@@ -7,6 +7,7 @@
 	"Description": "Do stuff that usually takes too long, with just a few clicks",
 	"Category": "Modding",
 	"CreatedBy": "Mircea Roata",
+	"GameVersion": ">=520140",
 	"CreatedByURL": "https://github.com/mircearoata/SatisfactoryAreaActions",
 	"DocsURL": "",
 	"MarketplaceURL": "",
@@ -18,7 +19,7 @@
     "Plugins": [
         {
             "Name": "SML",
-            "SemVersion": "^3.4.1",
+            "SemVersion": "^3.12.1",
             "Enabled": true
         }
     ]
