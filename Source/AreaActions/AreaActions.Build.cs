@@ -34,6 +34,8 @@ public class AreaActions : ModuleRules
 			PublicDependencyModuleNames.Add("AnimGraph");
 		}
 
+		// AbstractInstance: the lightweight instance data. UBT warns that the .uplugin does not list the plugin; the game ships it inside
+		// FactoryGame, so it stays out of the .uplugin.
 		PublicDependencyModuleNames.AddRange(new string[] { "FactoryGame", "SML", "AbstractInstance" });
 
 		// Developer test mode (-AATest=<Scenario>). The release gate decides whether a release build keeps it.

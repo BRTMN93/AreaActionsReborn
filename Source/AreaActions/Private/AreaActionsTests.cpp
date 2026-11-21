@@ -2,7 +2,18 @@
 
 #if AA_WITH_TESTS
 
+#include "AreaActionsEquipment.h"
 #include "AreaActionsInstanceModule.h"
+#include "AreaActionsPopupBase.h"
+#include "Buildables/FGBuildable.h"
+#include "Components/ListView.h"
+#include "Engine/GameViewportClient.h"
+#include "FGBuildableSubsystem.h"
+#include "FGCharacterPlayer.h"
+#include "FGInventoryComponentEquipment.h"
+#include "InputKeyEventArgs.h"
+#include "Interfaces/IPluginManager.h"
+#include "Resources/FGItemDescriptor.h"
 #include "AreaActionsLog.h"
 #include "AreaActionsRCO.h"
 #include "AreaActionsServerSubsystem.h"
@@ -121,8 +132,371 @@ namespace
 		}
 	}
 
+	// --- The tool (AA-005): the Blueprint's own variables and events, read and called by name ---
+
+	const TCHAR* ToolItem = TEXT("/AreaActions/Equipment/AreaActions/Desc_AreaActions.Desc_AreaActions_C");
+	const TCHAR* StateEnum = TEXT("/AreaActions/Equipment/AreaActions/AreaBuildingStateEnum.AreaBuildingStateEnum");
+
+	AFGCharacterPlayer* GetCharacter(const FRun& R)
+	{
+		APlayerController* Player = R.GetPlayer();
+		return Player ? Cast<AFGCharacterPlayer>(Player->GetPawn()) : nullptr;
+	}
+
+	AAreaActionsEquipment* GetTool(const FRun& R)
+	{
+		AFGCharacterPlayer* Character = GetCharacter(R);
+		if (!Character)
+		{
+			return nullptr;
+		}
+		for (AFGEquipment* Equipment : Character->GetActiveEquipments())
+		{
+			if (AAreaActionsEquipment* Tool = Cast<AAreaActionsEquipment>(Equipment))
+			{
+				return Tool;
+			}
+		}
+		return nullptr;
+	}
+
+	int32 ArrayNum(UObject* Object, const TCHAR* Name)
+	{
+		FArrayProperty* Property = Object ? FindFProperty<FArrayProperty>(Object->GetClass(), Name) : nullptr;
+		return Property ? FScriptArrayHelper(Property, Property->ContainerPtrToValuePtr<void>(Object)).Num() : -1;
+	}
+
+	TArray<FVector> VectorArray(UObject* Object, const TCHAR* Name)
+	{
+		FArrayProperty* Property = Object ? FindFProperty<FArrayProperty>(Object->GetClass(), Name) : nullptr;
+		return Property ? *Property->ContainerPtrToValuePtr<TArray<FVector>>(Object) : TArray<FVector>();
+	}
+
+	double DoubleValue(UObject* Object, const TCHAR* Name)
+	{
+		FDoubleProperty* Property = Object ? FindFProperty<FDoubleProperty>(Object->GetClass(), Name) : nullptr;
+		return Property ? Property->GetPropertyValue_InContainer(Object) : NAN;
+	}
+
+	UObject* ObjectValue(UObject* Object, const TCHAR* Name)
+	{
+		FObjectPropertyBase* Property = Object ? FindFProperty<FObjectPropertyBase>(Object->GetClass(), Name) : nullptr;
+		return Property ? Property->GetObjectPropertyValue_InContainer(Object) : nullptr;
+	}
+
+	// The tool's state, as the menu's state list sets it: the Blueprint event SelectBuildStatus(BuildingState)
+	bool SelectState(UObject* Tool, const TCHAR* Enumerator)
+	{
+		const UEnum* Enum = LoadObject<UEnum>(nullptr, StateEnum);
+		UFunction* Function = Tool ? Tool->FindFunction(TEXT("SelectBuildStatus")) : nullptr;
+		const int64 Value = Enum ? Enum->GetValueByNameString(Enumerator) : INDEX_NONE;
+		if (!Function || Value == INDEX_NONE)
+		{
+			return false;
+		}
+		TArray<uint8> Params;
+		Params.SetNumZeroed(Function->ParmsSize);
+		for (TFieldIterator<FProperty> It(Function); It && It->HasAnyPropertyFlags(CPF_Parm); ++It)
+		{
+			if (FByteProperty* Byte = CastField<FByteProperty>(*It))
+			{
+				Byte->SetPropertyValue_InContainer(Params.GetData(), static_cast<uint8>(Value));
+			}
+			else if (FEnumProperty* EnumProperty = CastField<FEnumProperty>(*It))
+			{
+				EnumProperty->GetUnderlyingProperty()->SetIntPropertyValue(EnumProperty->ContainerPtrToValuePtr<void>(Params.GetData()), Value);
+			}
+		}
+		Tool->ProcessEvent(Function, Params.GetData());
+		return true;
+	}
+
+	// A real key press of the local player, through the player controller's input as the keyboard and mouse send it
+	void PressKey(const FRun& R, const FKey& Key)
+	{
+		APlayerController* Player = R.GetPlayer();
+		FViewport* Viewport = GEngine && GEngine->GameViewport ? GEngine->GameViewport->Viewport : nullptr;
+		Player->InputKey(FInputKeyEventArgs(Viewport, FInputDeviceId::CreateFromInternalId(0), Key, IE_Pressed));
+		Player->InputKey(FInputKeyEventArgs(Viewport, FInputDeviceId::CreateFromInternalId(0), Key, IE_Released));
+	}
+
+	// Turns the camera to look at a point; the tool's raycast starts at the camera
+	void LookAt(const FRun& R, const FVector& Target)
+	{
+		APlayerController* Player = R.GetPlayer();
+		Player->SetControlRotation((Target - Player->PlayerCameraManager->GetCameraLocation()).Rotation());
+	}
+
+	// Waits a few frames (the camera manager and widgets update on the next ticks)
+	FStepFn WaitFrames(int32 Frames)
+	{
+		return [Frames, Until = TSharedRef<uint64>(MakeShared<uint64>(0))](FRun& Self) mutable
+		{
+			if (*Until == 0)
+			{
+				*Until = GFrameCounter + Frames;
+			}
+			if (GFrameCounter < *Until)
+			{
+				return EStep::Wait;
+			}
+			*Until = 0;
+			return EStep::Next;
+		};
+	}
+
+	bool GroundBelow(UWorld* World, const FVector& Point, FVector& OutGround)
+	{
+		FHitResult Hit;
+		FCollisionQueryParams Params(TEXT("AATest"), false);
+		if (APlayerController* Player = UGameplayStatics::GetPlayerController(World, 0))
+		{
+			Params.AddIgnoredActor(Player->GetPawn());
+		}
+		if (!World->LineTraceSingleByChannel(Hit, Point + FVector(0, 0, 5000), Point - FVector(0, 0, 5000), ECC_WorldStatic, Params))
+		{
+			return false;
+		}
+		OutGround = Hit.Location;
+		return true;
+	}
+
+	// The player takes the tool in hand: one tool item in the arms slot, made the active one
+	void AddEquipTool(FRun& R)
+	{
+		R.Steps.Add([](FRun& Self)
+		{
+			AFGCharacterPlayer* Character = GetCharacter(Self);
+			if (!Character)
+			{
+				return EStep::Wait;
+			}
+			UClass* Item = LoadClass<UFGItemDescriptor>(nullptr, ToolItem);
+			UFGInventoryComponentEquipment* Arms = Character->GetEquipmentSlot(EEquipmentSlot::ES_ARMS);
+			if (!Self.Check(Item && Arms, FString::Printf(TEXT("tool item %s, arms slot %s"), *GetNameSafe(Item), *GetNameSafe(Arms))))
+			{
+				return EStep::Next;
+			}
+			int32 Free = INDEX_NONE;
+			for (int32 Index = 0; Index < Arms->GetSizeLinear() && Free == INDEX_NONE; ++Index)
+			{
+				Free = Arms->IsSomethingOnIndex(Index) ? INDEX_NONE : Index;
+			}
+			const int32 Added = Free == INDEX_NONE ? 0 : Arms->AddStackToIndex(Free, FInventoryStack(1, Item));
+			Self.Step(FString::Printf(TEXT("tool item put in arms slot index %d: %d"), Free, Added));
+			Arms->SetActiveIndex(Free);
+			return EStep::Next;
+		});
+		R.Steps.Add([](FRun& Self)
+		{
+			AAreaActionsEquipment* Tool = GetTool(Self);
+			if (!Tool)
+			{
+				return EStep::Wait;
+			}
+			Self.Check(true, FString::Printf(TEXT("tool in hand: %s"), *Tool->GetClass()->GetName()));
+			return EStep::Next;
+		});
+		R.Steps.Add(WaitFrames(10));
+	}
+
+	void AddToolMenu(FRun& R)
+	{
+		AddEquipTool(R);
+		R.Steps.Add([](FRun& Self)
+		{
+			Self.Step(TEXT("right mouse button"));
+			PressKey(Self, EKeys::RightMouseButton);
+			return EStep::Next;
+		});
+		R.Steps.Add(WaitFrames(5));
+		R.Steps.Add([](FRun& Self)
+		{
+			UAreaActionsPopupBase* Popup = Cast<UAreaActionsPopupBase>(ObjectValue(GetTool(Self), TEXT("PopupWidget")));
+			if (!Self.Check(Popup && Popup->IsInViewport(), FString::Printf(TEXT("menu open: %s"), *GetNameSafe(Popup))))
+			{
+				return EStep::Next;
+			}
+			FString Version;
+			if (const FPluginDescriptor* Descriptor = IPluginManager::Get().FindPlugin(TEXT("AreaActions")) ? &IPluginManager::Get().FindPlugin(TEXT("AreaActions"))->GetDescriptor() : nullptr)
+			{
+				Version = Descriptor->VersionName;
+			}
+			const FString Title = Popup->GetTitle().ToString();
+			Self.Check(!Version.IsEmpty() && Title.Contains(Version), FString::Printf(TEXT("title '%s' has the version '%s'"), *Title, *Version));
+			const UListView* Actions = Cast<UListView>(Popup->GetWidgetFromName(TEXT("Actions")));
+			Self.Check(Actions && Actions->GetNumItems() == 6, FString::Printf(TEXT("action list items: %d"), Actions ? Actions->GetNumItems() : -1));
+			return EStep::Next;
+		});
+	}
+
+	// Three corners around a point in front of the player, as the player clicks them
+	void AddCorners(FRun& R)
+	{
+		AddEquipTool(R);
+		TSharedRef<TArray<FVector>> Targets = MakeShared<TArray<FVector>>();
+		R.Steps.Add([Targets](FRun& Self)
+		{
+			APawn* Pawn = Self.GetPlayer()->GetPawn();
+			const FVector Center = Pawn->GetActorLocation() + Pawn->GetActorForwardVector() * 1200.0;
+			for (int32 Index = 0; Index < 3; ++Index)
+			{
+				const FVector Point = Center + FRotator(0, Index * 120.0, 0).RotateVector(FVector(500, 0, 0));
+				FVector Ground;
+				if (!GroundBelow(Self.GetWorld(), Point, Ground))
+				{
+					Self.Check(false, FString::Printf(TEXT("ground below %s"), *Point.ToCompactString()));
+					return EStep::Next;
+				}
+				Targets->Add(Ground);
+			}
+			Self.Check(SelectState(GetTool(Self), TEXT("NewEnumerator1")), TEXT("corner mode set"));
+			return EStep::Next;
+		});
+		for (int32 Index = 0; Index < 3; ++Index)
+		{
+			R.Steps.Add([Targets, Index](FRun& Self)
+			{
+				if (Targets->IsValidIndex(Index))
+				{
+					LookAt(Self, (*Targets)[Index]);
+				}
+				return EStep::Next;
+			});
+			R.Steps.Add(WaitFrames(3));
+			R.Steps.Add([Targets, Index](FRun& Self)
+			{
+				Self.Step(FString::Printf(TEXT("left click %d at %s"), Index + 1, Targets->IsValidIndex(Index) ? *(*Targets)[Index].ToCompactString() : TEXT("-")));
+				PressKey(Self, EKeys::LeftMouseButton);
+				return EStep::Next;
+			});
+			R.Steps.Add(WaitFrames(3));
+		}
+		R.Steps.Add([](FRun& Self)
+		{
+			AAreaActionsEquipment* Tool = GetTool(Self);
+			const int32 Corners = ArrayNum(Tool, TEXT("CornerLocations"));
+			const int32 Walls = ArrayNum(Tool, TEXT("AreaWalls"));
+			Self.Check(Corners == 3, FString::Printf(TEXT("corners after 3 clicks: %d"), Corners));
+			Self.Check(Walls == 3, FString::Printf(TEXT("walls after 3 clicks: %d"), Walls));
+			Self.Check(SelectState(Tool, TEXT("NewEnumerator10")), TEXT("Clear"));
+			return EStep::Next;
+		});
+		R.Steps.Add(WaitFrames(3));
+		R.Steps.Add([](FRun& Self)
+		{
+			AAreaActionsEquipment* Tool = GetTool(Self);
+			const int32 Corners = ArrayNum(Tool, TEXT("CornerLocations"));
+			const int32 Indicators = ArrayNum(Tool, TEXT("CornerIndicators")) + ArrayNum(Tool, TEXT("AreaWalls"))
+				+ (ObjectValue(Tool, TEXT("MinZIndicator")) ? 1 : 0) + (ObjectValue(Tool, TEXT("MaxZIndicator")) ? 1 : 0);
+			Self.Check(Corners == 0, FString::Printf(TEXT("corners after Clear: %d"), Corners));
+			Self.Check(Indicators == 0, FString::Printf(TEXT("indicators after Clear: %d"), Indicators));
+			return EStep::Next;
+		});
+	}
+
+	// A Constructor in front of the player, clicked in the building selection mode
+	void AddSelectBuilding(FRun& R)
+	{
+		AddEquipTool(R);
+		TSharedRef<TWeakObjectPtr<AFGBuildable>> Built = MakeShared<TWeakObjectPtr<AFGBuildable>>();
+		R.Steps.Add([Built](FRun& Self)
+		{
+			UWorld* World = Self.GetWorld();
+			APawn* Pawn = Self.GetPlayer()->GetPawn();
+			FVector Ground;
+			UClass* Class = LoadClass<AFGBuildable>(nullptr, TEXT("/Game/FactoryGame/Buildable/Factory/ConstructorMk1/Build_ConstructorMk1.Build_ConstructorMk1_C"));
+			AFGBuildableSubsystem* Buildables = AFGBuildableSubsystem::Get(World);
+			if (!Self.Check(Class && Buildables && GroundBelow(World, Pawn->GetActorLocation() + Pawn->GetActorForwardVector() * 1500.0, Ground),
+				TEXT("Constructor class, buildable subsystem, ground in front")))
+			{
+				return EStep::Next;
+			}
+			const FTransform Transform(FRotator(0, 37, 0), Ground + FVector(0, 0, 100));
+			AFGBuildable* Constructor = Buildables->BeginSpawnBuildable(Class, Transform);
+			if (Constructor)
+			{
+				Constructor->FinishSpawning(Transform);
+			}
+			*Built = Constructor;
+			Self.Check(Constructor != nullptr, FString::Printf(TEXT("Constructor built at %s"), *Transform.GetLocation().ToCompactString()));
+			Self.Check(SelectState(GetTool(Self), TEXT("NewEnumerator14")), TEXT("building selection mode set"));
+			return EStep::Next;
+		});
+		R.Steps.Add(WaitFrames(10));
+		R.Steps.Add([Built](FRun& Self)
+		{
+			if (AFGBuildable* Constructor = Built->Get())
+			{
+				FBox Box;
+				AAreaActionsEquipment::GetLocalBox(Constructor, Box);
+				LookAt(Self, Constructor->GetActorTransform().TransformPosition(Box.GetCenter()));
+			}
+			return EStep::Next;
+		});
+		R.Steps.Add(WaitFrames(3));
+		R.Steps.Add([](FRun& Self)
+		{
+			Self.Step(TEXT("left click on the Constructor"));
+			PressKey(Self, EKeys::LeftMouseButton);
+			return EStep::Next;
+		});
+		R.Steps.Add(WaitFrames(3));
+		R.Steps.Add([Built](FRun& Self)
+		{
+			AFGBuildable* Constructor = Built->Get();
+			AAreaActionsEquipment* Tool = GetTool(Self);
+			if (!Self.Check(Constructor && Tool, TEXT("Constructor and tool still there")))
+			{
+				return EStep::Next;
+			}
+			const FBox Box = Constructor->GetCombinedClearanceBox();
+			const FTransform Transform = Constructor->GetActorTransform();
+			TArray<FVector> Expected;
+			double ExpectedMinZ = UE_BIG_NUMBER, ExpectedMaxZ = -UE_BIG_NUMBER;
+			for (int32 Index = 0; Index < 8; ++Index)
+			{
+				const FVector Corner = Transform.TransformPosition(FVector(Index & 1 ? Box.Max.X : Box.Min.X, Index & 2 ? Box.Max.Y : Box.Min.Y, Index & 4 ? Box.Max.Z : Box.Min.Z));
+				ExpectedMinZ = FMath::Min(ExpectedMinZ, Corner.Z);
+				ExpectedMaxZ = FMath::Max(ExpectedMaxZ, Corner.Z);
+				if (Index < 4)
+				{
+					Expected.Add(FVector(Corner.X, Corner.Y, 0));
+				}
+			}
+			const TArray<FVector> Corners = VectorArray(Tool, TEXT("CornerLocations"));
+			int32 Matched = 0;
+			for (const FVector& Want : Expected)
+			{
+				Matched += Corners.ContainsByPredicate([&Want](const FVector& Got) { return FVector::Dist2D(Want, Got) <= 1.0; }) ? 1 : 0;
+			}
+			Self.Check(Box.IsValid != 0, FString::Printf(TEXT("clearance box %s"), *Box.ToString()));
+			Self.Check(Corners.Num() == 4 && Matched == 4, FString::Printf(TEXT("corners %d, matching the clearance box within 1 cm: %d"), Corners.Num(), Matched));
+			const double MinZ = DoubleValue(Tool, TEXT("MinZ"));
+			const double MaxZ = DoubleValue(Tool, TEXT("MaxZ"));
+			Self.Check(FMath::Abs(MinZ - ExpectedMinZ) <= 1.0 && FMath::Abs(MaxZ - ExpectedMaxZ) <= 1.0,
+				FString::Printf(TEXT("MinZ %.1f (box %.1f), MaxZ %.1f (box %.1f)"), MinZ, ExpectedMinZ, MaxZ, ExpectedMaxZ));
+			return EStep::Next;
+		});
+	}
+
 	bool BuildScenario(FRun& R)
 	{
+		if (R.Name == TEXT("ToolMenu"))
+		{
+			AddToolMenu(R);
+			return true;
+		}
+		if (R.Name == TEXT("Corners"))
+		{
+			AddCorners(R);
+			return true;
+		}
+		if (R.Name == TEXT("SelectBuilding"))
+		{
+			AddSelectBuilding(R);
+			return true;
+		}
 		if (R.Name == TEXT("Smoke"))
 		{
 			AddSmoke(R, false);
