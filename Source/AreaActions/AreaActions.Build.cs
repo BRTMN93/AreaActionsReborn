@@ -1,0 +1,42 @@
+using UnrealBuildTool;
+
+public class AreaActions : ModuleRules
+{
+	public AreaActions(ReadOnlyTargetRules Target) : base(Target)
+	{
+		PCHUsage = PCHUsageMode.UseExplicitOrSharedPCHs;
+		CppStandard = CppStandardVersion.Cpp20;
+
+		// FactoryGame transitive dependencies, as in the Alpakit C++ template
+		PublicDependencyModuleNames.AddRange(new string[] {
+			"Core", "CoreUObject",
+			"Engine",
+			"DeveloperSettings",
+			"PhysicsCore",
+			"InputCore",
+			"GeometryCollectionEngine",
+			"AnimGraphRuntime",
+			"AssetRegistry",
+			"NavigationSystem",
+			"AIModule",
+			"GameplayTasks",
+			"SlateCore", "Slate", "UMG",
+			"RenderCore",
+			"CinematicCamera",
+			"Foliage",
+			"NetCore",
+			"GameplayTags",
+			"EnhancedInput",
+			"Projects",
+			"DummyHeaders",
+		});
+		if (Target.Type == TargetRules.TargetType.Editor) {
+			PublicDependencyModuleNames.Add("AnimGraph");
+		}
+
+		PublicDependencyModuleNames.AddRange(new string[] { "FactoryGame", "SML", "AbstractInstance" });
+
+		// Developer test mode (-AATest=<Scenario>). The release gate decides whether a release build keeps it.
+		PrivateDefinitions.Add("AA_WITH_TESTS=1");
+	}
+}

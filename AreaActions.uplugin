@@ -16,6 +16,13 @@
 	"IsBetaVersion": false,
 	"IsExperimentalVersion": false,
 	"Installed": false,
+	"Modules": [
+		{
+			"Name": "AreaActions",
+			"Type": "Runtime",
+			"LoadingPhase": "Default"
+		}
+	],
     "Plugins": [
         {
             "Name": "SML",
