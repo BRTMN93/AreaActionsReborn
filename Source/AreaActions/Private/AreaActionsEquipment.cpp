@@ -53,7 +53,7 @@ void AAreaActionsEquipment::GetActorCorners(AFGBuildable* Buildable, TArray<FVec
 	const FTransform Transform = Buildable->GetActorTransform();
 	const FVector Center = Box.GetCenter();
 	const FVector Extent = Box.GetExtent();
-	// Gray code order, as the Blueprint's GetBoxCorners: neighbours differ in one axis, so the four bottom corners go round
+	// Gray code order, as the Blueprint's GetBoxCorners: neighbours differ in one axis, so the first four corners (the top face, +Z) go round
 	for (int32 Index = 0; Index < 8; ++Index)
 	{
 		const int32 Gray = Index ^ (Index >> 1);
