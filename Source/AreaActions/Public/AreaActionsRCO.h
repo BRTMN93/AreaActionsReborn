@@ -32,7 +32,7 @@ public:
 	UFUNCTION(Server, Reliable)
 	void ServerSetRecipe(int32 RequestId, const FAreaActionsArea& Area, UClass* Recipe);
 	UFUNCTION(Server, Reliable)
-	void ServerClearInventories(int32 RequestId, const FAreaActionsArea& Area);
+	void ServerClearInventories(int32 RequestId, const FAreaActionsArea& Area, bool bToCrate);
 	UFUNCTION(Server, Reliable)
 	void ServerSetStationMode(int32 RequestId, const FAreaActionsArea& Area, bool bLoad);
 

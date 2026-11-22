@@ -3,6 +3,9 @@
 #include "AreaActionsLog.h"
 #include "AreaActionsRCO.h"
 #include "Blueprint/UserWidget.h"
+#include "Blueprint/WidgetTree.h"
+#include "Components/Button.h"
+#include "Components/TextBlock.h"
 #include "FGCharacterPlayer.h"
 #include "TimerManager.h"
 #include "UI/FGInteractWidget.h"
@@ -62,6 +65,7 @@ int32 AAreaActionBase::BeginRequest()
 {
 	static int32 LastId = 0;
 	RequestId = ++LastId;
+	++RequestCount;
 	return RequestId;
 }
 
@@ -144,6 +148,50 @@ bool AAreaActionBase::BindWindowEvent(UUserWidget* Window, FName Dispatcher, UOb
 	Delegate.BindUFunction(Target, Function);
 	Property->AddDelegate(MoveTemp(Delegate), Window);
 	return true;
+}
+
+bool AAreaActionBase::OpenChoice(const FText& Title, const FText& Message, const FText& First, const FText& Second, UObject* Target, FName OnFirst, FName OnSecond)
+{
+	UUserWidget* Window = OpenWindow(MessageYesNoClass, Title, Message);
+	if (!Window || !BindWindowEvent(Window, TEXT("NoClicked"), this, GET_FUNCTION_NAME_CHECKED(AAreaActionBase, ChoiceClosed)))
+	{
+		return false;
+	}
+	RequestCountAtChoice = RequestCount;
+	struct FAnswer { const TCHAR* Button; FText Label; FName Function; };
+	const FAnswer Answers[] = { { TEXT("YesButton"), First, OnFirst }, { TEXT("NoButton"), Second, OnSecond } };
+	for (const FAnswer& Answer : Answers)
+	{
+		UButton* Button = Cast<UButton>(Window->GetWidgetFromName(Answer.Button));
+		if (!Button || !Target || !Target->FindFunction(Answer.Function))
+		{
+			UE_LOG(LogAreaActionsCpp, Error, TEXT("Cannot bind %s.%s to %s.%s"), *GetNameSafe(Window), Answer.Button, *GetNameSafe(Target), *Answer.Function.ToString());
+			return false;
+		}
+		const FText& Label = Answer.Label;
+		UWidgetTree::ForWidgetAndChildren(Button, [&Label](UWidget* Child)
+		{
+			if (UTextBlock* Text = Cast<UTextBlock>(Child))
+			{
+				Text->SetText(Label);
+			}
+		});
+		FScriptDelegate Delegate;
+		Delegate.BindUFunction(Target, Answer.Function);
+		Button->OnClicked.Add(Delegate);
+	}
+	return true;
+}
+
+void AAreaActionBase::ChoiceClosed()
+{
+	GetWorldTimerManager().SetTimerForNextTick(FTimerDelegate::CreateWeakLambda(this, [this]()
+	{
+		if (RequestCount == RequestCountAtChoice)
+		{
+			Finish();
+		}
+	}));
 }
 
 void AAreaActionBase::ShowMessage(const FText& Title, const FText& Message)

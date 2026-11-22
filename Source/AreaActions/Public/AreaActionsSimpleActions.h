@@ -28,7 +28,7 @@ private:
 	TSubclassOf<UFGRecipe> Recipe;
 };
 
-// A yes/no question, then the request
+// "Delete items" or "Move to crate", then the request; closing the window cancels
 UCLASS()
 class AREAACTIONS_API UAreaActionClearInventories : public UAreaAction
 {
@@ -39,12 +39,16 @@ public:
 	virtual void OnResult(const FAreaActionsResult& Result) override;
 
 	UFUNCTION()
-	void Confirm();
+	void Delete();
 	UFUNCTION()
-	void Cancel();
+	void ToCrate();
+
+private:
+	void Send(bool bInToCrate);
+	bool bToCrate = false;
 };
 
-// "Should the stations load?": yes loads, no (and closing the window, as in the original) unloads
+// "Load" or "Unload", then the request; closing the window cancels
 UCLASS()
 class AREAACTIONS_API UAreaActionSetStationMode : public UAreaAction
 {

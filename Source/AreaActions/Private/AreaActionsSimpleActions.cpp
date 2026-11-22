@@ -98,53 +98,56 @@ void UAreaActionSetRecipe::OnResult(const FAreaActionsResult& Result)
 void UAreaActionClearInventories::Start()
 {
 	AAreaActionBase* Shell = GetShell();
-	UUserWidget* Window = Shell->OpenWindow(Shell->MessageYesNoClass, LOCTEXT("ClearConfirmTitle", "Confirm Clear Inventories"),
-		LOCTEXT("ClearConfirm", "Are you sure you want to clear ALL the inventories the selected area?"));
-	if (!AAreaActionBase::BindWindowEvent(Window, TEXT("YesClicked"), this, GET_FUNCTION_NAME_CHECKED(UAreaActionClearInventories, Confirm))
-		|| !AAreaActionBase::BindWindowEvent(Window, TEXT("NoClicked"), this, GET_FUNCTION_NAME_CHECKED(UAreaActionClearInventories, Cancel)))
+	if (!Shell->OpenChoice(LOCTEXT("ClearConfirmTitle", "Confirm Clear Inventories"),
+		LOCTEXT("ClearAsk", "Clear ALL the inventories in the selected area? The items can be deleted or moved to a crate next to you."),
+		LOCTEXT("ClearDelete", "Delete items"), LOCTEXT("ClearToCrate", "Move to crate"),
+		this, GET_FUNCTION_NAME_CHECKED(UAreaActionClearInventories, Delete), GET_FUNCTION_NAME_CHECKED(UAreaActionClearInventories, ToCrate)))
 	{
 		Shell->Finish();
 	}
 }
 
-void UAreaActionClearInventories::Confirm()
+void UAreaActionClearInventories::Delete()
+{
+	Send(false);
+}
+
+void UAreaActionClearInventories::ToCrate()
+{
+	Send(true);
+}
+
+void UAreaActionClearInventories::Send(bool bInToCrate)
 {
 	AAreaActionBase* Shell = ActiveShell(this);
 	if (UAreaActionsRCO* Rco = Shell ? Shell->GetRco() : nullptr)
 	{
-		Rco->ServerClearInventories(Shell->BeginRequest(), Shell->GetArea());
+		bToCrate = bInToCrate;
+		Rco->ServerClearInventories(Shell->BeginRequest(), Shell->GetArea(), bInToCrate);
 	}
 }
-
-void UAreaActionClearInventories::Cancel()
-{
-	if (AAreaActionBase* Shell = ActiveShell(this))
-	{
-		Shell->Finish();
-	}
-}
-
 void UAreaActionClearInventories::OnResult(const FAreaActionsResult& Result)
 {
 	AAreaActionBase* Shell = GetShell();
 	if (!Shell->ShowFailure(Result.Code))
 	{
-		Shell->ShowMessage(LOCTEXT("ClearTitle", "Clear complete"), FText::Format(LOCTEXT("Cleared", "Cleared {Count} buildings deleting a total of {ItemReturnCount} items."),
-			FFormatNamedArguments{ { TEXT("Count"), Result.Buildings }, { TEXT("ItemReturnCount"), Result.Items } }));
+		const FFormatNamedArguments Arguments{ { TEXT("Count"), Result.Buildings }, { TEXT("ItemReturnCount"), Result.Items } };
+		Shell->ShowMessage(LOCTEXT("ClearTitle", "Clear complete"), bToCrate
+			? FText::Format(LOCTEXT("ClearedToCrate", "Cleared {Count} buildings taking a total of {ItemReturnCount} items. The solid items are in a crate next to you."), Arguments)
+			: FText::Format(LOCTEXT("Cleared", "Cleared {Count} buildings deleting a total of {ItemReturnCount} items."), Arguments));
 	}
 }
 
 void UAreaActionSetStationMode::Start()
 {
 	AAreaActionBase* Shell = GetShell();
-	UUserWidget* Window = Shell->OpenWindow(Shell->MessageYesNoClass, LOCTEXT("StationTitle", "Set Station Load/Unload"), LOCTEXT("StationAsk", "Should the stations load?"));
-	if (!AAreaActionBase::BindWindowEvent(Window, TEXT("YesClicked"), this, GET_FUNCTION_NAME_CHECKED(UAreaActionSetStationMode, Load))
-		|| !AAreaActionBase::BindWindowEvent(Window, TEXT("NoClicked"), this, GET_FUNCTION_NAME_CHECKED(UAreaActionSetStationMode, Unload)))
+	if (!Shell->OpenChoice(LOCTEXT("StationTitle", "Set Station Load/Unload"), LOCTEXT("StationAsk", "What should the stations in the area do?"),
+		LOCTEXT("Load", "Load"), LOCTEXT("Unload", "Unload"),
+		this, GET_FUNCTION_NAME_CHECKED(UAreaActionSetStationMode, Load), GET_FUNCTION_NAME_CHECKED(UAreaActionSetStationMode, Unload)))
 	{
 		Shell->Finish();
 	}
 }
-
 void UAreaActionSetStationMode::Load()
 {
 	Send(true);

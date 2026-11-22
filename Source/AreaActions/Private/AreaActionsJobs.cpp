@@ -12,6 +12,63 @@
 
 namespace
 {
+	using FReturnedItems = TMap<TSubclassOf<UFGItemDescriptor>, int32>;
+
+	// The solid stacks of the inventory go into Returned (fluids cannot go into a crate); returns how many items that is
+	int32 TakeSolids(UFGInventoryComponent* Inventory, FReturnedItems& Returned)
+	{
+		TArray<FInventoryStack> Stacks;
+		Inventory->GetInventoryStacks(Stacks);
+		int32 Count = 0;
+		for (const FInventoryStack& Stack : Stacks)
+		{
+			if (Stack.HasItems() && UFGItemDescriptor::GetForm(Stack.Item.GetItemClass()) == EResourceForm::RF_SOLID)
+			{
+				Returned.FindOrAdd(Stack.Item.GetItemClass()) += Stack.NumItems;
+				Count += Stack.NumItems;
+			}
+		}
+		return Count;
+	}
+
+	// One crate with the items next to the player; when the player left or there is no room there, where the last changed building
+	// stands, rather than lose them
+	void SpawnReturnCrate(UWorld* World, const FReturnedItems& Returned, AFGCharacterPlayer* Player, const FVector& Fallback, const TCHAR* JobName)
+	{
+		if (Returned.IsEmpty())
+		{
+			return;
+		}
+		TArray<FInventoryStack> Stacks;
+		int32 Items = 0;
+		for (const TPair<TSubclassOf<UFGItemDescriptor>, int32>& Entry : Returned)
+		{
+			const int32 StackSize = FMath::Max(1, UFGItemDescriptor::GetStackSize(Entry.Key));
+			for (int32 Left = Entry.Value; Left > 0; Left -= StackSize)
+			{
+				Stacks.Emplace(FMath::Min(Left, StackSize), Entry.Key);
+			}
+			Items += Entry.Value;
+		}
+		FSpawnInventoryCrateParameters Parameters;
+		Parameters.bAllowCrateMerging = false;
+		if (Player)
+		{
+			Parameters.ActorsToIgnore.Add(Player);
+		}
+		const AFGCrate* Crate = Player ? AFGItemPickup_Spawnable::SpawnInventoryCrate(World, Stacks, Player->GetActorLocation(), Parameters) : nullptr;
+		if (!Crate)
+		{
+			Crate = AFGItemPickup_Spawnable::SpawnInventoryCrate(World, Stacks, Fallback, Parameters);
+		}
+		if (!Crate)
+		{
+			UE_LOG(LogAreaActionsCpp, Error, TEXT("%s could not spawn the crate: %d items in %d stacks lost"), JobName, Items, Stacks.Num());
+			return;
+		}
+		UE_LOG(LogAreaActionsCpp, Display, TEXT("%s crate %s with %d items in %d stacks"), JobName, *GetNameSafe(Crate), Items, Stacks.Num());
+	}
+
 	class FSetRecipeJob final : public FAreaActionsJob
 	{
 	public:
@@ -41,21 +98,11 @@ namespace
 			}
 			for (UFGInventoryComponent* Inventory : { Machine->GetInputInventory(), Machine->GetOutputInventory() })
 			{
-				if (!Inventory)
+				if (Inventory)
 				{
-					continue;
+					Result.Items += TakeSolids(Inventory, Returned);
+					Inventory->Empty();
 				}
-				TArray<FInventoryStack> Stacks;
-				Inventory->GetInventoryStacks(Stacks);
-				for (const FInventoryStack& Stack : Stacks)
-				{
-					if (Stack.HasItems() && UFGItemDescriptor::GetForm(Stack.Item.GetItemClass()) == EResourceForm::RF_SOLID)
-					{
-						Returned.FindOrAdd(Stack.Item.GetItemClass()) += Stack.NumItems;
-						Result.Items += Stack.NumItems;
-					}
-				}
-				Inventory->Empty();
 			}
 			Machine->SetRecipe(Recipe);
 			LastMachine = Machine->GetActorLocation();
@@ -70,44 +117,13 @@ namespace
 				Result.Code = EAreaActionsResultCode::AlreadySet;
 			}
 			FAreaActionsJob::Finish(World);
-			if (Returned.IsEmpty())
-			{
-				return;
-			}
-			TArray<FInventoryStack> Stacks;
-			for (const TPair<TSubclassOf<UFGItemDescriptor>, int32>& Entry : Returned)
-			{
-				const int32 StackSize = FMath::Max(1, UFGItemDescriptor::GetStackSize(Entry.Key));
-				for (int32 Left = Entry.Value; Left > 0; Left -= StackSize)
-				{
-					Stacks.Emplace(FMath::Min(Left, StackSize), Entry.Key);
-				}
-			}
-			AFGCharacterPlayer* Player = Character.Get();
-			FSpawnInventoryCrateParameters Parameters;
-			Parameters.bAllowCrateMerging = false;
-			if (Player)
-			{
-				Parameters.ActorsToIgnore.Add(Player);
-			}
-			const AFGCrate* Crate = Player ? AFGItemPickup_Spawnable::SpawnInventoryCrate(World, Stacks, Player->GetActorLocation(), Parameters) : nullptr;
-			if (!Crate)
-			{
-				// The player left, or there was no room next to them: the items stay where the last changed machine stands rather than vanish
-				Crate = AFGItemPickup_Spawnable::SpawnInventoryCrate(World, Stacks, LastMachine, Parameters);
-			}
-			if (!Crate)
-			{
-				UE_LOG(LogAreaActionsCpp, Error, TEXT("SetRecipe could not spawn the crate: %d items in %d stacks lost"), Result.Items, Stacks.Num());
-				return;
-			}
-			UE_LOG(LogAreaActionsCpp, Display, TEXT("SetRecipe crate %s with %d items in %d stacks"), *GetNameSafe(Crate), Result.Items, Stacks.Num());
+			SpawnReturnCrate(World, Returned, Character.Get(), LastMachine, GetName());
 		}
 
 	private:
 		TSubclassOf<UFGRecipe> Recipe;
 		TArray<UClass*> ProducedIn;
-		TMap<TSubclassOf<UFGItemDescriptor>, int32> Returned;
+		FReturnedItems Returned;
 		FVector LastMachine = FVector::ZeroVector;
 		int32 AlreadySet = 0;
 	};
@@ -115,6 +131,8 @@ namespace
 	class FClearInventoriesJob final : public FAreaActionsJob
 	{
 	public:
+		explicit FClearInventoriesJob(bool bInToCrate) : bToCrate(bInToCrate) {}
+
 		virtual const TCHAR* GetName() const override { return TEXT("ClearInventories"); }
 		virtual bool Matches(const AActor* Actor) const override { return true; }
 		virtual bool WantsCrates() const override { return true; }
@@ -132,15 +150,31 @@ namespace
 				{
 					bAny = true;
 					Result.Items += Inventory->GetNumItems(nullptr);
+					if (bToCrate)
+					{
+						TakeSolids(Inventory, Returned);
+					}
 					Inventory->Empty();
 				}
 			}
 			if (bAny)
 			{
+				LastBuilding = Actor->GetActorLocation();
 				++Result.Buildings;
 				Result.AddCount(Actor->GetClass());
 			}
 		}
+
+		virtual void Finish(UWorld* World) override
+		{
+			FAreaActionsJob::Finish(World);
+			SpawnReturnCrate(World, Returned, Character.Get(), LastBuilding, GetName());
+		}
+
+	private:
+		bool bToCrate;
+		FReturnedItems Returned;
+		FVector LastBuilding = FVector::ZeroVector;
 	};
 
 	class FSetStationModeJob final : public FAreaActionsJob
@@ -179,9 +213,9 @@ TUniquePtr<FAreaActionsJob> AreaActionsJobs::MakeSetRecipe(TSubclassOf<UFGRecipe
 	return MakeUnique<FSetRecipeJob>(Recipe);
 }
 
-TUniquePtr<FAreaActionsJob> AreaActionsJobs::MakeClearInventories()
+TUniquePtr<FAreaActionsJob> AreaActionsJobs::MakeClearInventories(bool bToCrate)
 {
-	return MakeUnique<FClearInventoriesJob>();
+	return MakeUnique<FClearInventoriesJob>(bToCrate);
 }
 
 TUniquePtr<FAreaActionsJob> AreaActionsJobs::MakeSetStationMode(bool bLoad)

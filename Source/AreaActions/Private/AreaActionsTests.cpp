@@ -20,6 +20,7 @@
 #include "AreaActionsPopupBase.h"
 #include "Buildables/FGBuildable.h"
 #include "Components/ListView.h"
+#include "Components/TextBlock.h"
 #include "Engine/GameViewportClient.h"
 #include "FGBuildableSubsystem.h"
 #include "FGCharacterPlayer.h"
@@ -815,8 +816,38 @@ namespace
 		});
 	}
 
+	// What the player sees: the list takes a real part of the screen and its rows show recipe names
+	void AddCheckRecipeWindowLayout(FRun& R)
+	{
+		AddOnWindow(R, TEXT("Widget_SetRecipe"), [](FRun& Self, UUserWidget* Window) {});
+		R.Steps.Add(WaitFrames(5));
+		R.Steps.Add([](FRun& Self)
+		{
+			UUserWidget* Window = TopWindow(Self);
+			UListView* List = Window ? Cast<UListView>(Window->GetWidgetFromName(TEXT("RecipeList"))) : nullptr;
+			FVector2D Viewport = FVector2D::ZeroVector;
+			if (GEngine && GEngine->GameViewport)
+			{
+				GEngine->GameViewport->GetViewportSize(Viewport);
+			}
+			const double Width = List ? List->GetCachedGeometry().GetAbsoluteSize().X : 0.0;
+			Self.Check(Viewport.X > 0.0 && Width >= Viewport.X * 0.3,
+				FString::Printf(TEXT("recipe list width %.0f of viewport %.0f (at least 30%%)"), Width, Viewport.X));
+			const TArray<UUserWidget*> Rows = List ? List->GetDisplayedEntryWidgets() : TArray<UUserWidget*>();
+			const UTextBlock* Text = Rows.IsEmpty() ? nullptr : Cast<UTextBlock>(Rows[0]->GetWidgetFromName(TEXT("ItemText")));
+			const FString Name = Text ? Text->GetText().ToString() : FString();
+			// The name is readable when its box is as wide as the text wants
+			const double TextWidth = Text ? Text->GetCachedGeometry().GetLocalSize().X : 0.0;
+			const double TextWants = Text ? Text->GetDesiredSize().X : 0.0;
+			Self.Check(Rows.Num() > 0 && !Name.IsEmpty() && TextWants > 0.0 && TextWidth >= TextWants * 0.9,
+				FString::Printf(TEXT("rows shown %d, first row '%s', text width %.0f of %.0f wanted"), Rows.Num(), *Name, TextWidth, TextWants));
+			return EStep::Next;
+		});
+	}
+
 	void AddPickRecipe(FRun& R, const TCHAR* RecipePath)
 	{
+		AddCheckRecipeWindowLayout(R);
 		AddOnWindow(R, TEXT("Widget_SetRecipe"), [RecipePath](FRun& Self, UUserWidget* Window)
 		{
 			const UClass* Want = Recipe(RecipePath);
@@ -965,7 +996,8 @@ namespace
 		return Storage;
 	}
 
-	void AddClearInventories(FRun& R)
+	// bToCrate: the second answer, the items go to one new crate at the player
+	void AddClearInventories(FRun& R, bool bToCrate)
 	{
 		FSceneRef S = MakeShared<FScene>();
 		TSharedRef<TWeakObjectPtr<AFGCrate>> Crate = MakeShared<TWeakObjectPtr<AFGCrate>>();
@@ -999,11 +1031,11 @@ namespace
 			Scene.Expected = 50 + 30 + 20 + 15 + 25;
 		});
 		AddOpenAction(R, TEXT("ClearInventories"));
-		AddPress(R, TEXT("Widget_MessageYesNo"), TEXT("YesButton"));
+		AddPress(R, TEXT("Widget_MessageYesNo"), bToCrate ? TEXT("NoButton") : TEXT("YesButton"));
 		AddResultWindow(R, S);
-		R.Steps.Add([S, Crate](FRun& Self)
+		R.Steps.Add([S, Crate, bToCrate](FRun& Self)
 		{
-			const FString Want = FString::Printf(TEXT("Cleared 4 buildings deleting a total of %d items"), S->Expected);
+			const FString Want = FString::Printf(TEXT("Cleared 4 buildings %s a total of %d items"), bToCrate ? TEXT("taking") : TEXT("deleting"), S->Expected);
 			Self.Check(S->Message.Contains(Want), FString::Printf(TEXT("result '%s' has '%s'"), *S->Message, *Want));
 			Self.Check(StorageItems(S->Inside[0].Get()) == 0 && StorageItems(S->Inside[1].Get()) == 0,
 				FString::Printf(TEXT("containers empty: %d, %d"), StorageItems(S->Inside[0].Get()), StorageItems(S->Inside[1].Get())));
@@ -1017,6 +1049,23 @@ namespace
 			{
 				Self.Check(StorageItems(S->Controls[Index].Get()) == 15, FString::Printf(TEXT("control container %d: %d items"), Index, StorageItems(S->Controls[Index].Get())));
 			}
+			const TArray<AFGCrate*> Crates = NewCrates(Self, *S);
+			if (!bToCrate)
+			{
+				Self.Check(Crates.IsEmpty(), FString::Printf(TEXT("no new crate: %d"), Crates.Num()));
+				return EStep::Next;
+			}
+			// Plates 50 + 20 + 5, ingots 30 + 10, rods 25: every solid item of the area, nothing more
+			const UFGInventoryComponent* Inventory = Crates.Num() == 1 ? Crates[0]->GetInventory() : nullptr;
+			const int32 Plates = Inventory ? Inventory->GetNumItems(Item(Asset::IronPlateItem)) : -1;
+			const int32 Ingots = Inventory ? Inventory->GetNumItems(Item(Asset::IronIngotItem)) : -1;
+			const int32 Rods = Inventory ? Inventory->GetNumItems(Item(Asset::IronRodItem)) : -1;
+			const int32 All = Inventory ? Inventory->GetNumItems(nullptr) : -1;
+			Self.Check(Crates.Num() == 1 && Plates == 75 && Ingots == 40 && Rods == 25 && All == S->Expected,
+				FString::Printf(TEXT("new crates %d; plates %d of 75, ingots %d of 40, rods %d of 25, all %d of %d"), Crates.Num(), Plates, Ingots, Rods, All, S->Expected));
+			const APawn* Pawn = Self.GetPlayer()->GetPawn();
+			const double Distance = Crates.Num() == 1 ? FVector::Dist(Crates[0]->GetActorLocation(), Pawn->GetActorLocation()) : -1.0;
+			Self.Check(Distance >= 0.0 && Distance < 1500.0, FString::Printf(TEXT("crate next to the player: %.0f cm"), Distance));
 			return EStep::Next;
 		});
 	}
@@ -1100,6 +1149,41 @@ namespace
 		AddStationPass(R, S, true);
 	}
 
+	// X on the question window: the action ends and nothing changes (before, closing meant Unload)
+	void AddSetStationCancel(FRun& R)
+	{
+		FSceneRef S = MakeShared<FScene>();
+		AddScene(R, S, 4000.0, [](FRun& Self, FScene& Scene)
+		{
+			Scene.Inside.Add(SpawnBuildable(Self, Asset::TruckStation, Scene.Slot(0)));
+			SetLoadMode(Scene.Inside[0].Get(), true);
+			AddControlStations(Self, Scene);
+		});
+		AddOpenAction(R, TEXT("SetStationLoadUnload"));
+		AddOnWindow(R, TEXT("Widget_MessageYesNo"), [](FRun& Self, UUserWidget* Window)
+		{
+			UUserWidget* Frame = Cast<UUserWidget>(Window->GetWidgetFromName(TEXT("WindowDark")));
+			FMulticastDelegateProperty* Property = Frame ? FindFProperty<FMulticastDelegateProperty>(Frame->GetClass(), TEXT("OnClose")) : nullptr;
+			if (Property)
+			{
+				Property->ContainerPtrToValuePtr<FMulticastScriptDelegate>(Frame)->ProcessMulticastDelegate<UObject>(nullptr);
+			}
+			Self.Check(Property != nullptr, TEXT("window closed with X"));
+		});
+		R.Steps.Add([S](FRun& Self)
+		{
+			if (ActiveAction(Self) || TopWindow(Self))
+			{
+				return EStep::Wait;
+			}
+			Self.Check(true, TEXT("action ended, no window left"));
+			const AFGBuildable* Station = S->Inside[0].Get();
+			Self.Check(Station && LoadMode(Station), TEXT("station still loads"));
+			CheckControlStations(Self, *S);
+			return EStep::Next;
+		});
+	}
+
 	void AddSetStationEmpty(FRun& R)
 	{
 		FSceneRef S = MakeShared<FScene>();
@@ -1157,7 +1241,7 @@ namespace
 				return EStep::Wait;
 			}
 			Self.Step(TEXT("tool put away; request 104"));
-			UAreaActionsRCO::Of(Self.GetPlayer())->ServerClearInventories(104, S->Area);
+			UAreaActionsRCO::Of(Self.GetPlayer())->ServerClearInventories(104, S->Area, false);
 			return EStep::Next;
 		});
 		R.Steps.Add([S](FRun& Self)
@@ -1286,7 +1370,17 @@ namespace
 		}
 		if (R.Name == TEXT("ClearInventories"))
 		{
-			AddClearInventories(R);
+			AddClearInventories(R, false);
+			return true;
+		}
+		if (R.Name == TEXT("ClearInventoriesCrate"))
+		{
+			AddClearInventories(R, true);
+			return true;
+		}
+		if (R.Name == TEXT("SetStationCancel"))
+		{
+			AddSetStationCancel(R);
 			return true;
 		}
 		if (R.Name == TEXT("SetStation"))

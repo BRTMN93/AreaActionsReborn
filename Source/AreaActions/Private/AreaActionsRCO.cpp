@@ -157,12 +157,12 @@ void UAreaActionsRCO::ServerSetRecipe_Implementation(int32 RequestId, const FAre
 	Start(RequestId, Area, AreaActionsJobs::MakeSetRecipe(Recipe));
 }
 
-void UAreaActionsRCO::ServerClearInventories_Implementation(int32 RequestId, const FAreaActionsArea& InArea)
+void UAreaActionsRCO::ServerClearInventories_Implementation(int32 RequestId, const FAreaActionsArea& InArea, bool bToCrate)
 {
 	FAreaActionsArea Area = InArea;
 	if (ValidateRequest(RequestId, Area, TEXT("ClearInventories")))
 	{
-		Start(RequestId, Area, AreaActionsJobs::MakeClearInventories());
+		Start(RequestId, Area, AreaActionsJobs::MakeClearInventories(bToCrate));
 	}
 }
 

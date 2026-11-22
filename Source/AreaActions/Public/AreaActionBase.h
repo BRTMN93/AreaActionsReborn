@@ -49,6 +49,9 @@ public:
 	UUserWidget* OpenWindow(TSubclassOf<UUserWidget> Class, const FText& Title = FText::GetEmpty(), const FText& Message = FText::GetEmpty());
 	// Binds a Blueprint event dispatcher of the window to a function of Target by name; false (and an error) when either is missing
 	static bool BindWindowEvent(UUserWidget* Window, FName Dispatcher, UObject* Target, FName Function);
+	// A question with two named answers: the yes/no window with its buttons renamed, each button calls a function of Target by name.
+	// Closing the window (X, or the tool put away) without an answer ends the action. False (and an error) when the window cannot open.
+	bool OpenChoice(const FText& Title, const FText& Message, const FText& First, const FText& Second, UObject* Target, FName OnFirst, FName OnSecond);
 	// A message with OK; OK ends the action
 	void ShowMessage(const FText& Title, const FText& Message);
 	// A message for a result code that is not Ok; false when Code is Ok
@@ -65,6 +68,11 @@ public:
 	UFUNCTION()
 	void Finish();
 
+	// The yes/no window's NoClicked, which it also fires for X and for its second button: the cancel waits one tick, so a button that
+	// sends a request in the same click wins
+	UFUNCTION()
+	void ChoiceClosed();
+
 protected:
 	virtual void BeginPlay() override;
 	virtual void EndPlay(const EEndPlayReason::Type Reason) override;
@@ -78,6 +86,9 @@ private:
 
 	FAreaActionsArea Area;
 	int32 RequestId = INDEX_NONE;
+	// Requests begun so far, and that count when the open choice window appeared
+	int32 RequestCount = 0;
+	int32 RequestCountAtChoice = 0;
 	FDelegateHandle ResultHandle;
 	bool bFinished = false;
 };
