@@ -976,9 +976,17 @@ namespace
 			AFGBuildableManufacturer* Constructor = SpawnMachine(Self, Asset::Constructor, Scene.Slot(2), Asset::IronPlate, 10, 5);
 			Scene.Inside.Add(Constructor);
 			// D11: a power shard in the machine's upgrade slot stays
+			// The slot filter refuses shards until research unlocks the slots, which a new game lacks
 			UFGInventoryComponent* Upgrades = Constructor ? Constructor->GetPotentialInventory() : nullptr;
-			const int32 Shards = Upgrades && Upgrades->GetSizeLinear() > 0 ? Upgrades->AddStackToIndex(0, FInventoryStack(1, Item(Asset::PowerShard)), true) : 0;
-			Self.Check(Shards == 1, FString::Printf(TEXT("power shard in the Constructor's upgrade slot: %d"), Shards));
+			int32 Shards = 0;
+			if (Upgrades && Upgrades->GetSizeLinear() > 0)
+			{
+				const FItemFilter Filter = Upgrades->mItemFilter;
+				Upgrades->mItemFilter.Unbind();
+				Shards = Upgrades->AddStackToIndex(0, FInventoryStack(1, Item(Asset::PowerShard)), true);
+				Upgrades->mItemFilter = Filter;
+			}
+			Self.Check(Shards == 1, FString::Printf(TEXT("power shard in the Constructor's upgrade slot: %d (slots %d)"), Shards, Upgrades ? Upgrades->GetSizeLinear() : -1));
 			FSpawnInventoryCrateParameters Parameters;
 			Parameters.bAllowCrateMerging = false;
 			*Crate = AFGItemPickup_Spawnable::SpawnInventoryCrate(Self.GetWorld(), { FInventoryStack(25, Item(Asset::IronRodItem)) }, Scene.Slot(5), Parameters);
