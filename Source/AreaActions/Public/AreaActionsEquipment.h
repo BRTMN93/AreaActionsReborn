@@ -1,9 +1,11 @@
 #pragma once
 
 #include "CoreMinimal.h"
+#include "AreaActionsTypes.h"
 #include "Equipment/FGEquipment.h"
 #include "AreaActionsEquipment.generated.h"
 
+class AAreaActionBase;
 class AFGBuildable;
 
 // Parent of the tool Blueprint Equip_AreaActions. Functions here keep the name and the pins of the Blueprint functions they replace, so
@@ -21,4 +23,11 @@ public:
 
 	// The same box in the building's local space; false when there is none
 	static bool GetLocalBox(const AFGBuildable* Buildable, FBox& OutBox);
+
+	// The actions in the tool's menu: the world module's list (both on the server and on clients)
+	UFUNCTION(BlueprintCallable, Category = "Area Actions")
+	void GetAvailableActions(TArray<TSubclassOf<AAreaActionBase>>& Actions);
+
+	// The selection as a request carries it, read from the Blueprint's CornerLocations, MinZ and MaxZ; false when they are missing
+	bool GetArea(FAreaActionsArea& Out) const;
 };

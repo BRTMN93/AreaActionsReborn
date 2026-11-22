@@ -1,5 +1,7 @@
 #include "AreaActionsEquipment.h"
+#include "AreaActionBase.h"
 #include "AreaActionsLegacyLibrary.h"
+#include "AreaActionsWorldModule.h"
 #include "Buildables/FGBuildable.h"
 #include "InstanceData.h"
 
@@ -60,4 +62,30 @@ void AAreaActionsEquipment::GetActorCorners(AFGBuildable* Buildable, TArray<FVec
 		const FVector Sign((Gray & 1) ? -1.0 : 1.0, (Gray & 2) ? -1.0 : 1.0, (Gray & 4) ? -1.0 : 1.0);
 		Corners.Add(Transform.TransformPosition(Center + Extent * Sign));
 	}
+}
+
+void AAreaActionsEquipment::GetAvailableActions(TArray<TSubclassOf<AAreaActionBase>>& Actions)
+{
+	const UAreaActionsWorldModule* Module = UAreaActionsWorldModule::Get(this);
+	Actions = Module ? Module->AvailableActions : TArray<TSubclassOf<AAreaActionBase>>();
+}
+
+bool AAreaActionsEquipment::GetArea(FAreaActionsArea& Out) const
+{
+	const FArrayProperty* Corners = FindFProperty<FArrayProperty>(GetClass(), TEXT("CornerLocations"));
+	const FDoubleProperty* MinZ = FindFProperty<FDoubleProperty>(GetClass(), TEXT("MinZ"));
+	const FDoubleProperty* MaxZ = FindFProperty<FDoubleProperty>(GetClass(), TEXT("MaxZ"));
+	if (!Corners || !CastField<FStructProperty>(Corners->Inner) || CastField<FStructProperty>(Corners->Inner)->Struct != TBaseStructure<FVector>::Get() || !MinZ || !MaxZ)
+	{
+		return false;
+	}
+	Out.Polygon.Reset();
+	for (const FVector& Corner : *Corners->ContainerPtrToValuePtr<TArray<FVector>>(this))
+	{
+		Out.Polygon.Add(FVector2D(Corner));
+	}
+	// The Blueprint's "no limit" is its +Inf/-Inf variables; a request carries it as +/-UE_BIG_NUMBER
+	Out.MinZ = FMath::Clamp(MinZ->GetPropertyValue_InContainer(this), -UE_BIG_NUMBER, UE_BIG_NUMBER);
+	Out.MaxZ = FMath::Clamp(MaxZ->GetPropertyValue_InContainer(this), -UE_BIG_NUMBER, UE_BIG_NUMBER);
+	return true;
 }

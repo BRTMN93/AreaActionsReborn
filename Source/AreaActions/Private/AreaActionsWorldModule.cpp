@@ -1,5 +1,7 @@
 #include "AreaActionsWorldModule.h"
+#include "AreaActionBase.h"
 #include "AreaActionsLog.h"
+#include "Module/WorldModuleManager.h"
 #include "AreaActionsServerSubsystem.h"
 #include "AreaActionsTests.h"
 
@@ -9,6 +11,21 @@ UAreaActionsWorldModule::UAreaActionsWorldModule()
 {
 	// Spawned by SML in CONSTRUCTION
 	ModSubsystems.Add(AAreaActionsServerSubsystem::StaticClass());
+}
+
+UAreaActionsWorldModule* UAreaActionsWorldModule::Get(const UObject* WorldContext)
+{
+	const UWorld* World = WorldContext ? WorldContext->GetWorld() : nullptr;
+	const UWorldModuleManager* Manager = World ? World->GetSubsystem<UWorldModuleManager>() : nullptr;
+	return Manager ? Cast<UAreaActionsWorldModule>(Manager->FindModule(TEXT("AreaActions"))) : nullptr;
+}
+
+void UAreaActionsWorldModule::AddAction(TSubclassOf<AAreaActionBase> Action)
+{
+	if (Action)
+	{
+		AvailableActions.AddUnique(Action);
+	}
 }
 
 void UAreaActionsWorldModule::DispatchLifecycleEvent(ELifecyclePhase Phase)
