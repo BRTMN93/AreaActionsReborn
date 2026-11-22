@@ -28,6 +28,14 @@ public:
 	UFUNCTION(BlueprintCallable, Category = "Area Actions")
 	void GetAvailableActions(TArray<TSubclassOf<AAreaActionBase>>& Actions);
 
+	// The building under the mouse becomes the area: its 4 corners and its height, actors and lightweights alike (the original's
+	// SelectBuilding missed lightweights)
+	UFUNCTION(BlueprintCallable, Category = "Area Actions")
+	void SelectBuilding();
+
+	// The Blueprint's RaycastMouseWithRange past the tool's own indicators; false when nothing is in range
+	bool RaycastMouse(FHitResult& Out);
+
 	// The selection as a request carries it, read from the Blueprint's CornerLocations, MinZ and MaxZ; false when they are missing
 	bool GetArea(FAreaActionsArea& Out) const;
 };

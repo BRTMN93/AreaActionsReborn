@@ -17,13 +17,17 @@ public:
 
 	// Name in the AAJOB line
 	virtual const TCHAR* GetName() const = 0;
+	// Runs the job until EndTime; true when it is done. By default it collects the actors Matches takes, then calls Apply for each
+	virtual bool Step(UWorld* World, double EndTime);
 	// Cheap class test; the area test comes after it
-	virtual bool Matches(const AActor* Actor) const = 0;
+	virtual bool Matches(const AActor* Actor) const { return false; }
 	// Crates (not buildables) are collected as well
 	virtual bool WantsCrates() const { return false; }
-	virtual void Apply(AActor* Actor) = 0;
+	virtual void Apply(AActor* Actor) {}
 	// After the last building; the result's code is decided here
 	virtual void Finish(UWorld* World);
+	// The count in the AAJOB line
+	virtual int32 GetItems() const { return Found.Num(); }
 
 	int32 RequestId = 0;
 	FAreaActionsArea Area;
@@ -63,8 +67,5 @@ protected:
 	virtual void EndPlay(const EEndPlayReason::Type Reason) override;
 
 private:
-	// Runs the job until the time is up; true when it is done
-	bool Step(FAreaActionsJob& Job, double EndTime);
-
 	TArray<TUniquePtr<FAreaActionsJob>> Jobs;
 };

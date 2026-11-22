@@ -15,10 +15,22 @@ static TAutoConsoleVariable<int32> CVarMaxCorners(TEXT("AreaActions.MaxCorners")
 static TAutoConsoleVariable<float> CVarMaxDistance(TEXT("AreaActions.MaxDistance"), 0.0f,
 	TEXT("Farthest an area's nearest corner may be from the player (cm); 0 = no limit, as the original's \"whole map\" needs"));
 
+// The original's ActionsSettings.MaxContainerDistance (10 km), the end of the window's slider
+static TAutoConsoleVariable<float> CVarMaxContainerDistance(TEXT("AreaActions.MaxContainerDistance"), 1000000.0f,
+	TEXT("Farthest a storage container may be from the player to pay a Copy or Fill (cm)"));
+
 namespace
 {
 	// Corners farther than this from the map's origin are not real input (the playable map ends well within it)
 	constexpr double MaxCoordinate = 1.0e6;
+	// Fill: copies per axis and gaps, ramps (cm) beyond these are not real input
+	constexpr int32 MaxAmount = 1000000;
+	constexpr double MaxGap = 1.0e5;
+
+	bool IsBounded(const FVector& Value, double Limit)
+	{
+		return FMath::IsFinite(Value.X) && FMath::IsFinite(Value.Y) && FMath::IsFinite(Value.Z) && Value.GetAbsMax() <= Limit;
+	}
 }
 
 int32 UAreaActionsRCO::RejectCount = 0;
@@ -173,6 +185,30 @@ void UAreaActionsRCO::ServerSetStationMode_Implementation(int32 RequestId, const
 	{
 		Start(RequestId, Area, AreaActionsJobs::MakeSetStationMode(bLoad));
 	}
+}
+
+void UAreaActionsRCO::ServerPlaceCopies_Implementation(int32 RequestId, const FAreaActionsArea& InArea, const FAreaActionsPlacement& InPlacement, bool bUseBuildCost,
+	float ContainerDistance)
+{
+	FAreaActionsPlacement Placement = InPlacement;
+	const TCHAR* Action = Placement.bFill ? TEXT("Fill") : TEXT("Copy");
+	FAreaActionsArea Area = InArea;
+	if (!ValidateRequest(RequestId, Area, Action))
+	{
+		return;
+	}
+	const bool bNumbers = IsBounded(Placement.Delta, 2.0 * MaxCoordinate) && IsBounded(Placement.RotationCenter, 2.0 * MaxCoordinate) && FMath::IsFinite(Placement.Yaw)
+		&& IsBounded(Placement.Border, MaxGap) && IsBounded(FVector(Placement.Ramp, 0.0), MaxGap)
+		&& FMath::Abs(Placement.Amount.X) <= MaxAmount && FMath::Abs(Placement.Amount.Y) <= MaxAmount && FMath::Abs(Placement.Amount.Z) <= MaxAmount;
+	if (!bNumbers)
+	{
+		Reject(RequestId, Action, EAreaActionsResultCode::Rejected, FString::Printf(TEXT("placement out of range: delta %s, centre %s, yaw %f, gap %s, amount %s, ramp %s"),
+			*Placement.Delta.ToString(), *Placement.RotationCenter.ToString(), Placement.Yaw, *Placement.Border.ToString(), *Placement.Amount.ToString(), *Placement.Ramp.ToString()));
+		return;
+	}
+	Placement.Yaw = FMath::Fmod(Placement.Yaw, 360.0);
+	const double Distance = FMath::IsFinite(ContainerDistance) ? FMath::Clamp<double>(ContainerDistance, 0.0, FMath::Max(0.0f, CVarMaxContainerDistance.GetValueOnGameThread())) : 0.0;
+	Start(RequestId, Area, AreaActionsJobs::MakePlaceCopies(Placement, bUseBuildCost, Distance));
 }
 
 void UAreaActionsRCO::ClientResult_Implementation(int32 RequestId, const FAreaActionsResult& Result)

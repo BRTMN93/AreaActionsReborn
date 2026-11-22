@@ -4,6 +4,12 @@
 
 #include "AreaActionBase.h"
 #include "AreaActionsBuildings.h"
+#include "AreaActionsCopy.h"
+#include "Buildables/FGBuildableConveyorBelt.h"
+#include "Components/CheckBox.h"
+#include "Components/EditableTextBox.h"
+#include "FGCentralStorageSubsystem.h"
+#include "FGGameState.h"
 #include "AssetRegistry/AssetRegistryModule.h"
 #include "FGBlueprintFunctionLibrary.h"
 #include "FGBuildableBeam.h"
@@ -1688,6 +1694,950 @@ namespace
 		AddDeleteSave(R, SaveName);
 	}
 
+	// --- Copy and Fill (AA-020, AA-071) ---
+
+	// One building of a pattern, as the test placed it
+	struct FPiece
+	{
+		UClass* Class = nullptr;
+		FTransform Transform;
+		bool bLightweight = false;
+		bool bIgnored = false;
+		float BeamLength = -1.0f;
+		TSubclassOf<UFGRecipe> BuiltWith;
+		// The classes by path: a load replaces the world, the pointers above may not survive it
+		FString ClassPath, RecipePath;
+
+		void Resolve()
+		{
+			Class = LoadClass<UObject>(nullptr, *ClassPath);
+			BuiltWith = RecipePath.IsEmpty() ? nullptr : LoadClass<UFGRecipe>(nullptr, *RecipePath);
+		}
+	};
+
+	FPiece MakePiece(UClass* Class, const FTransform& Transform, bool bLightweight, float Length, TSubclassOf<UFGRecipe> BuiltWith)
+	{
+		FPiece Piece{ Class, Transform, bLightweight, AreaActionsBuildings::ShouldIgnore(Class), Length, BuiltWith };
+		Piece.ClassPath = Class->GetPathName();
+		Piece.RecipePath = BuiltWith ? BuiltWith->GetPathName() : FString();
+		return Piece;
+	}
+
+	struct FCopyState
+	{
+		TArray<FPiece> Pattern;
+		int32 ActorsBefore = 0;
+		int32 LightweightsBefore = 0;
+		// Copy: the expected move and turn
+		FVector Delta = FVector::ZeroVector;
+		double Yaw = 0.0;
+		FVector Pivot = FVector::ZeroVector;
+		AreaActionsBuildings::FItemCounts Cost;
+		AreaActionsBuildings::FItemCounts Inventory, Near, Far, Depot;
+		TWeakObjectPtr<AFGBuildableStorage> NearBox, FarBox;
+		FVector Base = FVector::ZeroVector;
+		int32 JobsBefore = 0;
+	};
+	using FCopyRef = TSharedRef<FCopyState>;
+
+	int32 LightweightCount(UWorld* World)
+	{
+		int32 Count = 0;
+		if (AFGLightweightBuildableSubsystem* Lightweights = AFGLightweightBuildableSubsystem::Get(World))
+		{
+			for (const TPair<TSubclassOf<AFGBuildable>, TArray<FRuntimeBuildableInstanceData>>& Entry : Lightweights->GetAllLightweightBuildableInstances())
+			{
+				for (const FRuntimeBuildableInstanceData& Data : Entry.Value)
+				{
+					Count += Data.IsValid() ? 1 : 0;
+				}
+			}
+		}
+		return Count;
+	}
+
+	int32 ActorCount(UWorld* World)
+	{
+		const AFGBuildableSubsystem* Buildables = AFGBuildableSubsystem::Get(World);
+		return Buildables ? Buildables->GetAllBuildablesRef().Num() : 0;
+	}
+
+	void CountWorld(const FRun& R, FCopyState& C)
+	{
+		C.ActorsBefore = ActorCount(R.GetWorld());
+		C.LightweightsBefore = LightweightCount(R.GetWorld());
+	}
+
+	FVector Ground(const FRun& R, const FVector& At)
+	{
+		FVector Hit;
+		return GroundBelow(R.GetWorld(), At, Hit) ? Hit + FVector(0, 0, 50) : At;
+	}
+
+	void AddLightweight(const FRun& R, FCopyState& C, const TCHAR* ClassName, const TCHAR* RecipeName, const FTransform& Transform, float Length = -1.0f)
+	{
+		AreaActionsBuildings::FSnapshot Building;
+		Building.Class = GameClass(ClassName);
+		Building.BuiltWith = RecipeOfClass(R, Building.Class, RecipeName);
+		if (Length > 0.0f)
+		{
+			FBuildableBeamLightweightData Data;
+			Data.BeamLength = Length;
+			Building.TypeData.InitializeAs(Data);
+		}
+		const bool bBuilt = Building.Class && AreaActionsBuildings::Spawn(R.GetWorld(), Building, Transform);
+		UE_LOG(LogAreaActionsCpp, Display, TEXT("AATEST pattern %s at %s: %d"), ClassName, *Transform.GetLocation().ToCompactString(), bBuilt);
+		if (bBuilt)
+		{
+			C.Pattern.Add(MakePiece(Building.Class, Transform, true, Length, Building.BuiltWith));
+		}
+	}
+
+	AFGBuildable* AddActor(FRun& R, FScene& S, FCopyState& C, const TCHAR* ClassName, const TCHAR* RecipeName, const FTransform& Transform, TFunction<void(AFGBuildable*)> Before = nullptr)
+	{
+		UClass* Class = GameClass(ClassName);
+		AFGBuildableSubsystem* Buildables = AFGBuildableSubsystem::Get(R.GetWorld());
+		AFGBuildable* Actor = Class && Buildables ? Buildables->BeginSpawnBuildable(Class, Transform) : nullptr;
+		if (!Actor)
+		{
+			R.Check(false, FString::Printf(TEXT("pattern actor %s"), ClassName));
+			return nullptr;
+		}
+		const TSubclassOf<UFGRecipe> With = RecipeOfClass(R, Class, RecipeName);
+		Actor->SetBuiltWithRecipe(With);
+		if (Before)
+		{
+			Before(Actor);
+		}
+		Actor->FinishSpawning(Transform);
+		S.Inside.Add(Actor);
+		C.Pattern.Add(MakePiece(Class, Transform, false, -1.0f, With));
+		return Actor;
+	}
+
+	// The storage containers that must stay untouched (W4): outside the polygon, below MinZ, above MaxZ
+	void AddControlStorages(FRun& R, FScene& S)
+	{
+		for (const FVector& Place : S.ControlPlaces())
+		{
+			S.Controls.Add(SpawnBuildable(R, Asset::Storage, Place));
+		}
+	}
+
+	// CopyBasic's pattern: 4 foundations (2x2), a wall, a beam of 6 m, a Constructor with a recipe, a Smart Splitter with a rule, a painted
+	// container and a belt between two buildings
+	void BuildBasic(FRun& R, FScene& S, FCopyState& C)
+	{
+		C.Base = Ground(R, S.Center);
+		for (const FVector2D Offset : { FVector2D(-400, -400), FVector2D(400, -400), FVector2D(-400, 400), FVector2D(400, 400) })
+		{
+			AddLightweight(R, C, TEXT("Build_Foundation_8x1_01"), TEXT("Recipe_Foundation_8x1_01"), FTransform(C.Base + FVector(Offset, 0)));
+		}
+		AddLightweight(R, C, TEXT("Build_Wall_8x4_01"), TEXT("Recipe_Wall_8x4_01"), FTransform(C.Base + FVector(0, -800, 100)));
+		AddLightweight(R, C, TEXT("Build_Beam"), TEXT("Recipe_Beam"), FTransform(C.Base + FVector(0, 0, 600)), 600.0f);
+		AFGBuildable* Machine = AddActor(R, S, C, TEXT("Build_ConstructorMk1"), TEXT("Recipe_ConstructorMk1"), FTransform(C.Base + FVector(-2500, -1500, 50)));
+		if (AFGBuildableManufacturer* Constructor = Cast<AFGBuildableManufacturer>(Machine))
+		{
+			Constructor->SetRecipe(Recipe(Asset::IronPlate));
+		}
+		AFGBuildable* Splitter = AddActor(R, S, C, TEXT("Build_ConveyorAttachmentSplitterSmart"), TEXT("Recipe_ConveyorAttachmentSplitterSmart"), FTransform(C.Base + FVector(-2500, 1500, 50)));
+		if (AFGBuildableSplitterSmart* Smart = Cast<AFGBuildableSplitterSmart>(Splitter))
+		{
+			Smart->SetSortRules({ FSplitterSortRule(Item(Asset::IronPlateItem), 1) });
+		}
+		AddActor(R, S, C, TEXT("Build_StorageContainerMk1"), TEXT("Recipe_StorageContainerMk1"), FTransform(C.Base + FVector(-2500, 0, 50)), [](AFGBuildable* Actor)
+		{
+			Actor->SetCustomizationData_Native(TestColor());
+		});
+		AddActor(R, S, C, TEXT("Build_ConveyorBeltMk1"), TEXT("Recipe_ConveyorBeltMk1"), FTransform(C.Base + FVector(-2500, -1100, 150)), [](AFGBuildable* Actor)
+		{
+			if (TArray<FSplinePointData>* Spline = Cast<AFGBuildableConveyorBelt>(Actor)->GetMutableSplinePointData())
+			{
+				Spline->Reset();
+				Spline->Emplace(FVector::ZeroVector, FVector(0, 600, 0));
+				Spline->Emplace(FVector(0, 600, 0), FVector(0, 600, 0));
+			}
+		});
+		AddControlStorages(R, S);
+	}
+
+	// FillGrid's pattern: one foundation; AddScene wants an actor in the area, the controls' outside container stands in for it
+	void BuildSingle(FRun& R, FScene& S, FCopyState& C)
+	{
+		C.Base = Ground(R, S.Center);
+		AddLightweight(R, C, TEXT("Build_Foundation_8x1_01"), TEXT("Recipe_Foundation_8x1_01"), FTransform(C.Base));
+		AddControlStorages(R, S);
+		S.Inside.Add(S.Controls[0]);
+	}
+
+	// The middle of the pattern's places in XY: the copy's default rotation centre (the original's AreaCenter)
+	FVector PlacesCenter(const FCopyState& C)
+	{
+		FBox2D Box(ForceInit);
+		for (const FPiece& Piece : C.Pattern)
+		{
+			Box += FVector2D(Piece.Transform.GetLocation());
+		}
+		return FVector(Box.GetCenter(), 0.0);
+	}
+
+	FTransform Expected(const FCopyState& C, const FPiece& Piece)
+	{
+		const FQuat Turn(FRotator(0, C.Yaw, 0));
+		FTransform Out = Piece.Transform;
+		Out.SetLocation(C.Pivot + C.Delta + Turn.RotateVector(Piece.Transform.GetLocation() - C.Pivot));
+		Out.SetRotation(Turn * Piece.Transform.GetRotation());
+		return Out;
+	}
+
+	bool SameRotation(const FQuat& A, const FQuat& B)
+	{
+		return FMath::RadiansToDegrees(A.AngularDistance(B)) <= 0.1;
+	}
+
+	// The copy of every piece the copy takes stands where expected (1 cm, 0.1 degree) with its data, the belt has none; with bPresent
+	// false none of them stands there
+	void CheckCopies(FRun& R, FCopyState& C, bool bPresent, const TCHAR* When)
+	{
+		UWorld* World = R.GetWorld();
+		for (FPiece& Piece : C.Pattern)
+		{
+			Piece.Resolve();
+		}
+		int32 Found = 0, Taken = 0;
+		for (const FPiece& Piece : C.Pattern)
+		{
+			const FTransform Want = Expected(C, Piece);
+			if (Piece.bIgnored)
+			{
+				R.Check(!FindActor(World, Piece.Class, Want.GetLocation()), FString::Printf(TEXT("%s: no copy of %s"), When, *GetNameSafe(Piece.Class)));
+				continue;
+			}
+			++Taken;
+			bool bOk = false;
+			FString Got = TEXT("none");
+			if (Piece.bLightweight)
+			{
+				const FRuntimeBuildableInstanceData* Copy = FindLightweight(World, Piece.Class, Want.GetLocation());
+				bOk = Copy && SameRotation(Copy->Transform.GetRotation(), Want.GetRotation()) && (Piece.BeamLength < 0.0f || FMath::IsNearlyEqual(BeamLength(Copy->TypeSpecificData), Piece.BeamLength));
+				Got = Copy ? FString::Printf(TEXT("yaw %.2f, length %.1f"), Copy->Transform.Rotator().Yaw, BeamLength(Copy->TypeSpecificData)) : Got;
+			}
+			else if (const AFGBuildable* Copy = FindActor(World, Piece.Class, Want.GetLocation()))
+			{
+				bOk = SameRotation(Copy->GetActorQuat(), Want.GetRotation()) && Copy->GetBuiltWithRecipe() == Piece.BuiltWith;
+				if (const AFGBuildableManufacturer* Machine = Cast<AFGBuildableManufacturer>(Copy))
+				{
+					bOk &= Machine->GetCurrentRecipe() == Recipe(Asset::IronPlate);
+				}
+				if (const AFGBuildableSplitterSmart* Smart = Cast<AFGBuildableSplitterSmart>(Copy))
+				{
+					const TArray<FSplitterSortRule> Rules = Smart->GetSortRules();
+					bOk &= Rules.Num() == 1 && Rules[0].ItemClass == Item(Asset::IronPlateItem) && Rules[0].OutputIndex == 1;
+				}
+				if (Copy->IsA<AFGBuildableStorage>())
+				{
+					bOk &= Copy->GetCustomizationData_Native() == TestColor();
+				}
+				Got = FString::Printf(TEXT("yaw %.2f, data kept %d"), Copy->GetActorRotation().Yaw, bOk);
+			}
+			Found += bOk ? 1 : 0;
+			if (bPresent != bOk)
+			{
+				R.Check(false, FString::Printf(TEXT("%s: %s at %s yaw %.2f: %s"), When, *GetNameSafe(Piece.Class), *Want.GetLocation().ToCompactString(), Want.Rotator().Yaw, *Got));
+			}
+		}
+		R.Check(bPresent ? Found == Taken : Found == 0, FString::Printf(TEXT("%s: copies in place %d of %d (want %d)"), When, Found, Taken, bPresent ? Taken : 0));
+	}
+
+	// The pattern itself and the controls are untouched
+	void CheckPattern(FRun& R, const FScene& S, const FCopyState& C, const TCHAR* When)
+	{
+		int32 Kept = 0;
+		for (const FPiece& Piece : C.Pattern)
+		{
+			Kept += (Piece.bLightweight ? FindLightweight(R.GetWorld(), Piece.Class, Piece.Transform.GetLocation()) != nullptr
+				: FindActor(R.GetWorld(), Piece.Class, Piece.Transform.GetLocation()) != nullptr) ? 1 : 0;
+		}
+		int32 ControlCopies = 0;
+		for (const TWeakObjectPtr<AFGBuildable>& Control : S.Controls)
+		{
+			ControlCopies += Control.IsValid() && FindActor(R.GetWorld(), Control->GetClass(), Control->GetActorLocation() + C.Delta) ? 1 : 0;
+		}
+		R.Check(Kept == C.Pattern.Num() && AllValid(S.Controls) && ControlCopies == 0,
+			FString::Printf(TEXT("%s: pattern kept %d of %d, controls %d, copies of controls %d (want 0)"), When, Kept, C.Pattern.Num(), S.Controls.Num(), ControlCopies));
+	}
+
+	// A number typed into one of the windows' number boxes
+	void SetBox(UUserWidget* Window, const TCHAR* Name, double Value)
+	{
+		UUserWidget* Box = Window ? Cast<UUserWidget>(Window->GetWidgetFromName(Name)) : nullptr;
+		UEditableTextBox* Text = Box ? Cast<UEditableTextBox>(Box->GetWidgetFromName(TEXT("TextBox"))) : nullptr;
+		if (Text)
+		{
+			Text->SetText(FText::FromString(FString::SanitizeFloat(Value, 0)));
+		}
+		else
+		{
+			UE_LOG(LogAreaActionsCpp, Display, TEXT("AATEST no number box %s in %s"), Name, *GetNameSafe(Window));
+		}
+	}
+
+	void SetCost(UUserWidget* Window, bool bUseCost)
+	{
+		if (UCheckBox* Box = Window ? Cast<UCheckBox>(Window->GetWidgetFromName(TEXT("UseBuildCost"))) : nullptr)
+		{
+			Box->SetIsChecked(bUseCost);
+		}
+	}
+
+	// The Copy window: move (m) and turn (degrees) typed in, "Use build cost" set, then Button
+	void AddCopyWindow(FRun& R, const FVector& DeltaMetres, double Yaw, bool bUseCost, const TCHAR* Button = TEXT("OkButton"))
+	{
+		AddOnWindow(R, TEXT("Widget_Copy"), [=](FRun& Self, UUserWidget* Window)
+		{
+			SetBox(Window, TEXT("XNumberBox"), DeltaMetres.X);
+			SetBox(Window, TEXT("YNumberBox"), DeltaMetres.Y);
+			SetBox(Window, TEXT("ZNumberBox"), DeltaMetres.Z);
+			SetBox(Window, TEXT("RotationZ"), Yaw);
+			SetCost(Window, bUseCost);
+			Self.Check(PressButton(Window, Button), FString::Printf(TEXT("Copy: %s with %s m, %.0f degrees, cost %d"), Button, *DeltaMetres.ToCompactString(), Yaw, bUseCost));
+		});
+	}
+
+	void AddFillWindow(FRun& R, const FVector& BorderMetres, const FIntVector& Amount, const FVector2D& RampMetres, bool bUseCost)
+	{
+		AddOnWindow(R, TEXT("Widget_Fill"), [=](FRun& Self, UUserWidget* Window)
+		{
+			SetBox(Window, TEXT("XBorder"), BorderMetres.X);
+			SetBox(Window, TEXT("YBorder"), BorderMetres.Y);
+			SetBox(Window, TEXT("ZBorder"), BorderMetres.Z);
+			SetBox(Window, TEXT("XAmount"), Amount.X);
+			SetBox(Window, TEXT("YAmount"), Amount.Y);
+			SetBox(Window, TEXT("ZAmount"), Amount.Z);
+			SetBox(Window, TEXT("XRamp"), RampMetres.X);
+			SetBox(Window, TEXT("YRamp"), RampMetres.Y);
+			SetCost(Window, bUseCost);
+			Self.Check(PressButton(Window, TEXT("OkButton")), FString::Printf(TEXT("Fill: OK with gap %s m, amount %s, ramp %s m, cost %d"), *BorderMetres.ToCompactString(), *Amount.ToString(),
+				*RampMetres.ToString(), bUseCost));
+		});
+	}
+
+	void AddCheckMessage(FRun& R, const FSceneRef& S, const FString& Want)
+	{
+		R.Steps.Add([S, Want](FRun& Self)
+		{
+			Self.Check(S->Message.Contains(Want), FString::Printf(TEXT("result '%s' has '%s'"), *S->Message, *Want));
+			return EStep::Next;
+		});
+	}
+
+	// The cost of one copy of the pattern, from the game's recipes (a beam's times its length)
+	AreaActionsBuildings::FItemCounts PatternCost(const FRun& R, const FCopyState& C)
+	{
+		AreaActionsBuildings::FItemCounts Cost;
+		for (const FPiece& Piece : C.Pattern)
+		{
+			if (Piece.bIgnored || !Piece.BuiltWith)
+			{
+				continue;
+			}
+			int32 Times = 1;
+			if (Piece.BeamLength > 0.0f)
+			{
+				Times = FMath::Max(1, Piece.Class->GetDefaultObject<AFGBuildableBeam>()->GetDismantleReturnsMultiplierForBeam(Piece.BeamLength));
+			}
+			for (const FItemAmount& Ingredient : UFGRecipe::GetIngredients(R.GetWorld(), Piece.BuiltWith))
+			{
+				Cost.FindOrAdd(Ingredient.ItemClass) += Ingredient.Amount * Times;
+			}
+		}
+		return Cost;
+	}
+
+	FString ItemsText(const AreaActionsBuildings::FItemCounts& Counts)
+	{
+		TArray<FString> Parts;
+		for (const TPair<TSubclassOf<UFGItemDescriptor>, int32>& Entry : Counts)
+		{
+			Parts.Add(FString::Printf(TEXT("%s %d"), *GetNameSafe(Entry.Key), Entry.Value));
+		}
+		return FString::Join(Parts, TEXT(", "));
+	}
+
+	// The depot keeps its contents in a private list; the test sets one item's amount there
+	void SetDepot(UWorld* World, TSubclassOf<UFGItemDescriptor> ItemClass, int32 Amount)
+	{
+		AFGCentralStorageSubsystem* Depot = AFGCentralStorageSubsystem::Get(World);
+		FArrayProperty* Property = Depot ? FindFProperty<FArrayProperty>(Depot->GetClass(), TEXT("mStoredItems")) : nullptr;
+		TArray<FItemAmount>* Items = Property ? Property->ContainerPtrToValuePtr<TArray<FItemAmount>>(Depot) : nullptr;
+		if (!Items)
+		{
+			UE_LOG(LogAreaActionsCpp, Display, TEXT("AATEST no depot list"));
+			return;
+		}
+		Items->RemoveAll([ItemClass](const FItemAmount& Entry) { return Entry.ItemClass == ItemClass; });
+		if (Amount > 0)
+		{
+			Items->Emplace(ItemClass, Amount);
+		}
+	}
+
+	int32 DepotCount(UWorld* World, TSubclassOf<UFGItemDescriptor> ItemClass)
+	{
+		const AFGCentralStorageSubsystem* Depot = AFGCentralStorageSubsystem::Get(World);
+		return Depot ? Depot->GetNumItemsFromCentralStorage(ItemClass) : 0;
+	}
+
+	UFGInventoryComponent* PlayerInventory(const FRun& R)
+	{
+		AFGCharacterPlayer* Character = GetCharacter(R);
+		return Character ? Character->GetInventory() : nullptr;
+	}
+
+	int32 StorageCount(const TWeakObjectPtr<AFGBuildableStorage>& Box, TSubclassOf<UFGItemDescriptor> ItemClass)
+	{
+		return Box.IsValid() ? Box->GetStorageInventory()->GetNumItems(ItemClass) : 0;
+	}
+
+	// The cost's sources, per item: Own in the player's inventory (their own items of the kind go first), Near in a container 15 m behind
+	// the player, Far in one 600 m away, Depot in the depot; each a function of the item's cost
+	void SetCostSources(FRun& R, FCopyState& C, TFunction<int32(int32)> Own, TFunction<int32(int32)> Near, TFunction<int32(int32)> Far, TFunction<int32(int32)> Depot)
+	{
+		UWorld* World = R.GetWorld();
+		C.Cost = PatternCost(R, C);
+		UFGInventoryComponent* Inventory = PlayerInventory(R);
+		const APawn* Pawn = R.GetPlayer()->GetPawn();
+		if (!C.NearBox.IsValid())
+		{
+			C.NearBox = SpawnStorage(R, Ground(R, Pawn->GetActorLocation() - Pawn->GetActorForwardVector() * 1500.0), 0, 0);
+			C.FarBox = SpawnStorage(R, Ground(R, Pawn->GetActorLocation() + FVector(0, 60000, 0)), 0, 0);
+		}
+		C.Inventory.Reset();
+		C.Near.Reset();
+		C.Far.Reset();
+		C.Depot.Reset();
+		for (const TPair<TSubclassOf<UFGItemDescriptor>, int32>& Entry : C.Cost)
+		{
+			auto Fill = [&Entry](UFGInventoryComponent* Into, int32 Amount)
+			{
+				if (Into)
+				{
+					Into->Remove(Entry.Key, Into->GetNumItems(Entry.Key));
+					if (Amount > 0)
+					{
+						Into->AddStack(FInventoryStack(Amount, Entry.Key), true);
+					}
+				}
+			};
+			Fill(Inventory, Own(Entry.Value));
+			Fill(C.NearBox.IsValid() ? C.NearBox->GetStorageInventory() : nullptr, Near(Entry.Value));
+			Fill(C.FarBox.IsValid() ? C.FarBox->GetStorageInventory() : nullptr, Far(Entry.Value));
+			SetDepot(World, Entry.Key, Depot(Entry.Value));
+			C.Inventory.Add(Entry.Key, Inventory ? Inventory->GetNumItems(Entry.Key) : 0);
+			C.Near.Add(Entry.Key, StorageCount(C.NearBox, Entry.Key));
+			C.Far.Add(Entry.Key, StorageCount(C.FarBox, Entry.Key));
+			C.Depot.Add(Entry.Key, DepotCount(World, Entry.Key));
+		}
+		// The containers are buildings too
+		CountWorld(R, C);
+		R.Step(FString::Printf(TEXT("cost %s; inventory %s; near %s; far %s; depot %s"), *ItemsText(C.Cost), *ItemsText(C.Inventory), *ItemsText(C.Near), *ItemsText(C.Far), *ItemsText(C.Depot)));
+	}
+
+	int32 CostNone(int32) { return 0; }
+	int32 CostOne(int32) { return 1; }
+	int32 CostAllButOne(int32 Cost) { return Cost - 1; }
+	int32 CostAll(int32 Cost) { return Cost; }
+
+	// Each source lost exactly what Taken says (Own, Near, Depot), the far container nothing
+	void CheckSources(FRun& R, const FCopyState& C, TFunction<int32(int32)> FromOwn, TFunction<int32(int32)> FromNear, TFunction<int32(int32)> FromDepot, const TCHAR* When)
+	{
+		UFGInventoryComponent* Inventory = PlayerInventory(R);
+		for (const TPair<TSubclassOf<UFGItemDescriptor>, int32>& Entry : C.Cost)
+		{
+			const int32 Own = Inventory ? Inventory->GetNumItems(Entry.Key) : -1;
+			const int32 Near = StorageCount(C.NearBox, Entry.Key);
+			const int32 Far = StorageCount(C.FarBox, Entry.Key);
+			const int32 Depot = DepotCount(R.GetWorld(), Entry.Key);
+			const int32 WantOwn = C.Inventory.FindRef(Entry.Key) - FromOwn(Entry.Value);
+			const int32 WantNear = C.Near.FindRef(Entry.Key) - FromNear(Entry.Value);
+			const int32 WantDepot = C.Depot.FindRef(Entry.Key) - FromDepot(Entry.Value);
+			R.Check(Own == WantOwn && Near == WantNear && Far == C.Far.FindRef(Entry.Key) && Depot == WantDepot,
+				FString::Printf(TEXT("%s: %s inventory %d (want %d), near %d (want %d), far %d (want %d), depot %d (want %d)"), When, *GetNameSafe(Entry.Key), Own, WantOwn,
+					Near, WantNear, Far, C.Far.FindRef(Entry.Key), Depot, WantDepot));
+		}
+	}
+
+	void CheckNothingBuilt(FRun& R, const FCopyState& C, const TCHAR* When)
+	{
+		const int32 Actors = ActorCount(R.GetWorld()), Lightweights = LightweightCount(R.GetWorld());
+		R.Check(Actors == C.ActorsBefore && Lightweights == C.LightweightsBefore,
+			FString::Printf(TEXT("%s: actors %d (were %d), lightweights %d (were %d)"), When, Actors, C.ActorsBefore, Lightweights, C.LightweightsBefore));
+	}
+
+	// A copy scene: the pattern and the area; the world's counts after it
+	void AddCopyScene(FRun& R, const FSceneRef& S, const FCopyRef& C, TFunction<void(FRun&, FScene&, FCopyState&)> Build)
+	{
+		AddScene(R, S, 4000.0, [C, Build](FRun& Self, FScene& Scene)
+		{
+			Build(Self, Scene, *C);
+			C->Pivot = PlacesCenter(*C);
+			Self.Step(FString::Printf(TEXT("pattern: %d pieces at %s, places centre %s"), C->Pattern.Num(), *C->Base.ToCompactString(), *C->Pivot.ToCompactString()));
+		});
+		R.Steps.Add([C](FRun& Self)
+		{
+			CountWorld(Self, *C);
+			C->JobsBefore = AAreaActionsServerSubsystem::FinishedJobs;
+			return EStep::Next;
+		});
+	}
+
+	// One Copy through the window and its result window
+	void AddCopy(FRun& R, const FSceneRef& S, const FCopyRef& C, const FVector& DeltaMetres, double Yaw, bool bUseCost)
+	{
+		R.Steps.Add([C, DeltaMetres, Yaw](FRun& Self)
+		{
+			C->Delta = DeltaMetres * 100.0;
+			C->Yaw = Yaw;
+			return EStep::Next;
+		});
+		AddOpenAction(R, TEXT("Copy"));
+		AddCopyWindow(R, DeltaMetres, Yaw, bUseCost);
+		AddResultWindow(R, S);
+	}
+
+	void AddCopyBasic(FRun& R)
+	{
+		FSceneRef S = MakeShared<FScene>();
+		FCopyRef C = MakeShared<FCopyState>();
+		AddCopyScene(R, S, C, BuildBasic);
+		AddCopy(R, S, C, FVector(20, 0, 0), 0.0, false);
+		AddCheckMessage(R, S, TEXT("Copied 9 buildings."));
+		R.Steps.Add([S, C](FRun& Self)
+		{
+			CheckCopies(Self, *C, true, TEXT("copied"));
+			CheckPattern(Self, *S, *C, TEXT("copied"));
+			Self.Check(AAreaActionsServerSubsystem::FinishedJobs - C->JobsBefore == 1, TEXT("one AAJOB line"));
+			return EStep::Next;
+		});
+	}
+
+	void AddCopyRotate(FRun& R)
+	{
+		FSceneRef S = MakeShared<FScene>();
+		FCopyRef C = MakeShared<FCopyState>();
+		AddCopyScene(R, S, C, BuildBasic);
+		// Round the middle of the area
+		AddCopy(R, S, C, FVector(0, 100, 0), 90.0, false);
+		AddCheckMessage(R, S, TEXT("Copied 9 buildings."));
+		R.Steps.Add([C](FRun& Self) { CheckCopies(Self, *C, true, TEXT("turned round the middle")); return EStep::Next; });
+		// Round a centre picked on the Constructor
+		R.Steps.Add([C](FRun& Self) { C->Delta = FVector(0, -10000, 0); C->Yaw = 90.0; return EStep::Next; });
+		AddOpenAction(R, TEXT("Copy"));
+		AddPress(R, TEXT("Widget_Copy"), TEXT("SetRotationCenter"));
+		R.Steps.Add([C](FRun& Self)
+		{
+			if (const FPiece* Machine = C->Pattern.FindByPredicate([](const FPiece& Piece) { return Piece.Class->IsChildOf(AFGBuildableManufacturer::StaticClass()); }))
+			{
+				LookAt(Self, Machine->Transform.GetLocation() + FVector(0, 0, 300));
+			}
+			return EStep::Next;
+		});
+		R.Steps.Add(WaitFrames(3));
+		R.Steps.Add([](FRun& Self)
+		{
+			FHitResult Hit;
+			const bool bHit = AimHit(Self, Hit);
+			Self.Check(bHit && Cast<AFGBuildableManufacturer>(HitOwner(Self.GetWorld(), Hit)), FString::Printf(TEXT("aim hits the Constructor (%s)"), bHit ? *GetNameSafe(Hit.GetActor()) : TEXT("nothing")));
+			Self.Step(TEXT("left click picks the rotation centre"));
+			PressKey(Self, EKeys::LeftMouseButton);
+			return EStep::Next;
+		});
+		R.Steps.Add(WaitFrames(3));
+		R.Steps.Add([C](FRun& Self)
+		{
+			UClass* MarkerClass = LoadClass<AActor>(nullptr, TEXT("/AreaActions/Actions/Copy/CopyRotationCenter.CopyRotationCenter_C"));
+			AActor* Marker = MarkerClass ? UGameplayStatics::GetActorOfClass(Self.GetWorld(), MarkerClass) : nullptr;
+			if (Self.Check(Marker != nullptr, FString::Printf(TEXT("rotation centre marker %s"), Marker ? *Marker->GetActorLocation().ToCompactString() : TEXT("none"))))
+			{
+				C->Pivot = FVector(Marker->GetActorLocation().X, Marker->GetActorLocation().Y, 0.0);
+			}
+			return EStep::Next;
+		});
+		AddCopyWindow(R, FVector(0, -100, 0), 90.0, false);
+		AddResultWindow(R, S);
+		AddCheckMessage(R, S, TEXT("Copied 9 buildings."));
+		R.Steps.Add([C](FRun& Self) { CheckCopies(Self, *C, true, TEXT("turned round the picked centre")); return EStep::Next; });
+	}
+
+	// The copies land outside the area (80 m wide), so the second request finds only the pattern again
+	void AddCopyTwice(FRun& R)
+	{
+		FSceneRef S = MakeShared<FScene>();
+		FCopyRef C = MakeShared<FCopyState>();
+		AddCopyScene(R, S, C, BuildBasic);
+		R.Steps.Add([C](FRun& Self) { SetCostSources(Self, *C, [](int32 Cost) { return 2 * Cost; }, CostNone, CostNone, CostNone); return EStep::Next; });
+		AddCopy(R, S, C, FVector(100, 0, 0), 0.0, true);
+		AddCheckMessage(R, S, TEXT("Copied 9 buildings."));
+		R.Steps.Add([C](FRun& Self)
+		{
+			CheckSources(Self, *C, CostAll, CostNone, CostNone, TEXT("first copy"));
+			for (TPair<TSubclassOf<UFGItemDescriptor>, int32>& Entry : C->Inventory)
+			{
+				Entry.Value -= C->Cost.FindRef(Entry.Key);
+			}
+			CountWorld(Self, *C);
+			return EStep::Next;
+		});
+		AddCopy(R, S, C, FVector(100, 0, 0), 0.0, true);
+		AddCheckMessage(R, S, TEXT("Copied 0 buildings."));
+		R.Steps.Add([C](FRun& Self)
+		{
+			CheckSources(Self, *C, CostNone, CostNone, CostNone, TEXT("second copy"));
+			CheckNothingBuilt(Self, *C, TEXT("second copy"));
+			return EStep::Next;
+		});
+	}
+
+	void AddCopySaveLoad(FRun& R)
+	{
+		FSceneRef S = MakeShared<FScene>();
+		FCopyRef C = MakeShared<FCopyState>();
+		AddCopyScene(R, S, C, BuildBasic);
+		AddCopy(R, S, C, FVector(20, 0, 0), 0.0, false);
+		AddCheckMessage(R, S, TEXT("Copied 9 buildings."));
+		R.Steps.Add([C](FRun& Self) { CheckCopies(Self, *C, true, TEXT("copied")); return EStep::Next; });
+		AddSaveAndLoad(R, TEXT("AATest_CopySaveLoad"));
+		R.Steps.Add([C](FRun& Self) { CheckCopies(Self, *C, true, TEXT("loaded")); return EStep::Next; });
+		AddDeleteSave(R, TEXT("AATest_CopySaveLoad"));
+	}
+
+	// One of each item in the inventory, the rest in the container in range; the one out of range holds as much as the cost
+	void AddCopyCost(FRun& R)
+	{
+		FSceneRef S = MakeShared<FScene>();
+		FCopyRef C = MakeShared<FCopyState>();
+		AddCopyScene(R, S, C, BuildBasic);
+		R.Steps.Add([C](FRun& Self) { SetCostSources(Self, *C, CostOne, CostAllButOne, CostAll, CostNone); return EStep::Next; });
+		AddCopy(R, S, C, FVector(20, 0, 0), 0.0, true);
+		AddCheckMessage(R, S, TEXT("Copied 9 buildings."));
+		R.Steps.Add([C](FRun& Self)
+		{
+			CheckSources(Self, *C, CostOne, CostAllButOne, CostNone, TEXT("paid"));
+			CheckCopies(Self, *C, true, TEXT("paid"));
+			return EStep::Next;
+		});
+	}
+
+	void AddCopyCostMissing(FRun& R)
+	{
+		FSceneRef S = MakeShared<FScene>();
+		FCopyRef C = MakeShared<FCopyState>();
+		AddCopyScene(R, S, C, BuildBasic);
+		R.Steps.Add([C](FRun& Self) { SetCostSources(Self, *C, CostOne, CostNone, CostAll, CostNone); return EStep::Next; });
+		AddCopy(R, S, C, FVector(20, 0, 0), 0.0, true);
+		R.Steps.Add([S, C](FRun& Self)
+		{
+			Self.Check(S->Message.StartsWith(TEXT("Missing: ")), FString::Printf(TEXT("result '%s' lists what is missing"), *S->Message));
+			for (const TPair<TSubclassOf<UFGItemDescriptor>, int32>& Entry : C->Cost)
+			{
+				const FString Want = FString::Printf(TEXT("%d %s"), Entry.Value - 1, *UFGItemDescriptor::GetItemName(Entry.Key).ToString());
+				Self.Check(Entry.Value == 1 ? !S->Message.Contains(UFGItemDescriptor::GetItemName(Entry.Key).ToString()) : S->Message.Contains(Want),
+					FString::Printf(TEXT("missing has '%s'"), *Want));
+			}
+			CheckSources(Self, *C, CostNone, CostNone, CostNone, TEXT("nothing taken"));
+			CheckNothingBuilt(Self, *C, TEXT("nothing built"));
+			return EStep::Next;
+		});
+	}
+
+	void AddCopyNoCost(FRun& R)
+	{
+		FSceneRef S = MakeShared<FScene>();
+		FCopyRef C = MakeShared<FCopyState>();
+		AddCopyScene(R, S, C, BuildBasic);
+		R.Steps.Add([C](FRun& Self)
+		{
+			SetCostSources(Self, *C, CostOne, CostNone, CostNone, CostNone);
+			AFGGameState* State = Self.GetWorld()->GetGameState<AFGGameState>();
+			if (State)
+			{
+				State->SetCheatNoCost(true);
+			}
+			Self.Check(State && PlayerInventory(Self)->GetNoBuildCost(), TEXT("No Build Cost on"));
+			return EStep::Next;
+		});
+		AddCopy(R, S, C, FVector(20, 0, 0), 0.0, true);
+		AddCheckMessage(R, S, TEXT("Copied 9 buildings."));
+		R.Steps.Add([C](FRun& Self)
+		{
+			CheckCopies(Self, *C, true, TEXT("no cost"));
+			CheckSources(Self, *C, CostNone, CostNone, CostNone, TEXT("no cost"));
+			if (AFGGameState* State = Self.GetWorld()->GetGameState<AFGGameState>())
+			{
+				State->SetCheatNoCost(false);
+			}
+			return EStep::Next;
+		});
+	}
+
+	// AA-071: one of each item in the inventory, the rest only in the depot; first the depot lacks one of the first item (only that one
+	// is missing), then it has enough
+	void AddCopyCostDepot(FRun& R)
+	{
+		FSceneRef S = MakeShared<FScene>();
+		FCopyRef C = MakeShared<FCopyState>();
+		AddCopyScene(R, S, C, BuildBasic);
+		TSharedRef<TSubclassOf<UFGItemDescriptor>> Short = MakeShared<TSubclassOf<UFGItemDescriptor>>();
+		R.Steps.Add([C, Short](FRun& Self)
+		{
+			SetCostSources(Self, *C, CostOne, CostNone, CostNone, CostAllButOne);
+			for (const TPair<TSubclassOf<UFGItemDescriptor>, int32>& Entry : C->Cost)
+			{
+				if (!*Short && Entry.Value > 1)
+				{
+					*Short = Entry.Key;
+					SetDepot(Self.GetWorld(), Entry.Key, Entry.Value - 2);
+					C->Depot[Entry.Key] = DepotCount(Self.GetWorld(), Entry.Key);
+				}
+			}
+			Self.Step(FString::Printf(TEXT("depot short of one %s"), *GetNameSafe(Short->Get())));
+			return EStep::Next;
+		});
+		AddCopy(R, S, C, FVector(20, 0, 0), 0.0, true);
+		R.Steps.Add([S, C, Short](FRun& Self)
+		{
+			const FString Want = FString::Printf(TEXT("Missing: 1 %s"), *UFGItemDescriptor::GetItemName(*Short).ToString());
+			Self.Check(S->Message == Want, FString::Printf(TEXT("result '%s' is '%s'"), *S->Message, *Want));
+			CheckSources(Self, *C, CostNone, CostNone, CostNone, TEXT("short"));
+			CheckNothingBuilt(Self, *C, TEXT("short"));
+			return EStep::Next;
+		});
+		R.Steps.Add([C](FRun& Self) { SetCostSources(Self, *C, CostOne, CostNone, CostNone, CostAllButOne); return EStep::Next; });
+		AddCopy(R, S, C, FVector(20, 0, 0), 0.0, true);
+		AddCheckMessage(R, S, TEXT("Copied 9 buildings."));
+		R.Steps.Add([C](FRun& Self)
+		{
+			CheckSources(Self, *C, CostOne, CostNone, CostAllButOne, TEXT("paid from the depot"));
+			CheckCopies(Self, *C, true, TEXT("paid from the depot"));
+			return EStep::Next;
+		});
+	}
+
+	// Fill's copies of the single foundation: Steps along X and Y, the given pitch, Z per step along X
+	void CheckGrid(FRun& R, const FCopyState& C, const TArray<FIntPoint>& Steps, double Pitch, double RampX, const TCHAR* When)
+	{
+		const FPiece& Foundation = C.Pattern[0];
+		int32 Found = 0;
+		for (const FIntPoint& Step : Steps)
+		{
+			const FVector Want = Foundation.Transform.GetLocation() + FVector(Step.X * Pitch, Step.Y * Pitch, FMath::Abs(Step.X) * RampX);
+			const bool bHere = FindLightweight(R.GetWorld(), Foundation.Class, Want) != nullptr;
+			Found += bHere ? 1 : 0;
+			if (!bHere)
+			{
+				R.Check(false, FString::Printf(TEXT("%s: no foundation at step %s, %s"), When, *Step.ToString(), *Want.ToCompactString()));
+			}
+		}
+		R.Check(Found == Steps.Num() && LightweightCount(R.GetWorld()) == C.LightweightsBefore + Steps.Num(),
+			FString::Printf(TEXT("%s: foundations in the grid %d of %d, lightweights %d (want %d)"), When, Found, Steps.Num(), LightweightCount(R.GetWorld()), C.LightweightsBefore + Steps.Num()));
+	}
+
+	// Amount (3, 2, 1) with a gap of 1 m and a drop of 1 m per step along X; negative: (-3, -2, 1) in the test place's negative X and Y
+	void AddFillGrid(FRun& R, bool bNegative)
+	{
+		FSceneRef S = MakeShared<FScene>();
+		FCopyRef C = MakeShared<FCopyState>();
+		AddCopyScene(R, S, C, BuildSingle);
+		R.Steps.Add([C, bNegative](FRun& Self)
+		{
+			Self.Check(!bNegative || (C->Base.X < 0.0 && C->Base.Y < 0.0), FString::Printf(TEXT("pattern at %s"), *C->Base.ToCompactString()));
+			return EStep::Next;
+		});
+		AddOpenAction(R, TEXT("Fill"));
+		const double Ramp = bNegative ? 0.0 : -1.0;
+		AddFillWindow(R, FVector(1, 1, 0), bNegative ? FIntVector(-3, -2, 1) : FIntVector(3, 2, 1), FVector2D(Ramp, 0), false);
+		AddResultWindow(R, S);
+		AddCheckMessage(R, S, TEXT("Filled with 5 buildings."));
+		R.Steps.Add([C, bNegative, Ramp](FRun& Self)
+		{
+			TArray<FIntPoint> Steps;
+			for (int32 X = 0; X < 3; ++X)
+			{
+				for (int32 Y = 0; Y < 2; ++Y)
+				{
+					if (X || Y)
+					{
+						Steps.Add(bNegative ? FIntPoint(-X, -Y) : FIntPoint(X, Y));
+					}
+				}
+			}
+			// The foundation is 8 m: the step is 8 m and the gap
+			CheckGrid(Self, *C, Steps, 900.0, Ramp * 100.0, bNegative ? TEXT("negative fill") : TEXT("fill"));
+			return EStep::Next;
+		});
+	}
+
+	void AddCopyPreview(FRun& R, const FCopyRef& C)
+	{
+		R.Steps.Add([C](FRun& Self) { C->Delta = FVector(2000, 0, 0); C->Yaw = 0.0; return EStep::Next; });
+		AddOpenAction(R, TEXT("Copy"));
+		AddCopyWindow(R, FVector(20, 0, 0), 0.0, false, TEXT("PreviewButton"));
+		R.Steps.Add(WaitFrames(5));
+		R.Steps.Add([C](FRun& Self)
+		{
+			Self.Check(AAreaActionsPreview::LiveGhosts == 9, FString::Printf(TEXT("ghosts %d (want 9)"), AAreaActionsPreview::LiveGhosts));
+			CheckNothingBuilt(Self, *C, TEXT("preview"));
+			return EStep::Next;
+		});
+	}
+
+	// D7: the preview shows ghosts, not buildings; Cancel and the tool put away leave none; a save made meanwhile has no copies
+	void AddPreview(FRun& R)
+	{
+		FSceneRef S = MakeShared<FScene>();
+		FCopyRef C = MakeShared<FCopyState>();
+		AddCopyScene(R, S, C, BuildBasic);
+		AddCopyPreview(R, C);
+		AddOnWindow(R, TEXT("Widget_Copy"), [](FRun& Self, UUserWidget* Window)
+		{
+			UUserWidget* Frame = Cast<UUserWidget>(Window->GetWidgetFromName(TEXT("WindowDark")));
+			FMulticastDelegateProperty* Property = Frame ? FindFProperty<FMulticastDelegateProperty>(Frame->GetClass(), TEXT("OnClose")) : nullptr;
+			if (Property)
+			{
+				Property->ContainerPtrToValuePtr<FMulticastScriptDelegate>(Frame)->ProcessMulticastDelegate<UObject>(nullptr);
+			}
+			Self.Check(Property != nullptr, TEXT("Copy window closed with X"));
+		});
+		R.Steps.Add(WaitFrames(5));
+		R.Steps.Add([](FRun& Self)
+		{
+			Self.Check(AAreaActionsPreview::LiveGhosts == 0 && !ActiveAction(Self), FString::Printf(TEXT("after Cancel: ghosts %d, action %s"), AAreaActionsPreview::LiveGhosts, *GetNameSafe(ActiveAction(Self))));
+			return EStep::Next;
+		});
+		AddCopyPreview(R, C);
+		R.Steps.Add([](FRun& Self)
+		{
+			AFGCharacterPlayer* Character = GetCharacter(Self);
+			if (AAreaActionsEquipment* Tool = GetTool(Self); Character && Tool)
+			{
+				Character->UnequipEquipment(Tool);
+			}
+			return EStep::Next;
+		});
+		R.Steps.Add(WaitFrames(10));
+		R.Steps.Add([](FRun& Self)
+		{
+			Self.Check(AAreaActionsPreview::LiveGhosts == 0 && !GetTool(Self), FString::Printf(TEXT("tool put away: ghosts %d, tool %s"), AAreaActionsPreview::LiveGhosts, *GetNameSafe(GetTool(Self))));
+			return EStep::Next;
+		});
+		AddEquipTool(R);
+		R.Steps.Add([S](FRun& Self) { Self.Check(SetToolArea(Self, *S), TEXT("tool area set again")); return EStep::Next; });
+		AddCopyPreview(R, C);
+		AddSaveAndLoad(R, TEXT("AATest_Preview"));
+		R.Steps.Add([C](FRun& Self)
+		{
+			CheckCopies(Self, *C, false, TEXT("loaded after a preview"));
+			Self.Check(AAreaActionsPreview::LiveGhosts == 0, FString::Printf(TEXT("ghosts after the load %d"), AAreaActionsPreview::LiveGhosts));
+			return EStep::Next;
+		});
+		AddDeleteSave(R, TEXT("AATest_Preview"));
+	}
+
+	// The building selection on a foundation (lightweight): its box
+	void AddSelectLightweight(FRun& R)
+	{
+		AddEquipTool(R);
+		TSharedRef<FTransform> Placed = MakeShared<FTransform>();
+		R.Steps.Add([Placed](FRun& Self)
+		{
+			const APawn* Pawn = Self.GetPlayer()->GetPawn();
+			FCopyState Built;
+			*Placed = FTransform(FRotator(0, 23, 0), Ground(Self, Pawn->GetActorLocation() + Pawn->GetActorForwardVector() * 2000.0));
+			AddLightweight(Self, Built, TEXT("Build_Foundation_8x1_01"), TEXT("Recipe_Foundation_8x1_01"), *Placed);
+			Self.Check(Built.Pattern.Num() == 1, FString::Printf(TEXT("foundation built at %s"), *Placed->GetLocation().ToCompactString()));
+			Self.Check(SelectState(GetTool(Self), TEXT("NewEnumerator14")), TEXT("building selection mode set"));
+			return EStep::Next;
+		});
+		R.Steps.Add(WaitFrames(10));
+		R.Steps.Add([Placed](FRun& Self) { LookAt(Self, Placed->GetLocation() + FVector(0, 0, 50)); return EStep::Next; });
+		R.Steps.Add(WaitFrames(3));
+		R.Steps.Add([](FRun& Self)
+		{
+			FHitResult Hit;
+			const bool bHit = AimHit(Self, Hit);
+			AreaActionsBuildings::FSnapshot Target;
+			Self.Check(bHit && AreaActionsBuildings::FromHit(Self.GetWorld(), Hit, Target) && Target.Class == GameClass(TEXT("Build_Foundation_8x1_01")),
+				FString::Printf(TEXT("aim hits the foundation (%s)"), bHit ? *GetNameSafe(Hit.GetActor()) : TEXT("nothing")));
+			PressKey(Self, EKeys::LeftMouseButton);
+			return EStep::Next;
+		});
+		R.Steps.Add(WaitFrames(3));
+		R.Steps.Add([Placed](FRun& Self)
+		{
+			AAreaActionsEquipment* Tool = GetTool(Self);
+			const FBox Box = GameClass(TEXT("Build_Foundation_8x1_01"))->GetDefaultObject<AFGBuildable>()->GetCombinedClearanceBox();
+			double WantMinZ = UE_BIG_NUMBER, WantMaxZ = -UE_BIG_NUMBER;
+			TArray<FVector> Want;
+			for (int32 Index = 0; Index < 8; ++Index)
+			{
+				const FVector Corner = Placed->TransformPosition(FVector(Index & 1 ? Box.Max.X : Box.Min.X, Index & 2 ? Box.Max.Y : Box.Min.Y, Index & 4 ? Box.Max.Z : Box.Min.Z));
+				WantMinZ = FMath::Min(WantMinZ, Corner.Z);
+				WantMaxZ = FMath::Max(WantMaxZ, Corner.Z);
+				if (Index < 4)
+				{
+					Want.Add(Corner);
+				}
+			}
+			const TArray<FVector> Corners = VectorArray(Tool, TEXT("CornerLocations"));
+			int32 Matched = 0;
+			for (const FVector& Corner : Want)
+			{
+				Matched += Corners.ContainsByPredicate([&Corner](const FVector& Got) { return FVector::Dist2D(Corner, Got) <= 1.0; }) ? 1 : 0;
+			}
+			Self.Check(Box.IsValid && Corners.Num() == 4 && Matched == 4, FString::Printf(TEXT("corners %d, matching the foundation's box within 1 cm: %d"), Corners.Num(), Matched));
+			const double MinZ = DoubleValue(Tool, TEXT("MinZ")), MaxZ = DoubleValue(Tool, TEXT("MaxZ"));
+			Self.Check(FMath::Abs(MinZ - WantMinZ) <= 1.0 && FMath::Abs(MaxZ - WantMaxZ) <= 1.0, FString::Printf(TEXT("MinZ %.1f (box %.1f), MaxZ %.1f (box %.1f)"), MinZ, WantMinZ, MaxZ, WantMaxZ));
+			return EStep::Next;
+		});
+	}
+
+	// W5 on a Fill of 5049 foundations, then a request over AreaActions.MaxSpawnPerRequest refused before anything changes
+	void AddFillLarge(FRun& R)
+	{
+		FSceneRef S = MakeShared<FScene>();
+		FCopyRef C = MakeShared<FCopyState>();
+		AddCopyScene(R, S, C, BuildSingle);
+		R.Steps.Add([](FRun& Self)
+		{
+			Self.MaxFrameMs = 0.0;
+			Self.bMeasureFrames = true;
+			Self.StepTimeoutSec = 180.0;
+			return EStep::Next;
+		});
+		AddOpenAction(R, TEXT("Fill"));
+		AddFillWindow(R, FVector(1, 1, 0), FIntVector(101, 50, 1), FVector2D(0, 0), false);
+		AddResultWindow(R, S);
+		AddCheckMessage(R, S, TEXT("Filled with 5,049 buildings."));
+		R.Steps.Add([C](FRun& Self)
+		{
+			Self.bMeasureFrames = false;
+			Self.Check(Self.MaxFrameMs <= 200.0, FString::Printf(TEXT("longest frame during the job: %.1f ms (W5: 200)"), Self.MaxFrameMs));
+			Self.Check(LightweightCount(Self.GetWorld()) == C->LightweightsBefore + 5049, FString::Printf(TEXT("lightweights %d (want %d)"), LightweightCount(Self.GetWorld()), C->LightweightsBefore + 5049));
+			CountWorld(Self, *C);
+			return EStep::Next;
+		});
+		AddOpenAction(R, TEXT("Fill"));
+		AddFillWindow(R, FVector(1, 1, 0), FIntVector(200, 101, 1), FVector2D(0, 0), false);
+		AddResultWindow(R, S);
+		AddCheckMessage(R, S, TEXT("at most 10,000 at once"));
+		R.Steps.Add([C](FRun& Self)
+		{
+			CheckNothingBuilt(Self, *C, TEXT("refused request"));
+			Self.StepTimeoutSec = 30.0;
+			return EStep::Next;
+		});
+	}
+
 	// --- Action windows (AA-081) and the tool's menu (AA-075) ---
 
 	// Counts the Error lines of the mod's C++ category while it lives
@@ -1800,6 +2750,8 @@ namespace
 				FErrorCounter Counter;
 				// OkClicked() sends nothing; Selected takes a recipe
 				bWrong = AAreaActionBase::BindWindowEvent(Window, TEXT("OkClicked"), Target, GET_FUNCTION_NAME_CHECKED(UAreaActionSetRecipe, Selected));
+				// The redirector hands lines to this device later, on a flush
+				GLog->Flush();
 				Errors = Counter.Errors;
 			}
 			Self.Check(!bWrong && Errors == 1, FString::Printf(TEXT("OkClicked to Selected(recipe): bound %d, error lines %d (want 0, 1)"), bWrong, Errors));
@@ -1844,6 +2796,73 @@ namespace
 
 	bool BuildScenario(FRun& R)
 	{
+		if (R.Name == TEXT("CopyBasic"))
+		{
+			AddCopyBasic(R);
+			return true;
+		}
+		if (R.Name == TEXT("CopyRotate"))
+		{
+			AddCopyRotate(R);
+			return true;
+		}
+		if (R.Name == TEXT("CopyTwice"))
+		{
+			AddCopyTwice(R);
+			return true;
+		}
+		if (R.Name == TEXT("CopySaveLoad"))
+		{
+			R.StepTimeoutSec = 60.0;
+			AddCopySaveLoad(R);
+			return true;
+		}
+		if (R.Name == TEXT("CopyCost"))
+		{
+			AddCopyCost(R);
+			return true;
+		}
+		if (R.Name == TEXT("CopyCostMissing"))
+		{
+			AddCopyCostMissing(R);
+			return true;
+		}
+		if (R.Name == TEXT("CopyNoCost"))
+		{
+			AddCopyNoCost(R);
+			return true;
+		}
+		if (R.Name == TEXT("CopyCostDepot"))
+		{
+			AddCopyCostDepot(R);
+			return true;
+		}
+		if (R.Name == TEXT("FillGrid"))
+		{
+			AddFillGrid(R, false);
+			return true;
+		}
+		if (R.Name == TEXT("FillNegative"))
+		{
+			AddFillGrid(R, true);
+			return true;
+		}
+		if (R.Name == TEXT("Preview"))
+		{
+			R.StepTimeoutSec = 60.0;
+			AddPreview(R);
+			return true;
+		}
+		if (R.Name == TEXT("SelectLightweight"))
+		{
+			AddSelectLightweight(R);
+			return true;
+		}
+		if (R.Name == TEXT("FillLarge"))
+		{
+			AddFillLarge(R);
+			return true;
+		}
 		if (R.Name == TEXT("DoubleClick"))
 		{
 			AddDoubleClick(R, true, 0, -27000.0);
@@ -1984,11 +3003,12 @@ namespace
 				Finish(R);
 				return false;
 			}
-			// In the menu the mod's world module does not run: the load is started from here
+			// The load is started from the menu. The game's main menu is the game map with ?closed (TravelToMainMenu), an older one a Menu map.
 			for (const FWorldContext& Context : GEngine->GetWorldContexts())
 			{
 				UWorld* Menu = Context.World();
-				if (!R.bLoadIssued && Menu && Menu->IsGameWorld() && Menu->GetMapName().Contains(TEXT("Menu")) && Menu->HasBegunPlay() && R.Now() - R.AwaitStarted > 5.0)
+				const bool bMenu = Menu && Menu->IsGameWorld() && (Menu->GetMapName().Contains(TEXT("Menu")) || Menu->URL.HasOption(TEXT("closed")));
+				if (!R.bLoadIssued && bMenu && Menu->HasBegunPlay() && R.Now() - R.AwaitStarted > 5.0)
 				{
 					R.bLoadIssued = true;
 					R.Step(FString::Printf(TEXT("in %s: loading %s"), *Menu->GetMapName(), *R.LoadSave));

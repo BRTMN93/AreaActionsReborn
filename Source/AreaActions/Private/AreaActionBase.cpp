@@ -17,6 +17,12 @@ AAreaActionBase* UAreaAction::GetShell() const
 	return GetTypedOuter<AAreaActionBase>();
 }
 
+AAreaActionBase* UAreaAction::GetActiveShell() const
+{
+	AAreaActionBase* Shell = GetShell();
+	return Shell && Shell->IsActive() ? Shell : nullptr;
+}
+
 void AAreaActionBase::BeginPlay()
 {
 	Super::BeginPlay();
@@ -32,6 +38,10 @@ void AAreaActionBase::BeginPlay()
 void AAreaActionBase::EndPlay(const EEndPlayReason::Type Reason)
 {
 	bFinished = true;
+	if (Action)
+	{
+		Action->End();
+	}
 	if (UAreaActionsRCO* Rco = GetRco(); Rco && ResultHandle.IsValid())
 	{
 		Rco->OnResult.Remove(ResultHandle);
@@ -233,6 +243,22 @@ bool AAreaActionBase::ShowFailure(EAreaActionsResultCode Code)
 		return true;
 	default:
 		return false;
+	}
+}
+
+void AAreaActionBase::OnLeftClick()
+{
+	if (IsActive() && Action)
+	{
+		Action->OnClick(false);
+	}
+}
+
+void AAreaActionBase::OnRightClick()
+{
+	if (IsActive() && Action)
+	{
+		Action->OnClick(true);
 	}
 }
 

@@ -18,16 +18,23 @@ class AREAACTIONS_API UAreaAction : public UObject
 
 public:
 	AAreaActionBase* GetShell() const;
+	// The shell while it runs; null once it ended. The window's handlers run also when the tool is put away (the windows close after the
+	// action is gone); they do nothing then
+	AAreaActionBase* GetActiveShell() const;
 	// The area is read; open the first window or send the request
 	virtual void Start() {}
 	// The server's answer to the request sent through the shell
 	virtual void OnResult(const FAreaActionsResult& Result) {}
+	// A click into the world while the action runs (the tool forwards both buttons)
+	virtual void OnClick(bool bRight) {}
+	// The action ends (finished, cancelled or the tool put away): what it put into the world goes
+	virtual void End() {}
 };
 
 // Parent of the Blueprint BaseAction. The tool spawns an action's Blueprint on the player's machine (Equip_AreaActions.InitAction); with
-// NativeAction set, this class runs it in C++ and the Blueprint only holds data. Without it (Copy, Fill, MassDismantle until they move to
-// C++) the Blueprint's own graph runs as before. Names here differ from the Blueprint's members (Title, Description, Player,
-// AreaActionsEquip, Init, Run, Done, Finished), which stay in the Blueprint.
+// NativeAction set, this class runs it in C++ and the Blueprint only holds data. Without it (MassDismantle until it moves to C++) the
+// Blueprint's own graph runs as before. Names here differ from the Blueprint's members (Title, Description, Player, AreaActionsEquip, Init,
+// Run, Done, Finished), which stay in the Blueprint, except OnLeftClick and OnRightClick, which replace BaseAction's own events.
 UCLASS(Abstract)
 class AREAACTIONS_API AAreaActionBase : public AActor
 {
@@ -64,6 +71,15 @@ public:
 	AAreaActionsEquipment* GetEquipment() const;
 	const FAreaActionsArea& GetArea() const { return Area; }
 	bool IsActive() const { return !bFinished && IsValid(this); }
+
+	// The tool's clicks while this action is active (Equip_AreaActions calls them on its ActiveAction)
+	UFUNCTION(BlueprintCallable, Category = "Area Actions")
+	void OnLeftClick();
+	UFUNCTION(BlueprintCallable, Category = "Area Actions")
+	void OnRightClick();
+
+	// The C++ action, for the test mode
+	UAreaAction* GetAction() const { return Action; }
 
 	// Ends the action through the Blueprint's Finished, so the tool destroys it and takes the next one
 	UFUNCTION()

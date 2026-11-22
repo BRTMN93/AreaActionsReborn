@@ -1,6 +1,7 @@
 #include "AreaActionsEquipment.h"
 #include "AreaActionBase.h"
 #include "AreaActionsBuildings.h"
+#include "AreaActionsLog.h"
 #include "AreaActionsWorldModule.h"
 #include "Buildables/FGBuildable.h"
 #include "InstanceData.h"
@@ -86,4 +87,78 @@ bool AAreaActionsEquipment::GetArea(FAreaActionsArea& Out) const
 	Out.MinZ = FMath::Clamp(MinZ->GetPropertyValue_InContainer(this), -UE_BIG_NUMBER, UE_BIG_NUMBER);
 	Out.MaxZ = FMath::Clamp(MaxZ->GetPropertyValue_InContainer(this), -UE_BIG_NUMBER, UE_BIG_NUMBER);
 	return true;
+}
+
+bool AAreaActionsEquipment::RaycastMouse(FHitResult& Out)
+{
+	UFunction* Raycast = FindFunction(TEXT("RaycastMouseWithRange"));
+	const FStructProperty* Hit = Raycast ? FindFProperty<FStructProperty>(Raycast, TEXT("Hit")) : nullptr;
+	const FBoolProperty* Success = Raycast ? FindFProperty<FBoolProperty>(Raycast, TEXT("Success")) : nullptr;
+	if (!Hit || Hit->Struct != FHitResult::StaticStruct() || !Success)
+	{
+		UE_LOG(LogAreaActionsCpp, Error, TEXT("%s: no RaycastMouseWithRange(...) -> Hit, Success"), *GetClass()->GetName());
+		return false;
+	}
+	// The parameters are a struct of their own: construct them, so the hit result starts valid
+	uint8* Params = static_cast<uint8*>(FMemory_Alloca(Raycast->ParmsSize));
+	FMemory::Memzero(Params, Raycast->ParmsSize);
+	for (TFieldIterator<FProperty> It(Raycast); It && It->HasAnyPropertyFlags(CPF_Parm); ++It)
+	{
+		It->InitializeValue_InContainer(Params);
+		if (FBoolProperty* Flag = CastField<FBoolProperty>(*It); Flag && Flag != Success && Flag->GetName().StartsWith(TEXT("Ignore")))
+		{
+			Flag->SetPropertyValue_InContainer(Params, true);
+		}
+	}
+	ProcessEvent(Raycast, Params);
+	const bool bHit = Success->GetPropertyValue_InContainer(Params);
+	Out = *Hit->ContainerPtrToValuePtr<FHitResult>(Params);
+	for (TFieldIterator<FProperty> It(Raycast); It && It->HasAnyPropertyFlags(CPF_Parm); ++It)
+	{
+		It->DestroyValue_InContainer(Params);
+	}
+	return bHit;
+}
+
+void AAreaActionsEquipment::SelectBuilding()
+{
+	FHitResult Hit;
+	AreaActionsBuildings::FSnapshot Building;
+	if (!RaycastMouse(Hit) || !AreaActionsBuildings::FromHit(GetWorld(), Hit, Building))
+	{
+		return;
+	}
+	TArray<FVector> Box;
+	AreaActionsBuildings::GetCorners(Building, Box);
+	FArrayProperty* Corners = FindFProperty<FArrayProperty>(GetClass(), TEXT("CornerLocations"));
+	FDoubleProperty* MinZ = FindFProperty<FDoubleProperty>(GetClass(), TEXT("MinZ"));
+	FDoubleProperty* MaxZ = FindFProperty<FDoubleProperty>(GetClass(), TEXT("MaxZ"));
+	UFunction* Clear = FindFunction(TEXT("Clear"));
+	UFunction* UpdateIndicators = FindFunction(TEXT("UpdateIndicators"));
+	const FStructProperty* Inner = Corners ? CastField<FStructProperty>(Corners->Inner) : nullptr;
+	if (!Inner || Inner->Struct != TBaseStructure<FVector>::Get() || !MinZ || !MaxZ || !Clear || Clear->ParmsSize || !UpdateIndicators || UpdateIndicators->ParmsSize)
+	{
+		UE_LOG(LogAreaActionsCpp, Error, TEXT("%s: SelectBuilding needs CornerLocations, MinZ, MaxZ, Clear() and UpdateIndicators()"), *GetClass()->GetName());
+		return;
+	}
+	if (Box.IsEmpty())
+	{
+		UE_LOG(LogAreaActionsCpp, Display, TEXT("SelectBuilding: %s has no box"), *GetNameSafe(Building.Class));
+		return;
+	}
+	// The original's SelectBuildingData: the corners without their height (the top face), the box's lowest and highest point
+	TArray<FVector> Flat;
+	double Low = TNumericLimits<double>::Max(), High = TNumericLimits<double>::Lowest();
+	for (const FVector& Corner : Box)
+	{
+		Flat.AddUnique(FVector(Corner.X, Corner.Y, 0.0));
+		Low = FMath::Min(Low, Corner.Z);
+		High = FMath::Max(High, Corner.Z);
+	}
+	ProcessEvent(Clear, nullptr);
+	*Corners->ContainerPtrToValuePtr<TArray<FVector>>(this) = Flat;
+	MinZ->SetPropertyValue_InContainer(this, Low);
+	MaxZ->SetPropertyValue_InContainer(this, High);
+	ProcessEvent(UpdateIndicators, nullptr);
+	UE_LOG(LogAreaActionsCpp, Display, TEXT("SelectBuilding: %s, %d corners, Z %.0f..%.0f"), *GetNameSafe(Building.Class), Flat.Num(), Low, High);
 }

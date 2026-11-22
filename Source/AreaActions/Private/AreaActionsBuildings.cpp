@@ -166,6 +166,63 @@ namespace AreaActionsBuildings
 		return true;
 	}
 
+	bool FromHit(UWorld* World, const FHitResult& Hit, FSnapshot& Out)
+	{
+		if (AFGBuildable* Actor = Cast<AFGBuildable>(Hit.GetActor()))
+		{
+			FromActor(Actor, Out);
+			return true;
+		}
+		AAbstractInstanceManager* Manager = AAbstractInstanceManager::GetInstanceManager(World);
+		FInstanceHandle Handle;
+		if (!Manager || !Manager->ResolveHit(Hit, Handle))
+		{
+			return false;
+		}
+		if (AFGBuildable* Owner = Cast<AFGBuildable>(AAbstractInstanceManager::GetOwnerByHandle(Handle)))
+		{
+			FromActor(Owner, Out);
+			return true;
+		}
+		FLightweightBuildableInstanceRef Ref;
+		if (!AFGLightweightBuildableSubsystem::ResolveLightweightInstance(Handle, Ref) || !Ref.GetBuildableClass())
+		{
+			return false;
+		}
+		Out = FSnapshot();
+		Out.Class = Ref.GetBuildableClass();
+		Out.Transform = Ref.GetBuildableTransform();
+		Out.BuiltWith = Ref.GetBuiltWithRecipe();
+		if (const FFGDynamicStruct* TypeData = Ref.GetTypeSpecificData())
+		{
+			Out.TypeData = *TypeData;
+		}
+		if (const FFactoryCustomizationData* Customization = Ref.GetCustomizationData())
+		{
+			Out.Customization = *Customization;
+		}
+		Out.bIgnored = ShouldIgnore(Out.Class);
+		return true;
+	}
+
+	void GetCorners(const FSnapshot& Building, TArray<FVector>& Out)
+	{
+		Out.Reset();
+		FBox Box;
+		if (!GetLocalBox(Building, Box))
+		{
+			return;
+		}
+		const FVector Center = Box.GetCenter();
+		const FVector Extent = Box.GetExtent();
+		for (int32 Index = 0; Index < 8; ++Index)
+		{
+			const int32 Gray = Index ^ (Index >> 1);
+			const FVector Sign((Gray & 1) ? -1.0 : 1.0, (Gray & 2) ? -1.0 : 1.0, (Gray & 4) ? -1.0 : 1.0);
+			Out.Add(Building.Transform.TransformPosition(Center + Extent * Sign));
+		}
+	}
+
 	bool FCollector::Step(UWorld* World, const FAreaActionsArea& Area, TArray<FSnapshot>& Out, double EndTime)
 	{
 		int32 Seen = 0;

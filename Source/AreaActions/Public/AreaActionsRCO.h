@@ -35,6 +35,10 @@ public:
 	void ServerClearInventories(int32 RequestId, const FAreaActionsArea& Area, bool bToCrate);
 	UFUNCTION(Server, Reliable)
 	void ServerSetStationMode(int32 RequestId, const FAreaActionsArea& Area, bool bLoad);
+	// Copy and Fill; the server finds the buildings in the area itself and turns the numbers into places with the client's code.
+	// ContainerDistance (cm) is capped by AreaActions.MaxContainerDistance.
+	UFUNCTION(Server, Reliable)
+	void ServerPlaceCopies(int32 RequestId, const FAreaActionsArea& Area, const FAreaActionsPlacement& Placement, bool bUseBuildCost, float ContainerDistance);
 
 	UFUNCTION(Client, Reliable)
 	void ClientResult(int32 RequestId, const FAreaActionsResult& Result);

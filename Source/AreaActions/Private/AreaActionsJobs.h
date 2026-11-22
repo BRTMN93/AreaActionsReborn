@@ -16,4 +16,10 @@ namespace AreaActionsJobs
 	TUniquePtr<FAreaActionsJob> MakeClearInventories(bool bToCrate);
 	// Truck stations (docking stations) and freight platforms
 	TUniquePtr<FAreaActionsJob> MakeSetStationMode(bool bLoad);
+	// Copy and Fill: copies of the area's buildings where the placement puts them, except onto an equal building; with bUseCost the build
+	// cost comes from the player's inventory, then the storage containers within ContainerDistance cm of the player, then the dimensional
+	// depot (D17, D18), all or nothing
+	TUniquePtr<FAreaActionsJob> MakePlaceCopies(const FAreaActionsPlacement& Placement, bool bUseCost, double ContainerDistance);
+	// Most copies one request may build (AreaActions.MaxSpawnPerRequest)
+	int32 GetMaxSpawn();
 }

@@ -41,7 +41,8 @@ void AAreaActionsServerSubsystem::Init()
 
 void AAreaActionsServerSubsystem::EndPlay(const EEndPlayReason::Type Reason)
 {
-	// Nothing carries over into the next load
+	// Nothing carries over into the next load. shortcut: a Copy or Fill cut off here keeps the cost of its unbuilt copies; the world
+	// goes with it unless a save is made in the same moment. Finish the jobs here when a server's own shutdown save shows the gap.
 	Jobs.Reset();
 	Super::EndPlay(Reason);
 }
@@ -78,7 +79,7 @@ void AAreaActionsServerSubsystem::Tick(float DeltaSeconds)
 			continue;
 		}
 		const double SliceStart = FPlatformTime::Seconds();
-		const bool bDone = Step(Job, FMath::Max(SliceStart, Start) + Share);
+		const bool bDone = Job.Step(GetWorld(), FMath::Max(SliceStart, Start) + Share);
 		++Job.Frames;
 		Job.MaxSliceMs = FMath::Max(Job.MaxSliceMs, (FPlatformTime::Seconds() - SliceStart) * 1000.0);
 		if (!bDone)
@@ -88,20 +89,21 @@ void AAreaActionsServerSubsystem::Tick(float DeltaSeconds)
 		}
 		Job.Finish(GetWorld());
 		UE_LOG(LogAreaActionsCpp, Display, TEXT("AAJOB %s items=%d frames=%d maxslice=%.2f code=%d buildings=%d"),
-			Job.GetName(), Job.Found.Num(), Job.Frames, Job.MaxSliceMs, static_cast<int32>(Job.Result.Code), Job.Result.Buildings);
+			Job.GetName(), Job.GetItems(), Job.Frames, Job.MaxSliceMs, static_cast<int32>(Job.Result.Code), Job.Result.Buildings);
 		++FinishedJobs;
 		Rco->ClientResult(Job.RequestId, Job.Result);
 		Jobs.RemoveAt(Index);
 	}
 }
 
-bool AAreaActionsServerSubsystem::Step(FAreaActionsJob& Job, double EndTime)
+bool FAreaActionsJob::Step(UWorld* World, double EndTime)
 {
+	FAreaActionsJob& Job = *this;
 	if (!Job.bCollected)
 	{
 		if (Job.Cursor == 0 && Job.WantsCrates())
 		{
-			for (TActorIterator<AFGCrate> It(GetWorld()); It; ++It)
+			for (TActorIterator<AFGCrate> It(World); It; ++It)
 			{
 				if (IsValid(*It) && Job.Area.Contains(It->GetActorLocation()))
 				{
@@ -109,7 +111,7 @@ bool AAreaActionsServerSubsystem::Step(FAreaActionsJob& Job, double EndTime)
 				}
 			}
 		}
-		AFGBuildableSubsystem* Buildables = AFGBuildableSubsystem::Get(GetWorld());
+		AFGBuildableSubsystem* Buildables = AFGBuildableSubsystem::Get(World);
 		// shortcut: a cursor over the live list; a building removed during the collection can shift one unvisited entry past it.
 		// Upgrade to a snapshot when actions have to see every building while others dismantle.
 		static const TArray<AFGBuildable*> None;

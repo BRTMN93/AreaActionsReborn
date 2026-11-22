@@ -25,12 +25,6 @@ namespace
 		return FText::FromString(FString::Join(Parts, TEXT(", ")));
 	}
 
-	// The window's handlers run also when the tool is put away (the windows close after the action is gone); they do nothing then
-	AAreaActionBase* ActiveShell(const UAreaAction* Action)
-	{
-		AAreaActionBase* Shell = Action->GetShell();
-		return Shell && Shell->IsActive() ? Shell : nullptr;
-	}
 }
 
 void UAreaActionSetRecipe::Start()
@@ -46,7 +40,7 @@ void UAreaActionSetRecipe::Start()
 
 void UAreaActionSetRecipe::Selected(TSubclassOf<UFGRecipe> InRecipe)
 {
-	AAreaActionBase* Shell = ActiveShell(this);
+	AAreaActionBase* Shell = GetActiveShell();
 	UAreaActionsRCO* Rco = Shell ? Shell->GetRco() : nullptr;
 	if (!Rco)
 	{
@@ -62,7 +56,7 @@ void UAreaActionSetRecipe::Selected(TSubclassOf<UFGRecipe> InRecipe)
 
 void UAreaActionSetRecipe::Canceled()
 {
-	if (AAreaActionBase* Shell = ActiveShell(this))
+	if (AAreaActionBase* Shell = GetActiveShell())
 	{
 		Shell->Finish();
 	}
@@ -123,7 +117,7 @@ void UAreaActionClearInventories::ToCrate()
 
 void UAreaActionClearInventories::Send(bool bInToCrate)
 {
-	AAreaActionBase* Shell = ActiveShell(this);
+	AAreaActionBase* Shell = GetActiveShell();
 	if (UAreaActionsRCO* Rco = Shell ? Shell->GetRco() : nullptr)
 	{
 		if (const int32 Id = Shell->BeginRequest(); Id != INDEX_NONE)
@@ -177,7 +171,7 @@ void UAreaActionSetStationMode::Unload()
 
 void UAreaActionSetStationMode::Send(bool bInLoad)
 {
-	AAreaActionBase* Shell = ActiveShell(this);
+	AAreaActionBase* Shell = GetActiveShell();
 	if (UAreaActionsRCO* Rco = Shell ? Shell->GetRco() : nullptr)
 	{
 		if (const int32 Id = Shell->BeginRequest(); Id != INDEX_NONE)
