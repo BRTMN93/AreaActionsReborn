@@ -58,6 +58,7 @@ namespace
 				Inventory->Empty();
 			}
 			Machine->SetRecipe(Recipe);
+			LastMachine = Machine->GetActorLocation();
 			++Result.Buildings;
 			Result.AddCount(Machine->GetClass());
 		}
@@ -83,15 +84,23 @@ namespace
 				}
 			}
 			AFGCharacterPlayer* Player = Character.Get();
-			// The player left the world between the check and now: the items stay where the last machine stood rather than vanish
-			const FVector Where = Player ? Player->GetActorLocation() : Found.Last().IsValid() ? Found.Last()->GetActorLocation() : FVector::ZeroVector;
 			FSpawnInventoryCrateParameters Parameters;
 			Parameters.bAllowCrateMerging = false;
 			if (Player)
 			{
 				Parameters.ActorsToIgnore.Add(Player);
 			}
-			const AFGCrate* Crate = AFGItemPickup_Spawnable::SpawnInventoryCrate(World, Stacks, Where, Parameters);
+			const AFGCrate* Crate = Player ? AFGItemPickup_Spawnable::SpawnInventoryCrate(World, Stacks, Player->GetActorLocation(), Parameters) : nullptr;
+			if (!Crate)
+			{
+				// The player left, or there was no room next to them: the items stay where the last changed machine stands rather than vanish
+				Crate = AFGItemPickup_Spawnable::SpawnInventoryCrate(World, Stacks, LastMachine, Parameters);
+			}
+			if (!Crate)
+			{
+				UE_LOG(LogAreaActionsCpp, Error, TEXT("SetRecipe could not spawn the crate: %d items in %d stacks lost"), Result.Items, Stacks.Num());
+				return;
+			}
 			UE_LOG(LogAreaActionsCpp, Display, TEXT("SetRecipe crate %s with %d items in %d stacks"), *GetNameSafe(Crate), Result.Items, Stacks.Num());
 		}
 
@@ -99,6 +108,7 @@ namespace
 		TSubclassOf<UFGRecipe> Recipe;
 		TArray<UClass*> ProducedIn;
 		TMap<TSubclassOf<UFGItemDescriptor>, int32> Returned;
+		FVector LastMachine = FVector::ZeroVector;
 		int32 AlreadySet = 0;
 	};
 

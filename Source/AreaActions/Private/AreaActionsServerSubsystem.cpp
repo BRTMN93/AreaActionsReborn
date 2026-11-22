@@ -69,8 +69,9 @@ void AAreaActionsServerSubsystem::Tick(float DeltaSeconds)
 		UAreaActionsRCO* Rco = Job.Rco.Get();
 		if (!Rco)
 		{
-			// The player left: the job ends between two buildings
-			UE_LOG(LogAreaActionsCpp, Display, TEXT("AAJOB %s cancelled, the player left"), Job.GetName());
+			// The player left: the job ends between two buildings; Finish still hands over what was already taken (SetRecipe's crate)
+			Job.Finish(GetWorld());
+			UE_LOG(LogAreaActionsCpp, Display, TEXT("AAJOB %s cancelled, the player left, buildings=%d"), Job.GetName(), Job.Result.Buildings);
 			Jobs.RemoveAt(Index);
 			continue;
 		}
