@@ -5,6 +5,7 @@
 #include "AreaActionBase.h"
 #include "AreaActionsBuildings.h"
 #include "AreaActionsCopy.h"
+#include "Hologram/FGHologram.h"
 #include "Buildables/FGBuildableConveyorBelt.h"
 #include "Components/CheckBox.h"
 #include "Components/EditableTextBox.h"
@@ -2486,6 +2487,13 @@ namespace
 		R.Steps.Add([C](FRun& Self)
 		{
 			Self.Check(AAreaActionsPreview::LiveGhosts == 9, FString::Printf(TEXT("ghosts %d (want 9)"), AAreaActionsPreview::LiveGhosts));
+			// D20: the game's own holograms, except the beam (its length)
+			int32 Holograms = 0;
+			for (TActorIterator<AFGHologram> It(Self.GetWorld()); It; ++It)
+			{
+				Holograms += It->GetOwner() && It->GetOwner()->IsA<AAreaActionsPreview>() ? 1 : 0;
+			}
+			Self.Check(Holograms == 8, FString::Printf(TEXT("game holograms in the preview %d (want 8)"), Holograms));
 			CheckNothingBuilt(Self, *C, TEXT("preview"));
 			return EStep::Next;
 		});

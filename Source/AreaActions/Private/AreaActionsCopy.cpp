@@ -9,12 +9,17 @@
 #include "Components/InstancedStaticMeshComponent.h"
 #include "Components/LineBatchComponent.h"
 #include "FGFactorySettings.h"
+#include "HAL/IConsoleManager.h"
+#include "Hologram/FGHologram.h"
 #include "Kismet/GameplayStatics.h"
 #include "Resources/FGItemDescriptor.h"
 
 #define LOCTEXT_NAMESPACE "AreaActions"
 
 int32 AAreaActionsPreview::LiveGhosts = 0;
+
+static TAutoConsoleVariable<int32> CVarPreviewHolograms(TEXT("AreaActions.PreviewHolograms"), 300,
+	TEXT("Most copies the Copy and Fill preview shows as the game's own holograms (each is an actor); the rest are instanced meshes"));
 
 namespace
 {
@@ -53,9 +58,24 @@ void AAreaActionsPreview::Show(const TArray<AreaActionsBuildings::FSnapshot>& Bu
 	const UFGFactorySettings* Settings = UFGFactorySettings::Get();
 	UMaterialInterface* Material = Settings ? Settings->mDefaultValidPlacementMaterial.Get() : nullptr;
 	TMap<int32, TArray<TPair<UStaticMesh*, FTransform>>> Parts;
+	const int32 MaxHolograms = FMath::Max(0, CVarPreviewHolograms.GetValueOnGameThread());
+	const APlayerController* Player = GetOwner() ? Cast<APlayerController>(GetOwner()->GetOwner()) : nullptr;
+	APawn* Pawn = Player ? Player->GetPawn() : nullptr;
 	for (const AreaActionsBuildings::FPlanned& Copy : Copies)
 	{
 		const AreaActionsBuildings::FSnapshot& Source = Buildings[Copy.Source];
+		// The game's hologram shows the class at its defaults: a building with data of its own (a beam's length) keeps the meshes
+		const TSubclassOf<UFGRecipe> Recipe = Holograms.Num() < MaxHolograms && !Source.TypeData.IsValid() ? AreaActionsBuildings::GetRecipe(GetWorld(), Source) : nullptr;
+		if (AFGHologram* Hologram = Recipe ? AFGHologram::SpawnHologramFromRecipe(Recipe, this, Copy.Transform.GetLocation(), Pawn) : nullptr)
+		{
+			Hologram->SetActorTransform(Copy.Transform);
+			// Nothing moves it: the build gun's updates and placement checks stay off
+			Hologram->SetActorTickEnabled(false);
+			Hologram->SetPlacementMaterialState(EHologramMaterialState::HMS_OK);
+			Holograms.Add(Hologram);
+			++Ghosts;
+			continue;
+		}
 		TArray<TPair<UStaticMesh*, FTransform>>* Own = Parts.Find(Copy.Source);
 		if (!Own)
 		{
@@ -104,6 +124,14 @@ void AAreaActionsPreview::Clear()
 		}
 	}
 	Meshes.Reset();
+	for (AFGHologram* Hologram : Holograms)
+	{
+		if (IsValid(Hologram))
+		{
+			Hologram->Destroy();
+		}
+	}
+	Holograms.Reset();
 	if (Lines)
 	{
 		Lines->Flush();
@@ -187,7 +215,7 @@ void UAreaActionPlaceCopies::ShowPreview(const FAreaActionsPlacement& Placement)
 	if (Preview)
 	{
 		Preview->Show(Buildings, Copies);
-		UE_LOG(LogAreaActionsCpp, Display, TEXT("%s preview: %d ghosts"), *GetClass()->GetName(), Preview->GetGhosts());
+		UE_LOG(LogAreaActionsCpp, Display, TEXT("%s preview: %d ghosts, %d of them holograms"), *GetClass()->GetName(), Preview->GetGhosts(), Preview->GetHolograms());
 	}
 }
 

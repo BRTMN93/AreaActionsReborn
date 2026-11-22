@@ -98,6 +98,8 @@ namespace AreaActionsBuildings
 		TMap<const UClass*, TMultiMap<FIntVector, FTransform>> Places;
 	};
 
+	// The recipe the building was built with (for a lightweight the class's own when the instance has none)
+	TSubclassOf<UFGRecipe> GetRecipe(UWorld* World, const FSnapshot& Building);
 	// The items one copy of the building costs: its recipe's ingredients, times the length for beams
 	void AddCost(UWorld* World, const FSnapshot& Building, FItemCounts& InOut);
 	// Builds one copy on the server; false when the game refused it

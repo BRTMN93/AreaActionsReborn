@@ -6,12 +6,15 @@
 #include "GameFramework/Actor.h"
 #include "AreaActionsCopy.generated.h"
 
+class AFGHologram;
 class UInstancedStaticMeshComponent;
 class ULineBatchComponent;
 class UStaticMesh;
 
-// The preview of Copy and Fill on the player's machine: ghosts, not buildings. One instanced mesh per mesh in the game's valid placement
-// material, a box of lines for a building without meshes. Nothing of it is saved or replicated.
+// The preview of Copy and Fill on the player's machine: ghosts, not buildings. The first AreaActions.PreviewHolograms copies are the game's
+// own holograms (as the build gun shows them, decision D20); the rest, and buildings whose hologram cannot show their data (a beam's
+// length), are instanced meshes in the game's valid placement material, a box of lines for a building without meshes. Nothing of it is
+// saved or replicated.
 UCLASS(NotPlaceable, Transient)
 class AREAACTIONS_API AAreaActionsPreview : public AActor
 {
@@ -23,6 +26,7 @@ public:
 	void Show(const TArray<AreaActionsBuildings::FSnapshot>& Buildings, const TArray<AreaActionsBuildings::FPlanned>& Copies);
 	void Clear();
 	int32 GetGhosts() const { return Ghosts; }
+	int32 GetHolograms() const { return Holograms.Num(); }
 
 	// Ghosts of all previews in this process (the test mode counts them)
 	static int32 LiveGhosts;
@@ -35,6 +39,8 @@ private:
 	TMap<TObjectPtr<UStaticMesh>, TObjectPtr<UInstancedStaticMeshComponent>> Meshes;
 	UPROPERTY()
 	TObjectPtr<ULineBatchComponent> Lines;
+	UPROPERTY()
+	TArray<TObjectPtr<AFGHologram>> Holograms;
 	int32 Ghosts = 0;
 };
 

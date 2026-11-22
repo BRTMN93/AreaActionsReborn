@@ -506,6 +506,11 @@ namespace AreaActionsBuildings
 		return false;
 	}
 
+	TSubclassOf<UFGRecipe> GetRecipe(UWorld* World, const FSnapshot& Building)
+	{
+		return RecipeOf(World, Building);
+	}
+
 	void AddCost(UWorld* World, const FSnapshot& Building, FItemCounts& InOut)
 	{
 		const TSubclassOf<UFGRecipe> Recipe = RecipeOf(World, Building);
