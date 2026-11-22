@@ -14,21 +14,39 @@ namespace
 {
 	using FReturnedItems = TMap<TSubclassOf<UFGItemDescriptor>, int32>;
 
-	// The solid stacks of the inventory go into Returned (fluids cannot go into a crate); returns how many items that is
-	int32 TakeSolids(UFGInventoryComponent* Inventory, FReturnedItems& Returned)
+	struct FTaken
+	{
+		int32 Solids = 0;
+		// Liquids and gases, in inventory units (1000 per m3)
+		int32 Fluid = 0;
+	};
+
+	// Counts the inventory's contents and empties it; the solid stacks also go into Returned when it is given (fluids cannot go
+	// into a crate)
+	FTaken TakeAll(UFGInventoryComponent* Inventory, FReturnedItems* Returned)
 	{
 		TArray<FInventoryStack> Stacks;
 		Inventory->GetInventoryStacks(Stacks);
-		int32 Count = 0;
+		FTaken Taken;
 		for (const FInventoryStack& Stack : Stacks)
 		{
-			if (Stack.HasItems() && UFGItemDescriptor::GetForm(Stack.Item.GetItemClass()) == EResourceForm::RF_SOLID)
+			if (!Stack.HasItems())
 			{
-				Returned.FindOrAdd(Stack.Item.GetItemClass()) += Stack.NumItems;
-				Count += Stack.NumItems;
+				continue;
+			}
+			if (UFGItemDescriptor::GetForm(Stack.Item.GetItemClass()) != EResourceForm::RF_SOLID)
+			{
+				Taken.Fluid += Stack.NumItems;
+				continue;
+			}
+			Taken.Solids += Stack.NumItems;
+			if (Returned)
+			{
+				Returned->FindOrAdd(Stack.Item.GetItemClass()) += Stack.NumItems;
 			}
 		}
-		return Count;
+		Inventory->Empty();
+		return Taken;
 	}
 
 	// One crate with the items next to the player; when the player left or there is no room there, where the last changed building
@@ -100,8 +118,7 @@ namespace
 			{
 				if (Inventory)
 				{
-					Result.Items += TakeSolids(Inventory, Returned);
-					Inventory->Empty();
+					Result.Items += TakeAll(Inventory, &Returned).Solids;
 				}
 			}
 			Machine->SetRecipe(Recipe);
@@ -134,7 +151,7 @@ namespace
 		explicit FClearInventoriesJob(bool bInToCrate) : bToCrate(bInToCrate) {}
 
 		virtual const TCHAR* GetName() const override { return TEXT("ClearInventories"); }
-		virtual bool Matches(const AActor* Actor) const override { return true; }
+		virtual bool Matches(const AActor* Actor) const override { return Actor->FindComponentByClass<UFGInventoryComponent>() != nullptr; }
 		virtual bool WantsCrates() const override { return true; }
 
 		virtual void Apply(AActor* Actor) override
@@ -143,22 +160,21 @@ namespace
 			const AFGBuildableFactory* Factory = Cast<AFGBuildableFactory>(Actor);
 			const UFGInventoryComponent* Upgrades = Factory ? Factory->GetPotentialInventory() : nullptr;
 			TInlineComponentArray<UFGInventoryComponent*> Inventories(Actor);
-			bool bAny = false;
+			FTaken Taken;
 			for (UFGInventoryComponent* Inventory : Inventories)
 			{
 				if (Inventory && Inventory != Upgrades)
 				{
-					bAny = true;
-					Result.Items += Inventory->GetNumItems(nullptr);
-					if (bToCrate)
-					{
-						TakeSolids(Inventory, Returned);
-					}
-					Inventory->Empty();
+					const FTaken One = TakeAll(Inventory, bToCrate ? &Returned : nullptr);
+					Taken.Solids += One.Solids;
+					Taken.Fluid += One.Fluid;
 				}
 			}
-			if (bAny)
+			// Only buildings something was taken from count, as the player sees it (AA-079)
+			if (Taken.Solids > 0 || Taken.Fluid > 0)
 			{
+				Result.Items += Taken.Solids;
+				Result.Fluid += Taken.Fluid;
 				LastBuilding = Actor->GetActorLocation();
 				++Result.Buildings;
 				Result.AddCount(Actor->GetClass());

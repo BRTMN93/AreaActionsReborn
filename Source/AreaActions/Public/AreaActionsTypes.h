@@ -64,9 +64,13 @@ struct AREAACTIONS_API FAreaActionsResult
 	UPROPERTY(BlueprintReadOnly, Category = "Area Actions")
 	int32 Buildings = 0;
 
-	// Items the action moved or removed
+	// Solid items the action moved or removed
 	UPROPERTY(BlueprintReadOnly, Category = "Area Actions")
 	int32 Items = 0;
+
+	// Fluids the action removed, in the game's inventory units (1000 per m3)
+	UPROPERTY(BlueprintReadOnly, Category = "Area Actions")
+	int32 Fluid = 0;
 
 	// Changed buildings per class
 	UPROPERTY(BlueprintReadOnly, Category = "Area Actions")

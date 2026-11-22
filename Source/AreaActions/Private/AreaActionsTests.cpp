@@ -513,6 +513,8 @@ namespace
 		const TCHAR* IronIngotItem = TEXT("/Game/FactoryGame/Resource/Parts/IronIngot/Desc_IronIngot.Desc_IronIngot_C");
 		const TCHAR* IronPlateItem = TEXT("/Game/FactoryGame/Resource/Parts/IronPlate/Desc_IronPlate.Desc_IronPlate_C");
 		const TCHAR* IronRodItem = TEXT("/Game/FactoryGame/Resource/Parts/IronRod/Desc_IronRod.Desc_IronRod_C");
+		const TCHAR* Splitter = TEXT("/Game/FactoryGame/Buildable/Factory/CA_Splitter/Build_ConveyorAttachmentSplitter.Build_ConveyorAttachmentSplitter_C");
+		const TCHAR* WaterItem = TEXT("/Game/FactoryGame/Resource/RawResources/Water/Desc_Water.Desc_Water_C");
 		const TCHAR* PowerShard = TEXT("/Game/FactoryGame/Resource/Environment/Crystal/Desc_CrystalShard.Desc_CrystalShard_C");
 	}
 
@@ -1005,8 +1007,28 @@ namespace
 		{
 			Scene.Inside.Add(SpawnStorage(Self, Scene.Slot(0), 50, 30));
 			Scene.Inside.Add(SpawnStorage(Self, Scene.Slot(1), 20, 0));
-			AFGBuildableManufacturer* Constructor = SpawnMachine(Self, Asset::Constructor, Scene.Slot(2), Asset::IronPlate, 10, 5);
+			AFGBuildableManufacturer* Constructor = SpawnMachine(Self, Asset::Constructor, Scene.Slot(2), Asset::IronPlate, 0, 5);
 			Scene.Inside.Add(Constructor);
+			// AA-079: 2 m3 of water in the input (past its filters) is reported apart; an empty container and an empty splitter do not count
+			UFGInventoryComponent* Input = Constructor ? Constructor->GetInputInventory() : nullptr;
+			int32 Water = 0;
+			if (Input && Input->GetSizeLinear() > 0)
+			{
+				const FItemFilter ItemFilter = Input->mItemFilter;
+				const FFormFilter FormFilter = Input->mFormFilter;
+				Input->mItemFilter.Unbind();
+				Input->mFormFilter.Unbind();
+				// The recipe also pins its ingredient to the slot
+				const TSubclassOf<UFGItemDescriptor> Allowed = Input->GetAllowedItemOnIndex(0);
+				Input->SetAllowedItemOnIndex(0, nullptr);
+				Water = Input->AddStackToIndex(0, FInventoryStack(2000, Item(Asset::WaterItem)), true);
+				Input->SetAllowedItemOnIndex(0, Allowed);
+				Input->mItemFilter = ItemFilter;
+				Input->mFormFilter = FormFilter;
+			}
+			Self.Check(Water == 2000, FString::Printf(TEXT("water in the Constructor's input: %d of 2000"), Water));
+			Scene.Inside.Add(SpawnStorage(Self, Scene.Slot(3), 0, 0));
+			Scene.Inside.Add(SpawnBuildable(Self, Asset::Splitter, Scene.Slot(4)));
 			// D11: a power shard in the machine's upgrade slot stays
 			// The slot filter refuses shards until research unlocks the slots, which a new game lacks
 			UFGInventoryComponent* Upgrades = Constructor ? Constructor->GetPotentialInventory() : nullptr;
@@ -1028,7 +1050,7 @@ namespace
 			{
 				Scene.Controls.Add(SpawnStorage(Self, Place, 15, 0));
 			}
-			Scene.Expected = 50 + 30 + 20 + 15 + 25;
+			Scene.Expected = 50 + 30 + 20 + 5 + 25;
 		});
 		AddOpenAction(R, TEXT("ClearInventories"));
 		AddPress(R, TEXT("Widget_MessageYesNo"), bToCrate ? TEXT("NoButton") : TEXT("YesButton"));
@@ -1037,6 +1059,7 @@ namespace
 		{
 			const FString Want = FString::Printf(TEXT("Cleared 4 buildings %s a total of %d items"), bToCrate ? TEXT("taking") : TEXT("deleting"), S->Expected);
 			Self.Check(S->Message.Contains(Want), FString::Printf(TEXT("result '%s' has '%s'"), *S->Message, *Want));
+			Self.Check(S->Message.Contains(TEXT("2 m³ of fluids were deleted")), FString::Printf(TEXT("result '%s' names 2 m³ of fluids"), *S->Message));
 			Self.Check(StorageItems(S->Inside[0].Get()) == 0 && StorageItems(S->Inside[1].Get()) == 0,
 				FString::Printf(TEXT("containers empty: %d, %d"), StorageItems(S->Inside[0].Get()), StorageItems(S->Inside[1].Get())));
 			const AFGBuildableManufacturer* Constructor = Machine(*S, 2);
@@ -1055,14 +1078,14 @@ namespace
 				Self.Check(Crates.IsEmpty(), FString::Printf(TEXT("no new crate: %d"), Crates.Num()));
 				return EStep::Next;
 			}
-			// Plates 50 + 20 + 5, ingots 30 + 10, rods 25: every solid item of the area, nothing more
+			// Plates 50 + 20 + 5, ingots 30, rods 25: every solid item of the area, no water, nothing more
 			const UFGInventoryComponent* Inventory = Crates.Num() == 1 ? Crates[0]->GetInventory() : nullptr;
 			const int32 Plates = Inventory ? Inventory->GetNumItems(Item(Asset::IronPlateItem)) : -1;
 			const int32 Ingots = Inventory ? Inventory->GetNumItems(Item(Asset::IronIngotItem)) : -1;
 			const int32 Rods = Inventory ? Inventory->GetNumItems(Item(Asset::IronRodItem)) : -1;
 			const int32 All = Inventory ? Inventory->GetNumItems(nullptr) : -1;
-			Self.Check(Crates.Num() == 1 && Plates == 75 && Ingots == 40 && Rods == 25 && All == S->Expected,
-				FString::Printf(TEXT("new crates %d; plates %d of 75, ingots %d of 40, rods %d of 25, all %d of %d"), Crates.Num(), Plates, Ingots, Rods, All, S->Expected));
+			Self.Check(Crates.Num() == 1 && Plates == 75 && Ingots == 30 && Rods == 25 && All == S->Expected,
+				FString::Printf(TEXT("new crates %d; plates %d of 75, ingots %d of 30, rods %d of 25, all %d of %d"), Crates.Num(), Plates, Ingots, Rods, All, S->Expected));
 			const APawn* Pawn = Self.GetPlayer()->GetPawn();
 			const double Distance = Crates.Num() == 1 ? FVector::Dist(Crates[0]->GetActorLocation(), Pawn->GetActorLocation()) : -1.0;
 			Self.Check(Distance >= 0.0 && Distance < 1500.0, FString::Printf(TEXT("crate next to the player: %.0f cm"), Distance));

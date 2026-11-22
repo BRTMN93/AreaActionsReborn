@@ -131,10 +131,20 @@ void UAreaActionClearInventories::OnResult(const FAreaActionsResult& Result)
 	AAreaActionBase* Shell = GetShell();
 	if (!Shell->ShowFailure(Result.Code))
 	{
-		const FFormatNamedArguments Arguments{ { TEXT("Count"), Result.Buildings }, { TEXT("ItemReturnCount"), Result.Items } };
-		Shell->ShowMessage(LOCTEXT("ClearTitle", "Clear complete"), bToCrate
+		FNumberFormattingOptions OneDecimal;
+		OneDecimal.MaximumFractionalDigits = 1;
+		const FFormatNamedArguments Arguments{ { TEXT("Count"), Result.Buildings }, { TEXT("ItemReturnCount"), Result.Items },
+			{ TEXT("Fluid"), FText::AsNumber(Result.Fluid / 1000.0, &OneDecimal) } };
+		FText Message = bToCrate
 			? FText::Format(LOCTEXT("ClearedToCrate", "Cleared {Count} buildings taking a total of {ItemReturnCount} items. The solid items are in a crate next to you."), Arguments)
-			: FText::Format(LOCTEXT("Cleared", "Cleared {Count} buildings deleting a total of {ItemReturnCount} items."), Arguments));
+			: FText::Format(LOCTEXT("Cleared", "Cleared {Count} buildings deleting a total of {ItemReturnCount} items."), Arguments);
+		if (Result.Fluid > 0)
+		{
+			// Fluids are shown apart, in m3 as the game shows them (AA-079); they never go into the crate
+			Message = FText::Format(LOCTEXT("ClearedFluid", "{Message} {Fluid} m³ of fluids were deleted."),
+				FFormatNamedArguments{ { TEXT("Message"), Message }, { TEXT("Fluid"), Arguments[TEXT("Fluid")] } });
+		}
+		Shell->ShowMessage(LOCTEXT("ClearTitle", "Clear complete"), Message);
 	}
 }
 
