@@ -3,6 +3,7 @@
 #if AA_WITH_TESTS
 
 #include "AreaActionBase.h"
+#include "Algo/Count.h"
 #include "AreaActionsBuildings.h"
 #include "AreaActionsCopy.h"
 #include "Hologram/FGHologram.h"
@@ -2478,6 +2479,17 @@ namespace
 		});
 	}
 
+	// The game's holograms the preview spawned and has not destroyed
+	int32 PreviewHolograms(FRun& Self)
+	{
+		int32 Holograms = 0;
+		for (TActorIterator<AFGHologram> It(Self.GetWorld()); It; ++It)
+		{
+			Holograms += It->GetOwner() && It->GetOwner()->IsA<AAreaActionsPreview>() ? 1 : 0;
+		}
+		return Holograms;
+	}
+
 	void AddCopyPreview(FRun& R, const FCopyRef& C)
 	{
 		R.Steps.Add([C](FRun& Self) { C->Delta = FVector(2000, 0, 0); C->Yaw = 0.0; return EStep::Next; });
@@ -2489,11 +2501,34 @@ namespace
 			Self.Check(AAreaActionsPreview::LiveGhosts == 9, FString::Printf(TEXT("ghosts %d (want 9)"), AAreaActionsPreview::LiveGhosts));
 			// D20: the game's own holograms, except the beam (its length)
 			int32 Holograms = 0;
+			// The build gun's colour comes from the custom depth stencil: each hologram's building meshes have the valid one (its guidelines,
+			// ports and clearance keep their own, as in the build gun), and so has every instanced mesh of the preview
+			const uint8 Stencil = AAreaActionsPreview::GetValidStencil();
+			auto WithStencil = [Stencil](const AActor* Actor, int32& Meshes)
+			{
+				TInlineComponentArray<UMeshComponent*> Components(Actor);
+				Meshes = Components.Num();
+				return Algo::CountIf(Components, [Stencil](const UMeshComponent* Mesh) { return Mesh->bRenderCustomDepth && Mesh->CustomDepthStencilValue == Stencil; });
+			};
+			int32 Uncoloured = 0, Instanced = 0, InstancedColoured = 0;
 			for (TActorIterator<AFGHologram> It(Self.GetWorld()); It; ++It)
 			{
-				Holograms += It->GetOwner() && It->GetOwner()->IsA<AAreaActionsPreview>() ? 1 : 0;
+				if (It->GetOwner() && It->GetOwner()->IsA<AAreaActionsPreview>())
+				{
+					int32 Meshes = 0;
+					++Holograms;
+					Uncoloured += WithStencil(*It, Meshes) > 0 ? 0 : 1;
+				}
+			}
+			for (TActorIterator<AAreaActionsPreview> It(Self.GetWorld()); It; ++It)
+			{
+				int32 Meshes = 0;
+				InstancedColoured += WithStencil(*It, Meshes);
+				Instanced += Meshes;
 			}
 			Self.Check(Holograms == 8, FString::Printf(TEXT("game holograms in the preview %d (want 8)"), Holograms));
+			Self.Check(Stencil != 0 && Uncoloured == 0 && Instanced > 0 && InstancedColoured == Instanced, FString::Printf(
+				TEXT("ghost stencil %d: holograms without it %d, instanced meshes with it %d of %d"), Stencil, Uncoloured, InstancedColoured, Instanced));
 			CheckNothingBuilt(Self, *C, TEXT("preview"));
 			return EStep::Next;
 		});
@@ -2519,7 +2554,8 @@ namespace
 		R.Steps.Add(WaitFrames(5));
 		R.Steps.Add([](FRun& Self)
 		{
-			Self.Check(AAreaActionsPreview::LiveGhosts == 0 && !ActiveAction(Self), FString::Printf(TEXT("after Cancel: ghosts %d, action %s"), AAreaActionsPreview::LiveGhosts, *GetNameSafe(ActiveAction(Self))));
+			Self.Check(AAreaActionsPreview::LiveGhosts == 0 && PreviewHolograms(Self) == 0 && !ActiveAction(Self), FString::Printf(TEXT("after Cancel: ghosts %d, holograms %d, action %s"),
+				AAreaActionsPreview::LiveGhosts, PreviewHolograms(Self), *GetNameSafe(ActiveAction(Self))));
 			return EStep::Next;
 		});
 		AddCopyPreview(R, C);
@@ -2535,7 +2571,8 @@ namespace
 		R.Steps.Add(WaitFrames(10));
 		R.Steps.Add([](FRun& Self)
 		{
-			Self.Check(AAreaActionsPreview::LiveGhosts == 0 && !GetTool(Self), FString::Printf(TEXT("tool put away: ghosts %d, tool %s"), AAreaActionsPreview::LiveGhosts, *GetNameSafe(GetTool(Self))));
+			Self.Check(AAreaActionsPreview::LiveGhosts == 0 && PreviewHolograms(Self) == 0 && !GetTool(Self), FString::Printf(TEXT("tool put away: ghosts %d, holograms %d, tool %s"),
+				AAreaActionsPreview::LiveGhosts, PreviewHolograms(Self), *GetNameSafe(GetTool(Self))));
 			return EStep::Next;
 		});
 		AddEquipTool(R);

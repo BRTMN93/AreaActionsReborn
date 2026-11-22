@@ -41,6 +41,19 @@ namespace
 	{
 		return A.Class == B.Class && FVector::Dist(A.Transform.GetLocation(), B.Transform.GetLocation()) <= 1.0;
 	}
+
+	// The hologram material takes its colour from the custom depth stencil, which only the protected SetMaterialState sets; the public
+	// SetPlacementMaterialState skips a state equal to the current one, and a fresh hologram's state is already HMS_OK. Never instantiated.
+	struct FHologramAccess : AFGHologram
+	{
+		static void SetState(AFGHologram* Hologram, EHologramMaterialState State) { (Hologram->*(&FHologramAccess::SetMaterialState))(State); }
+		static uint8 GetStencil(const AFGHologram* Hologram, EHologramMaterialState State) { return (Hologram->*(&FHologramAccess::GetStencilForHologramMaterialState))(State); }
+	};
+}
+
+uint8 AAreaActionsPreview::GetValidStencil()
+{
+	return FHologramAccess::GetStencil(GetDefault<AFGHologram>(), EHologramMaterialState::HMS_OK);
 }
 
 AAreaActionsPreview::AAreaActionsPreview()
@@ -57,6 +70,7 @@ void AAreaActionsPreview::Show(const TArray<AreaActionsBuildings::FSnapshot>& Bu
 	Clear();
 	const UFGFactorySettings* Settings = UFGFactorySettings::Get();
 	UMaterialInterface* Material = Settings ? Settings->mDefaultValidPlacementMaterial.Get() : nullptr;
+	const uint8 Stencil = GetValidStencil();
 	TMap<int32, TArray<TPair<UStaticMesh*, FTransform>>> Parts;
 	const int32 MaxHolograms = FMath::Max(0, CVarPreviewHolograms.GetValueOnGameThread());
 	const APlayerController* Player = GetOwner() ? Cast<APlayerController>(GetOwner()->GetOwner()) : nullptr;
@@ -66,12 +80,29 @@ void AAreaActionsPreview::Show(const TArray<AreaActionsBuildings::FSnapshot>& Bu
 		const AreaActionsBuildings::FSnapshot& Source = Buildings[Copy.Source];
 		// The game's hologram shows the class at its defaults: a building with data of its own (a beam's length) keeps the meshes
 		const TSubclassOf<UFGRecipe> Recipe = Holograms.Num() < MaxHolograms && !Source.TypeData.IsValid() ? AreaActionsBuildings::GetRecipe(GetWorld(), Source) : nullptr;
-		if (AFGHologram* Hologram = Recipe ? AFGHologram::SpawnHologramFromRecipe(Recipe, this, Copy.Transform.GetLocation(), Pawn) : nullptr)
+		AFGHologram* Hologram = Recipe ? AFGHologram::SpawnHologramFromRecipe(Recipe, this, Copy.Transform.GetLocation(), Pawn) : nullptr;
+		if (Hologram && !Hologram->GetHologramChildren().IsEmpty())
 		{
+			// Only the build gun places a composite hologram's children: the copy takes the meshes
+			for (AFGHologram* Child : Hologram->GetHologramChildren())
+			{
+				if (IsValid(Child))
+				{
+					Child->Destroy();
+				}
+			}
+			Hologram->Destroy();
+			Hologram = nullptr;
+		}
+		if (Hologram)
+		{
+			// Only this player's: not sent to clients from a host, nothing hits it or overlaps it
+			Hologram->SetReplicates(false);
+			Hologram->SetActorEnableCollision(false);
 			Hologram->SetActorTransform(Copy.Transform);
 			// Nothing moves it: the build gun's updates and placement checks stay off
 			Hologram->SetActorTickEnabled(false);
-			Hologram->SetPlacementMaterialState(EHologramMaterialState::HMS_OK);
+			FHologramAccess::SetState(Hologram, EHologramMaterialState::HMS_OK);
 			Holograms.Add(Hologram);
 			++Ghosts;
 			continue;
@@ -100,6 +131,9 @@ void AAreaActionsPreview::Show(const TArray<AreaActionsBuildings::FSnapshot>& Bu
 				Component->SetStaticMesh(Part.Key);
 				Component->SetCollisionEnabled(ECollisionEnabled::NoCollision);
 				Component->SetCastShadow(false);
+				// The colour of the build gun's valid hologram (see FHologramAccess)
+				Component->SetRenderCustomDepth(true);
+				Component->SetCustomDepthStencilValue(Stencil);
 				for (int32 Slot = 0; Material && Slot < Component->GetNumMaterials(); ++Slot)
 				{
 					Component->SetMaterial(Slot, Material);
