@@ -10,6 +10,8 @@
 static TAutoConsoleVariable<float> CVarServerBudgetMs(TEXT("AreaActions.ServerBudgetMs"), 2.0f,
 	TEXT("Time per frame the server spends on area actions, for all players together (ms)"));
 
+int32 AAreaActionsServerSubsystem::FinishedJobs = 0;
+
 void FAreaActionsJob::Finish(UWorld* World)
 {
 	if (Result.Code == EAreaActionsResultCode::Ok && Result.Buildings == 0)
@@ -87,6 +89,7 @@ void AAreaActionsServerSubsystem::Tick(float DeltaSeconds)
 		Job.Finish(GetWorld());
 		UE_LOG(LogAreaActionsCpp, Display, TEXT("AAJOB %s items=%d frames=%d maxslice=%.2f code=%d buildings=%d"),
 			Job.GetName(), Job.Found.Num(), Job.Frames, Job.MaxSliceMs, static_cast<int32>(Job.Result.Code), Job.Result.Buildings);
+		++FinishedJobs;
 		Rco->ClientResult(Job.RequestId, Job.Result);
 		Jobs.RemoveAt(Index);
 	}

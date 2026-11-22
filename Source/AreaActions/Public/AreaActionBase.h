@@ -47,7 +47,8 @@ public:
 
 	// Opens a window of the tool: interact object = the tool, Title and Message set when the window has them, added to the tool's stack
 	UUserWidget* OpenWindow(TSubclassOf<UUserWidget> Class, const FText& Title = FText::GetEmpty(), const FText& Message = FText::GetEmpty());
-	// Binds a Blueprint event dispatcher of the window to a function of Target by name; false (and an error) when either is missing
+	// Binds a Blueprint event dispatcher of the window to a function of Target by name; false (and an error) when either is missing or
+	// their parameters differ
 	static bool BindWindowEvent(UUserWidget* Window, FName Dispatcher, UObject* Target, FName Function);
 	// A question with two named answers: the yes/no window with its buttons renamed, each button calls a function of Target by name.
 	// Closing the window (X, or the tool put away) without an answer ends the action. False (and an error) when the window cannot open.
@@ -57,7 +58,7 @@ public:
 	// A message for a result code that is not Ok; false when Code is Ok
 	bool ShowFailure(EAreaActionsResultCode Code);
 
-	// A new request id; the answer with this id comes to the action's OnResult
+	// A new request id; the answer with this id comes to the action's OnResult. An action sends one request: INDEX_NONE after the first
 	int32 BeginRequest();
 	UAreaActionsRCO* GetRco() const;
 	AAreaActionsEquipment* GetEquipment() const;

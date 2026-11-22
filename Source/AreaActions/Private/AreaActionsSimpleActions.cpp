@@ -8,7 +8,7 @@
 
 namespace
 {
-	// "3 Constructors,  2 Assemblers", as the original wrote the counts
+	// "3 Constructors, 2 Assemblers"
 	FText CountsText(const FAreaActionsResult& Result)
 	{
 		TArray<FString> Parts;
@@ -22,7 +22,7 @@ namespace
 			}
 			Parts.Add(FText::Format(LOCTEXT("ClassCount", "{count} {machine}s"), FFormatNamedArguments{ { TEXT("count"), Entry.Count }, { TEXT("machine"), Name } }).ToString());
 		}
-		return FText::FromString(FString::Join(Parts, TEXT(",  ")));
+		return FText::FromString(FString::Join(Parts, TEXT(", ")));
 	}
 
 	// The window's handlers run also when the tool is put away (the windows close after the action is gone); they do nothing then
@@ -52,8 +52,12 @@ void UAreaActionSetRecipe::Selected(TSubclassOf<UFGRecipe> InRecipe)
 	{
 		return;
 	}
-	Recipe = InRecipe;
-	Rco->ServerSetRecipe(Shell->BeginRequest(), Shell->GetArea(), InRecipe);
+	const int32 Id = Shell->BeginRequest();
+	if (Id != INDEX_NONE)
+	{
+		Recipe = InRecipe;
+		Rco->ServerSetRecipe(Id, Shell->GetArea(), InRecipe);
+	}
 }
 
 void UAreaActionSetRecipe::Canceled()
@@ -122,8 +126,11 @@ void UAreaActionClearInventories::Send(bool bInToCrate)
 	AAreaActionBase* Shell = ActiveShell(this);
 	if (UAreaActionsRCO* Rco = Shell ? Shell->GetRco() : nullptr)
 	{
-		bToCrate = bInToCrate;
-		Rco->ServerClearInventories(Shell->BeginRequest(), Shell->GetArea(), bInToCrate);
+		if (const int32 Id = Shell->BeginRequest(); Id != INDEX_NONE)
+		{
+			bToCrate = bInToCrate;
+			Rco->ServerClearInventories(Id, Shell->GetArea(), bInToCrate);
+		}
 	}
 }
 void UAreaActionClearInventories::OnResult(const FAreaActionsResult& Result)
@@ -173,8 +180,11 @@ void UAreaActionSetStationMode::Send(bool bInLoad)
 	AAreaActionBase* Shell = ActiveShell(this);
 	if (UAreaActionsRCO* Rco = Shell ? Shell->GetRco() : nullptr)
 	{
-		bLoad = bInLoad;
-		Rco->ServerSetStationMode(Shell->BeginRequest(), Shell->GetArea(), bInLoad);
+		if (const int32 Id = Shell->BeginRequest(); Id != INDEX_NONE)
+		{
+			bLoad = bInLoad;
+			Rco->ServerSetStationMode(Id, Shell->GetArea(), bInLoad);
+		}
 	}
 }
 

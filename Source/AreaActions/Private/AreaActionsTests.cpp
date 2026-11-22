@@ -2,7 +2,18 @@
 
 #if AA_WITH_TESTS
 
+#include "AreaActionBase.h"
+#include "AreaActionsBuildings.h"
+#include "AssetRegistry/AssetRegistryModule.h"
+#include "FGBlueprintFunctionLibrary.h"
+#include "FGBuildableBeam.h"
+#include "FGLightweightBuildableSubsystem.h"
+#include "FGSaveSession.h"
+#include "FGSaveSystem.h"
 #include "AreaActionsEquipment.h"
+#include "AreaActionsSimpleActions.h"
+#include "AbstractInstanceManager.h"
+#include "GameFramework/CharacterMovementComponent.h"
 #include "AreaActionsTypes.h"
 #include "Blueprint/UserWidget.h"
 #include "Buildables/FGBuildableDockingStation.h"
@@ -68,6 +79,11 @@ namespace
 		// Longest game frame while bMeasureFrames is on (W5)
 		bool bMeasureFrames = false;
 		double MaxFrameMs = 0.0;
+		// Save, back to the menu and load in this process: the run waits for the next game world (StartFromCommandLine hands it over)
+		bool bAwaitWorld = false;
+		double AwaitStarted = 0.0;
+		FString LoadSave;
+		bool bLoadIssued = false;
 
 		void Step(const FString& Text) const
 		{
@@ -278,6 +294,83 @@ namespace
 		return true;
 	}
 
+	// AA-077: every scenario starts at the same place, whatever start a new game picks. A flat meadow where the tool's clicks and the
+	// scenes worked in the runs of chats 04 and 05; the player looks along +X.
+	const FVector2D TestPlace(-246000.0, -62600.0);
+
+	bool TraceGround(UWorld* World, const FVector2D& At, FHitResult& Hit)
+	{
+		FCollisionQueryParams Params(TEXT("AATestPlace"), false);
+		if (APlayerController* Player = UGameplayStatics::GetPlayerController(World, 0))
+		{
+			Params.AddIgnoredActor(Player->GetPawn());
+		}
+		return World->LineTraceSingleByChannel(Hit, FVector(At, 100000.0), FVector(At, -100000.0), ECC_WorldStatic, Params);
+	}
+
+	void AddPlace(FRun& R)
+	{
+		R.Steps.Add([](FRun& Self)
+		{
+			AFGCharacterPlayer* Character = GetCharacter(Self);
+			if (!Character)
+			{
+				return EStep::Wait;
+			}
+			// Flying until the ground there has streamed in, so the player does not fall through it
+			Self.Step(FString::Printf(TEXT("teleport to X=%.0f Y=%.0f from %s"), TestPlace.X, TestPlace.Y, *Character->GetActorLocation().ToCompactString()));
+			Character->GetCharacterMovement()->SetMovementMode(MOVE_Flying);
+			Character->TeleportTo(FVector(TestPlace, 30000.0), FRotator::ZeroRotator);
+			Self.GetPlayer()->SetControlRotation(FRotator::ZeroRotator);
+			return EStep::Next;
+		});
+		R.Steps.Add([](FRun& Self)
+		{
+			FHitResult Hit;
+			if (!TraceGround(Self.GetWorld(), TestPlace, Hit))
+			{
+				return EStep::Wait;
+			}
+			AFGCharacterPlayer* Character = GetCharacter(Self);
+			const FVector At = Hit.Location + FVector(0, 0, Character->GetSimpleCollisionHalfHeight() + 20.0);
+			Character->TeleportTo(At, FRotator::ZeroRotator);
+			Character->GetCharacterMovement()->SetMovementMode(MOVE_Walking);
+			Self.GetPlayer()->SetControlRotation(FRotator::ZeroRotator);
+			Self.Check(true, FString::Printf(TEXT("place X=%.0f Y=%.0f Z=%.0f, ground %s"), At.X, At.Y, At.Z, *GetNameSafe(Hit.GetActor())));
+			return EStep::Next;
+		});
+		R.Steps.Add(WaitFrames(30));
+	}
+
+	// What the tool's own trace hits if it clicks now (Equip.RaycastMouseWithRange: from the camera, MaxDistance, TraceTypeQuery3)
+	bool AimHit(const FRun& R, FHitResult& Hit)
+	{
+		APlayerController* Player = R.GetPlayer();
+		AAreaActionsEquipment* Tool = GetTool(R);
+		const double Range = Tool ? DoubleValue(Tool, TEXT("MaxDistance")) : 0.0;
+		if (!Player || !Player->PlayerCameraManager || !(Range > 0.0))
+		{
+			return false;
+		}
+		const FVector From = Player->PlayerCameraManager->GetCameraLocation();
+		const FVector To = From + Player->PlayerCameraManager->GetCameraRotation().Vector() * Range;
+		FCollisionQueryParams Params(TEXT("AATestAim"), false, Player->GetPawn());
+		Params.AddIgnoredActor(Tool);
+		return R.GetWorld()->LineTraceSingleByChannel(Hit, From, To, UEngineTypes::ConvertToCollisionChannel(TraceTypeQuery3), Params);
+	}
+
+	// The actor the hit belongs to, also for meshes drawn as abstract instances
+	AActor* HitOwner(UWorld* World, const FHitResult& Hit)
+	{
+		FInstanceHandle Handle;
+		AAbstractInstanceManager* Manager = AAbstractInstanceManager::GetInstanceManager(World);
+		if (Manager && Manager->ResolveHit(Hit, Handle))
+		{
+			return Handle.GetOwner();
+		}
+		return Hit.GetActor();
+	}
+
 	// The player takes the tool in hand: one tool item in the arms slot, made the active one
 	void AddEquipTool(FRun& R)
 	{
@@ -287,6 +380,11 @@ namespace
 			if (!Character)
 			{
 				return EStep::Wait;
+			}
+			if (GetTool(Self))
+			{
+				// A scenario with several scenes takes the tool once
+				return EStep::Next;
 			}
 			UClass* Item = LoadClass<UFGItemDescriptor>(nullptr, ToolItem);
 			UFGInventoryComponentEquipment* Arms = Character->GetEquipmentSlot(EEquipmentSlot::ES_ARMS);
@@ -383,6 +481,12 @@ namespace
 			R.Steps.Add(WaitFrames(3));
 			R.Steps.Add([Targets, Index](FRun& Self)
 			{
+				// AA-077: a click that cannot land fails with its cause
+				FHitResult Hit;
+				const bool bHit = AimHit(Self, Hit);
+				const double Off = bHit && Targets->IsValidIndex(Index) ? FVector::Dist(Hit.Location, (*Targets)[Index]) : -1.0;
+				Self.Check(bHit && Off <= 100.0, FString::Printf(TEXT("aim %d hits %s at %s, %.0f cm from the target"), Index + 1,
+					bHit ? *GetNameSafe(Hit.GetActor()) : TEXT("nothing within the tool's range"), bHit ? *Hit.Location.ToCompactString() : TEXT("-"), Off));
 				Self.Step(FString::Printf(TEXT("left click %d at %s"), Index + 1, Targets->IsValidIndex(Index) ? *(*Targets)[Index].ToCompactString() : TEXT("-")));
 				PressKey(Self, EKeys::LeftMouseButton);
 				return EStep::Next;
@@ -452,8 +556,13 @@ namespace
 			return EStep::Next;
 		});
 		R.Steps.Add(WaitFrames(3));
-		R.Steps.Add([](FRun& Self)
+		R.Steps.Add([Built](FRun& Self)
 		{
+			FHitResult Hit;
+			const bool bHit = AimHit(Self, Hit);
+			AActor* Owner = bHit ? HitOwner(Self.GetWorld(), Hit) : nullptr;
+			Self.Check(Owner && Owner == Built->Get(), FString::Printf(TEXT("aim hits %s (owner %s), the Constructor is %s"),
+				bHit ? *GetNameSafe(Hit.GetActor()) : TEXT("nothing within the tool's range"), *GetNameSafe(Owner), *GetNameSafe(Built->Get())));
 			Self.Step(TEXT("left click on the Constructor"));
 			PressKey(Self, EKeys::LeftMouseButton);
 			return EStep::Next;
@@ -547,12 +656,13 @@ namespace
 	};
 	using FSceneRef = TSharedRef<FScene>;
 
-	void PlaceScene(const FRun& R, FScene& S, double HalfSize, double Ahead)
+	void PlaceScene(const FRun& R, FScene& S, double HalfSize, double Ahead, double Side = 0.0)
 	{
 		const APawn* Pawn = R.GetPlayer()->GetPawn();
 		const FVector Forward = Pawn->GetActorForwardVector().GetSafeNormal2D();
+		const FVector Right = FVector(-Forward.Y, Forward.X, 0.0);
 		S.HalfSize = HalfSize;
-		S.Center = Pawn->GetActorLocation() + Forward * (HalfSize + Ahead) + FVector(0, 0, 300);
+		S.Center = Pawn->GetActorLocation() + Forward * (HalfSize + Ahead) + Right * Side + FVector(0, 0, 300);
 		S.Area.MinZ = Pawn->GetActorLocation().Z - 3000.0;
 		S.Area.MaxZ = Pawn->GetActorLocation().Z + 3000.0;
 		S.Corners.Reset();
@@ -862,12 +972,12 @@ namespace
 	}
 
 	// Scene step: what Build puts in the area, then the tool's area, the crates before, the results listener
-	void AddScene(FRun& R, const FSceneRef& S, double HalfSize, TFunction<void(FRun&, FScene&)> Build)
+	void AddScene(FRun& R, const FSceneRef& S, double HalfSize, TFunction<void(FRun&, FScene&)> Build, double Side = 0.0)
 	{
 		AddEquipTool(R);
-		R.Steps.Add([S, HalfSize, Build](FRun& Self)
+		R.Steps.Add([S, HalfSize, Build, Side](FRun& Self)
 		{
-			PlaceScene(Self, *S, HalfSize, 1000.0);
+			PlaceScene(Self, *S, HalfSize, 1000.0, Side);
 			Build(Self, *S);
 			Self.Check(S->Inside.Num() > 0 && AllValid(S->Inside) && S->Controls.Num() == 3 && AllValid(S->Controls),
 				FString::Printf(TEXT("scene: %d in the area, %d controls"), S->Inside.Num(), S->Controls.Num()));
@@ -1142,9 +1252,9 @@ namespace
 		AddResultWindow(R, S);
 		R.Steps.Add([S, bLoad](FRun& Self)
 		{
-			const TCHAR* Mode = bLoad ? TEXT("to Load") : TEXT("to Unload");
-			Self.Check(S->Message.Contains(Mode) && S->Message.Contains(TEXT("1 Truck Station")) && S->Message.Contains(TEXT("1 Freight Platform")),
-				FString::Printf(TEXT("result '%s' names 1 Truck Station, 1 Freight Platform, %s"), *S->Message, Mode));
+			// AA-081: one space after the comma
+			const FString Want = FString::Printf(TEXT("Set 1 Truck Stations, 1 Freight Platforms to %s"), bLoad ? TEXT("Load") : TEXT("Unload"));
+			Self.Check(S->Message.Equals(Want), FString::Printf(TEXT("result '%s' is '%s'"), *S->Message, *Want));
 			for (int32 Index = 0; Index < S->Inside.Num(); ++Index)
 			{
 				const AFGBuildable* Station = S->Inside[Index].Get();
@@ -1374,8 +1484,390 @@ namespace
 		});
 	}
 
+	// --- Lightweight buildings and the copy engine (AA-020) ---
+
+	// A class of the game by its asset name, wherever the game keeps it; the path found is logged once
+	UClass* GameClass(const FString& AssetName)
+	{
+		static TMap<FString, FString> Paths;
+		if (Paths.IsEmpty())
+		{
+			TArray<FAssetData> Assets;
+			FModuleManager::LoadModuleChecked<FAssetRegistryModule>(TEXT("AssetRegistry")).Get().GetAssetsByPath(FName(TEXT("/Game/FactoryGame")), Assets, true);
+			for (const FAssetData& Asset : Assets)
+			{
+				FString Short = Asset.AssetName.ToString();
+				Short.RemoveFromEnd(TEXT("_C"));
+				Paths.Add(Short, Asset.PackageName.ToString() + TEXT(".") + Short + TEXT("_C"));
+			}
+			UE_LOG(LogAreaActionsCpp, Display, TEXT("AATEST asset registry: %d assets under /Game/FactoryGame"), Assets.Num());
+		}
+		const FString* Path = Paths.Find(AssetName);
+		UClass* Class = Path ? LoadClass<UObject>(nullptr, **Path) : nullptr;
+		UE_LOG(LogAreaActionsCpp, Display, TEXT("AATEST class %s: %s"), *AssetName, Class ? **Path : TEXT("not found"));
+		return Class;
+	}
+
+	TSubclassOf<UFGRecipe> RecipeOfClass(const FRun& R, UClass* Class, const TCHAR* RecipeName)
+	{
+		AFGLightweightBuildableSubsystem* Lightweights = AFGLightweightBuildableSubsystem::Get(R.GetWorld());
+		TSubclassOf<UFGRecipe> Found = Lightweights && Class ? Lightweights->GetBuiltWithRecipeForBuildableClass(Class) : nullptr;
+		return Found ? Found : TSubclassOf<UFGRecipe>(GameClass(RecipeName));
+	}
+
+	FFactoryCustomizationData TestColor()
+	{
+		FFactoryCustomizationData Color;
+		Color.SwatchDesc = GameClass(TEXT("SwatchDesc_Custom"));
+		Color.OverrideColorData = FFactoryCustomizationColorSlot(FLinearColor(0.8f, 0.1f, 0.1f), FLinearColor(0.1f, 0.1f, 0.8f));
+		return Color;
+	}
+
+	const FRuntimeBuildableInstanceData* FindLightweight(UWorld* World, UClass* Class, const FVector& At, int32* OutIndex = nullptr)
+	{
+		AFGLightweightBuildableSubsystem* Lightweights = AFGLightweightBuildableSubsystem::Get(World);
+		const TArray<FRuntimeBuildableInstanceData>* Array = Lightweights ? Lightweights->GetAllLightweightBuildableInstances().Find(Class) : nullptr;
+		for (int32 Index = 0; Array && Index < Array->Num(); ++Index)
+		{
+			if ((*Array)[Index].IsValid() && FVector::Dist((*Array)[Index].Transform.GetLocation(), At) <= 1.0)
+			{
+				if (OutIndex)
+				{
+					*OutIndex = Index;
+				}
+				return &(*Array)[Index];
+			}
+		}
+		return nullptr;
+	}
+
+	AFGBuildable* FindActor(UWorld* World, UClass* Class, const FVector& At)
+	{
+		AFGBuildableSubsystem* Buildables = AFGBuildableSubsystem::Get(World);
+		if (!Buildables)
+		{
+			return nullptr;
+		}
+		for (AFGBuildable* Actor : Buildables->GetAllBuildablesRef())
+		{
+			if (IsValid(Actor) && Actor->GetClass() == Class && FVector::Dist(Actor->GetActorLocation(), At) <= 1.0)
+			{
+				return Actor;
+			}
+		}
+		return nullptr;
+	}
+
+	float BeamLength(const FFGDynamicStruct& Data)
+	{
+		return Data.IsValid() && Data.GetStruct() == FBuildableBeamLightweightData::StaticStruct()
+			? static_cast<const FBuildableBeamLightweightData*>(Data.GetStructValueRaw())->BeamLength : -1.0f;
+	}
+
+	// Save, back to the main menu, load the save: the steps after this run in the loaded world
+	void AddSaveAndLoad(FRun& R, const FString& SaveName)
+	{
+		TSharedRef<int32> Saved = MakeShared<int32>(-1);
+		R.Steps.Add([Saved, SaveName](FRun& Self)
+		{
+			UFGSaveSession* Session = UFGSaveSession::Get(Self.GetWorld());
+			if (!Self.Check(Session != nullptr, TEXT("save session")))
+			{
+				return EStep::Next;
+			}
+			Self.Step(FString::Printf(TEXT("saving %s"), *SaveName));
+			Session->SaveGame(SaveName, FOnSaveGameComplete::CreateLambda([Saved](bool bOk, const FText& Error, void*)
+			{
+				*Saved = bOk ? 1 : 0;
+				UE_LOG(LogAreaActionsCpp, Display, TEXT("AATEST save done: %d %s"), bOk, *Error.ToString());
+			}), nullptr);
+			return EStep::Next;
+		});
+		R.Steps.Add([Saved, SaveName](FRun& Self)
+		{
+			if (*Saved < 0)
+			{
+				return EStep::Wait;
+			}
+			if (!Self.Check(*Saved == 1, FString::Printf(TEXT("saved %s"), *SaveName)))
+			{
+				return EStep::Next;
+			}
+			Self.bAwaitWorld = true;
+			Self.bLoadIssued = false;
+			Self.LoadSave = SaveName;
+			Self.AwaitStarted = Self.Now();
+			Self.Step(TEXT("to the main menu"));
+			UFGBlueprintFunctionLibrary::TravelToMainMenu(Self.GetPlayer());
+			return EStep::Next;
+		});
+		R.Steps.Add(WaitFrames(30));
+	}
+
+	// The test's save leaves the player's save folder again
+	void AddDeleteSave(FRun& R, const FString& SaveName)
+	{
+		R.Steps.Add([SaveName](FRun& Self)
+		{
+			if (UFGSaveSystem* Saves = UFGSaveSystem::Get(Self.GetWorld()))
+			{
+				Saves->DeleteSaveFiles({ SaveName }, FOnDeleteSaveGameComplete::CreateLambda([SaveName](bool bOk, void*)
+				{
+					UE_LOG(LogAreaActionsCpp, Display, TEXT("AATEST save %s deleted: %d"), *SaveName, bOk);
+				}), nullptr);
+			}
+			return EStep::Next;
+		});
+		R.Steps.Add(WaitFrames(10));
+	}
+
+	// R6, R7: what the copy engine builds, lightweight and actor, survives a save and a load with its data
+	void AddSpawnProbe(FRun& R)
+	{
+		struct FProbe
+		{
+			FVector Foundation, Beam, Machine;
+			FTransform BeamTransform;
+		};
+		TSharedRef<FProbe> P = MakeShared<FProbe>();
+		const FString SaveName = TEXT("AATest_SpawnProbe");
+		auto Check = [P](FRun& Self, const TCHAR* When)
+		{
+			UWorld* World = Self.GetWorld();
+			UClass* FoundationClass = GameClass(TEXT("Build_Foundation_8x1_01"));
+			UClass* BeamClass = GameClass(TEXT("Build_Beam"));
+			const FFactoryCustomizationData Color = TestColor();
+			const FRuntimeBuildableInstanceData* Foundation = FindLightweight(World, FoundationClass, P->Foundation);
+			Self.Check(Foundation && Foundation->CustomizationData == Color && Foundation->BuiltWithRecipe,
+				FString::Printf(TEXT("%s: lightweight foundation at %s, color kept %d, recipe %s"), When, *P->Foundation.ToCompactString(),
+					Foundation && Foundation->CustomizationData == Color, Foundation ? *GetNameSafe(Foundation->BuiltWithRecipe) : TEXT("-")));
+			const FRuntimeBuildableInstanceData* Beam = FindLightweight(World, BeamClass, P->Beam);
+			Self.Check(Beam && FMath::IsNearlyEqual(BeamLength(Beam->TypeSpecificData), 12.0f) && Beam->Transform.GetRotation().Equals(P->BeamTransform.GetRotation(), 1e-4),
+				FString::Printf(TEXT("%s: lightweight beam, length %.2f (want 12)"), When, Beam ? BeamLength(Beam->TypeSpecificData) : -1.0f));
+			const AFGBuildableManufacturer* Machine = Cast<AFGBuildableManufacturer>(FindActor(World, LoadClass<AFGBuildable>(nullptr, Asset::Constructor), P->Machine));
+			Self.Check(Machine && Machine->GetCurrentRecipe() == Recipe(Asset::IronPlate) && Machine->GetCustomizationData_Native() == Color && Machine->GetBuiltWithRecipe(),
+				FString::Printf(TEXT("%s: Constructor actor, recipe %s, color kept %d, built with %s"), When, Machine ? *GetNameSafe(Machine->GetCurrentRecipe()) : TEXT("-"),
+					Machine && Machine->GetCustomizationData_Native() == Color, Machine ? *GetNameSafe(Machine->GetBuiltWithRecipe()) : TEXT("-")));
+		};
+		R.Steps.Add([P](FRun& Self)
+		{
+			using namespace AreaActionsBuildings;
+			UWorld* World = Self.GetWorld();
+			const FVector Base = Self.GetPlayer()->GetPawn()->GetActorLocation() + FVector(3000.0, 0.0, 0.0);
+			const FFactoryCustomizationData Color = TestColor();
+			FSnapshot Foundation;
+			Foundation.Class = GameClass(TEXT("Build_Foundation_8x1_01"));
+			Foundation.BuiltWith = RecipeOfClass(Self, Foundation.Class, TEXT("Recipe_Foundation_8x1_01"));
+			Foundation.Customization = Color;
+			P->Foundation = Base;
+			Self.Check(IsLightweightClass(Foundation.Class) && Spawn(World, Foundation, FTransform(FRotator(0, 15, 0), P->Foundation)),
+				FString::Printf(TEXT("foundation built through AddFromBuildableInstanceData (lightweight class %d)"), IsLightweightClass(Foundation.Class)));
+			FSnapshot Beam;
+			Beam.Class = GameClass(TEXT("Build_Beam"));
+			Beam.BuiltWith = RecipeOfClass(Self, Beam.Class, TEXT("Recipe_Beam"));
+			FBuildableBeamLightweightData Length;
+			Length.BeamLength = 12.0f;
+			Beam.TypeData.InitializeAs(Length);
+			P->Beam = Base + FVector(0.0, 1500.0, 400.0);
+			P->BeamTransform = FTransform(FRotator(0, 30, 0), P->Beam);
+			Self.Check(IsLightweightClass(Beam.Class) && Spawn(World, Beam, P->BeamTransform),
+				FString::Printf(TEXT("beam built through AddFromBuildableInstanceData (lightweight class %d)"), IsLightweightClass(Beam.Class)));
+			FSnapshot Machine;
+			Machine.Class = LoadClass<AFGBuildable>(nullptr, Asset::Constructor);
+			Machine.BuiltWith = RecipeOfClass(Self, Machine.Class, TEXT("Recipe_ConstructorMk1"));
+			Machine.Customization = Color;
+			Machine.MachineRecipe = Recipe(Asset::IronPlate);
+			P->Machine = Base + FVector(0.0, -1500.0, 100.0);
+			Self.Check(!IsLightweightClass(Machine.Class) && Spawn(World, Machine, FTransform(FRotator(0, -20, 0), P->Machine)), TEXT("Constructor built through BeginSpawnBuildable"));
+			return EStep::Next;
+		});
+		R.Steps.Add(WaitFrames(30));
+		R.Steps.Add([Check](FRun& Self) { Check(Self, TEXT("built")); return EStep::Next; });
+		AddSaveAndLoad(R, SaveName);
+		R.Steps.Add([Check](FRun& Self) { Check(Self, TEXT("loaded")); return EStep::Next; });
+		AddDeleteSave(R, SaveName);
+	}
+
+	// --- Action windows (AA-081) and the tool's menu (AA-075) ---
+
+	// Counts the Error lines of the mod's C++ category while it lives
+	struct FErrorCounter : public FOutputDevice
+	{
+		int32 Errors = 0;
+		FErrorCounter() { GLog->AddOutputDevice(this); }
+		virtual ~FErrorCounter() override { GLog->RemoveOutputDevice(this); }
+		virtual void Serialize(const TCHAR* V, ELogVerbosity::Type Verbosity, const FName& Category) override
+		{
+			Errors += Category == LogAreaActionsCpp.GetCategoryName() && Verbosity == ELogVerbosity::Error ? 1 : 0;
+		}
+	};
+
+	bool ClickRecipe(UUserWidget* Window, const TCHAR* RecipePath)
+	{
+		const UClass* Want = Recipe(RecipePath);
+		return ClickListItem(Window ? Cast<UListView>(Window->GetWidgetFromName(TEXT("RecipeList"))) : nullptr, [Want](UObject* Entry)
+		{
+			return ClassValue(Entry, TEXT("Recipe")) == Want;
+		});
+	}
+
+	// The same button twice, in one frame (GapFrames 0) or GapFrames apart: one request, one job, a result with success
+	void AddDoubleClick(FRun& R, bool bRecipe, int32 GapFrames, double Side)
+	{
+		FSceneRef S = MakeShared<FScene>();
+		TSharedRef<int32> JobsBefore = MakeShared<int32>(0);
+		TSharedRef<TWeakObjectPtr<UUserWidget>> Clicked = MakeShared<TWeakObjectPtr<UUserWidget>>();
+		AddScene(R, S, 4000.0, [bRecipe](FRun& Self, FScene& Scene)
+		{
+			MakeAvailable(Self, Asset::IronRod);
+			for (int32 Index = 0; Index < 2; ++Index)
+			{
+				Scene.Inside.Add(bRecipe ? static_cast<AFGBuildable*>(SpawnMachine(Self, Asset::Constructor, Scene.Slot(Index), Asset::IronPlate, 0, 0))
+					: static_cast<AFGBuildable*>(SpawnStorage(Self, Scene.Slot(Index), 10, 0)));
+			}
+			for (const FVector& Place : Scene.ControlPlaces())
+			{
+				Scene.Controls.Add(SpawnStorage(Self, Place, 15, 0));
+			}
+		}, Side);
+		AddOpenAction(R, bRecipe ? TEXT("SetRecipe") : TEXT("ClearInventories"));
+		const TCHAR* WindowName = bRecipe ? TEXT("Widget_SetRecipe") : TEXT("Widget_MessageYesNo");
+		auto Click = [bRecipe](FRun& Self, UUserWidget* Window, int32 Nth)
+		{
+			const bool bDone = bRecipe ? ClickRecipe(Window, Asset::IronRod) : PressButton(Window, TEXT("YesButton"));
+			Self.Check(bDone, FString::Printf(TEXT("click %d on %s"), Nth, bRecipe ? TEXT("Iron Rod") : TEXT("Delete items")));
+		};
+		R.Steps.Add([=](FRun& Self)
+		{
+			UUserWidget* Window = TopWindow(Self);
+			if (!IsWindow(Window, WindowName) || !Window->IsInViewport())
+			{
+				return EStep::Wait;
+			}
+			*JobsBefore = AAreaActionsServerSubsystem::FinishedJobs;
+			*Clicked = Window;
+			Click(Self, Window, 1);
+			if (GapFrames == 0)
+			{
+				Click(Self, Window, 2);
+			}
+			return EStep::Next;
+		});
+		if (GapFrames > 0)
+		{
+			R.Steps.Add(WaitFrames(GapFrames));
+			R.Steps.Add([=](FRun& Self)
+			{
+				Click(Self, Clicked->Get(), 2);
+				return EStep::Next;
+			});
+		}
+		AddResultWindow(R, S);
+		R.Steps.Add([S, JobsBefore, bRecipe, GapFrames](FRun& Self)
+		{
+			const int32 Jobs = AAreaActionsServerSubsystem::FinishedJobs - *JobsBefore;
+			Self.Check(Jobs == 1 && S->Results.Num() == 1, FString::Printf(TEXT("%s, %d frames apart: jobs %d, results %d (want 1, 1)"),
+				bRecipe ? TEXT("recipe") : TEXT("Delete items"), GapFrames, Jobs, S->Results.Num()));
+			const TCHAR* Success = bRecipe ? TEXT("Set recipe to") : TEXT("Cleared 2 buildings");
+			Self.Check(S->Message.Contains(Success) && !S->Message.Contains(TEXT("Another area action")), FString::Printf(TEXT("result '%s' has '%s'"), *S->Message, Success));
+			return EStep::Next;
+		});
+	}
+
+	// A handler whose parameters differ from the dispatcher's is refused with an error; a matching one binds
+	void AddBindSignature(FRun& R)
+	{
+		R.Steps.Add([](FRun& Self)
+		{
+			const UAreaActionsWorldModule* Module = UAreaActionsWorldModule::Get(Self.GetWorld());
+			// The message window of the first action that names one
+			TSubclassOf<UUserWidget> MessageOk;
+			for (const TSubclassOf<AAreaActionBase>& Action : Module ? Module->AvailableActions : TArray<TSubclassOf<AAreaActionBase>>())
+			{
+				MessageOk = MessageOk ? MessageOk : Action->GetDefaultObject<AAreaActionBase>()->MessageOkClass;
+			}
+			UUserWidget* Window = MessageOk ? CreateWidget<UUserWidget>(Self.GetPlayer(), MessageOk) : nullptr;
+			if (!Self.Check(Window != nullptr, FString::Printf(TEXT("message window %s"), *GetNameSafe(Window))))
+			{
+				return EStep::Next;
+			}
+			UAreaActionSetRecipe* Target = NewObject<UAreaActionSetRecipe>(GetTransientPackage());
+			FMulticastDelegateProperty* Property = FindFProperty<FMulticastDelegateProperty>(Window->GetClass(), TEXT("OkClicked"));
+			const FMulticastScriptDelegate* Bound = Property ? Property->ContainerPtrToValuePtr<FMulticastScriptDelegate>(Window) : nullptr;
+			int32 Errors = 0;
+			bool bWrong = true;
+			{
+				FErrorCounter Counter;
+				// OkClicked() sends nothing; Selected takes a recipe
+				bWrong = AAreaActionBase::BindWindowEvent(Window, TEXT("OkClicked"), Target, GET_FUNCTION_NAME_CHECKED(UAreaActionSetRecipe, Selected));
+				Errors = Counter.Errors;
+			}
+			Self.Check(!bWrong && Errors == 1, FString::Printf(TEXT("OkClicked to Selected(recipe): bound %d, error lines %d (want 0, 1)"), bWrong, Errors));
+			Self.Check(Bound && !Bound->Contains(Target, GET_FUNCTION_NAME_CHECKED(UAreaActionSetRecipe, Selected)), TEXT("OkClicked has no Selected"));
+			const bool bRight = AAreaActionBase::BindWindowEvent(Window, TEXT("OkClicked"), Target, GET_FUNCTION_NAME_CHECKED(UAreaActionSetRecipe, Canceled));
+			Self.Check(bRight && Bound && Bound->Contains(Target, GET_FUNCTION_NAME_CHECKED(UAreaActionSetRecipe, Canceled)), TEXT("OkClicked to Canceled() binds"));
+			return EStep::Next;
+		});
+	}
+
+	// AA-075: the menu closed with X leaves the game's own input: no cursor, the viewport takes the mouse
+	void AddToolMenuClose(FRun& R)
+	{
+		AddToolMenu(R);
+		R.Steps.Add([](FRun& Self)
+		{
+			UUserWidget* Popup = Cast<UUserWidget>(ObjectValue(GetTool(Self), TEXT("PopupWidget")));
+			UUserWidget* Frame = Popup ? Cast<UUserWidget>(Popup->GetWidgetFromName(TEXT("WindowDark"))) : nullptr;
+			FMulticastDelegateProperty* Property = Frame ? FindFProperty<FMulticastDelegateProperty>(Frame->GetClass(), TEXT("OnClose")) : nullptr;
+			if (Property)
+			{
+				Property->ContainerPtrToValuePtr<FMulticastScriptDelegate>(Frame)->ProcessMulticastDelegate<UObject>(nullptr);
+			}
+			Self.Check(Property != nullptr, TEXT("menu closed with X"));
+			return EStep::Next;
+		});
+		R.Steps.Add(WaitFrames(5));
+		R.Steps.Add([](FRun& Self)
+		{
+			APlayerController* Player = Self.GetPlayer();
+			UGameViewportClient* Viewport = GEngine ? GEngine->GameViewport : nullptr;
+			const UUserWidget* Popup = Cast<UUserWidget>(ObjectValue(GetTool(Self), TEXT("PopupWidget")));
+			Self.Check(!Popup || !Popup->IsInViewport(), TEXT("menu gone"));
+			Self.Check(TopWindow(Self) == nullptr, TEXT("no window of the tool left"));
+			Self.Check(Player && !Player->bShowMouseCursor, FString::Printf(TEXT("mouse cursor hidden: %d"), Player ? !Player->bShowMouseCursor : -1));
+			const bool bGameInput = Viewport && !Viewport->IgnoreInput() && Viewport->GetMouseCaptureMode() == EMouseCaptureMode::CapturePermanently;
+			Self.Check(bGameInput, FString::Printf(TEXT("game input: ignore %d, capture mode %d (want 0, %d)"), Viewport ? Viewport->IgnoreInput() : -1,
+				Viewport ? static_cast<int32>(Viewport->GetMouseCaptureMode()) : -1, static_cast<int32>(EMouseCaptureMode::CapturePermanently)));
+			return EStep::Next;
+		});
+	}
+
 	bool BuildScenario(FRun& R)
 	{
+		if (R.Name == TEXT("DoubleClick"))
+		{
+			AddDoubleClick(R, true, 0, -27000.0);
+			AddDoubleClick(R, true, 3, -9000.0);
+			AddDoubleClick(R, false, 0, 9000.0);
+			AddDoubleClick(R, false, 3, 27000.0);
+			return true;
+		}
+		if (R.Name == TEXT("SpawnProbe"))
+		{
+			R.StepTimeoutSec = 60.0;
+			AddSpawnProbe(R);
+			return true;
+		}
+		if (R.Name == TEXT("BindSignature"))
+		{
+			AddBindSignature(R);
+			return true;
+		}
+		if (R.Name == TEXT("ToolMenuClose"))
+		{
+			AddToolMenuClose(R);
+			return true;
+		}
 		if (R.Name == TEXT("SetRecipe"))
 		{
 			AddSetRecipe(R);
@@ -1484,6 +1976,27 @@ namespace
 		{
 			R.MaxFrameMs = FMath::Max(R.MaxFrameMs, FApp::GetDeltaTime() * 1000.0);
 		}
+		if (R.bAwaitWorld)
+		{
+			if (R.Now() - R.AwaitStarted > 180.0)
+			{
+				R.Check(false, FString::Printf(TEXT("no game world 180 s after leaving for the menu (load %s issued %d)"), *R.LoadSave, R.bLoadIssued));
+				Finish(R);
+				return false;
+			}
+			// In the menu the mod's world module does not run: the load is started from here
+			for (const FWorldContext& Context : GEngine->GetWorldContexts())
+			{
+				UWorld* Menu = Context.World();
+				if (!R.bLoadIssued && Menu && Menu->IsGameWorld() && Menu->GetMapName().Contains(TEXT("Menu")) && Menu->HasBegunPlay() && R.Now() - R.AwaitStarted > 5.0)
+				{
+					R.bLoadIssued = true;
+					R.Step(FString::Printf(TEXT("in %s: loading %s"), *Menu->GetMapName(), *R.LoadSave));
+					UGameplayStatics::OpenLevel(Menu, FName(TEXT("/Game/FactoryGame/Map/GameLevel01/Persistent_Level")), true, FString::Printf(TEXT("skipOnboarding?listen?loadgame=%s"), *R.LoadSave));
+				}
+			}
+			return true;
+		}
 		if (!R.World.IsValid())
 		{
 			R.Check(false, TEXT("the game world is gone"));
@@ -1524,6 +2037,17 @@ namespace
 void FAreaActionsTests::StartFromCommandLine(UWorld* World)
 {
 	FString Name;
+	if (Run && Run->bAwaitWorld && World && Run->bLoadIssued)
+	{
+		// The loaded save: the scenario goes on with its next step after the load has settled
+		Run->World = World;
+		Run->bAwaitWorld = false;
+		Run->bStarted = false;
+		Run->Started = FPlatformTime::Seconds();
+		Run->StartFrame = GFrameCounter;
+		Run->Step(FString::Printf(TEXT("loaded into %s, net mode %d"), *World->GetMapName(), static_cast<int32>(World->GetNetMode())));
+		return;
+	}
 	if (Run || !World || !FParse::Value(FCommandLine::Get(), TEXT("AATest="), Name))
 	{
 		return;
@@ -1534,6 +2058,7 @@ void FAreaActionsTests::StartFromCommandLine(UWorld* World)
 	Run->Started = FPlatformTime::Seconds();
 	Run->StartFrame = GFrameCounter;
 	UE_LOG(LogAreaActionsCpp, Display, TEXT("AATEST %s step scenario in %s, net mode %d"), *Name, *World->GetMapName(), static_cast<int32>(World->GetNetMode()));
+	AddPlace(*Run);
 	if (!BuildScenario(*Run))
 	{
 		Run->Check(false, TEXT("unknown scenario"));

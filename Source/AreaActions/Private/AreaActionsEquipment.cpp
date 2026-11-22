@@ -1,6 +1,6 @@
 #include "AreaActionsEquipment.h"
 #include "AreaActionBase.h"
-#include "AreaActionsLegacyLibrary.h"
+#include "AreaActionsBuildings.h"
 #include "AreaActionsWorldModule.h"
 #include "Buildables/FGBuildable.h"
 #include "InstanceData.h"
@@ -17,9 +17,7 @@ bool AAreaActionsEquipment::GetLocalBox(const AFGBuildable* Buildable, FBox& Out
 	{
 		return true;
 	}
-	bool bIgnore = false;
-	UAreaActionsLegacyLibrary::ShouldIgnore(const_cast<AFGBuildable*>(Buildable), nullptr, bIgnore);
-	if (bIgnore)
+	if (AreaActionsBuildings::ShouldIgnore(Buildable->GetClass()))
 	{
 		return false;
 	}

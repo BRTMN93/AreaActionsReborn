@@ -35,6 +35,10 @@ enum class EAreaActionsResultCode : uint8
 	NothingInArea,
 	// Every building the action works on already has the asked state (SetRecipe, decision D12)
 	AlreadySet,
+	// Copy and Fill: the player has not got the build cost; Missing lists what lacks, nothing was built or taken
+	MissingItems,
+	// Copy and Fill: more buildings than AreaActions.MaxSpawnPerRequest; Buildings is the count asked, Items the limit
+	TooMany,
 };
 
 USTRUCT(BlueprintType)
@@ -76,5 +80,45 @@ struct AREAACTIONS_API FAreaActionsResult
 	UPROPERTY(BlueprintReadOnly, Category = "Area Actions")
 	TArray<FAreaActionsClassCount> Counts;
 
+	// Items missing for the build cost (Copy, Fill), at most MaxCounts kinds
+	UPROPERTY(BlueprintReadOnly, Category = "Area Actions")
+	TArray<FAreaActionsClassCount> Missing;
+
 	void AddCount(UClass* Class);
+};
+
+// Where Copy and Fill put the copies: the player's numbers, not transforms. Both sides turn them into transforms with the same code
+// (AreaActionsBuildings), from the buildings each side finds in the area; the server checks every number before use.
+USTRUCT(BlueprintType)
+struct AREAACTIONS_API FAreaActionsPlacement
+{
+	GENERATED_BODY()
+
+	// Fill (a grid of copies) instead of Copy (one copy moved and turned)
+	UPROPERTY(BlueprintReadWrite, Category = "Area Actions")
+	bool bFill = false;
+
+	// Copy: the move in cm, along the area's own axes (its most common building rotation)
+	UPROPERTY(BlueprintReadWrite, Category = "Area Actions")
+	FVector Delta = FVector::ZeroVector;
+
+	// Copy: the turn around Z in degrees, round the rotation centre
+	UPROPERTY(BlueprintReadWrite, Category = "Area Actions")
+	double Yaw = 0.0;
+
+	// Copy: the rotation centre in cm from the area's reference point (the middle of the buildings, at their lowest point), world axes
+	UPROPERTY(BlueprintReadWrite, Category = "Area Actions")
+	FVector RotationCenter = FVector::ZeroVector;
+
+	// Fill: the gap between copies in cm, per axis of the area
+	UPROPERTY(BlueprintReadWrite, Category = "Area Actions")
+	FVector Border = FVector::ZeroVector;
+
+	// Fill: copies per axis, the pattern itself included; negative fills the other way
+	UPROPERTY(BlueprintReadWrite, Category = "Area Actions")
+	FIntVector Amount = FIntVector(1, 1, 1);
+
+	// Fill: the rise in cm per step along X and along Y
+	UPROPERTY(BlueprintReadWrite, Category = "Area Actions")
+	FVector2D Ramp = FVector2D::ZeroVector;
 };

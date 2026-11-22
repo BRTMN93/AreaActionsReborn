@@ -63,6 +63,12 @@ void AAreaActionBase::StartNative()
 
 int32 AAreaActionBase::BeginRequest()
 {
+	// One request per action: a second click on the same button (or a button of a window still closing) is not a second request (AA-081)
+	if (RequestCount > 0)
+	{
+		UE_LOG(LogAreaActionsCpp, Display, TEXT("Action %s: request already sent, click ignored"), *GetClass()->GetName());
+		return INDEX_NONE;
+	}
 	static int32 LastId = 0;
 	RequestId = ++LastId;
 	++RequestCount;
@@ -126,12 +132,16 @@ UUserWidget* AAreaActionBase::OpenWindow(TSubclassOf<UUserWidget> Class, const F
 	SetString(TEXT("Title"), Title);
 	SetString(TEXT("Message"), Message);
 	// Equip_AreaActions.AddWidget(Widget): the tool's window stack, input mode and mouse cursor
+	FObjectPropertyBase* Param = CastField<FObjectPropertyBase>(AddWidget->ChildProperties);
+	if (!Param || !Param->HasAnyPropertyFlags(CPF_Parm) || !Window->IsA(Param->PropertyClass))
+	{
+		UE_LOG(LogAreaActionsCpp, Error, TEXT("%s: the tool's AddWidget does not take %s (parameter %s)"), *GetClass()->GetName(), *Window->GetClass()->GetName(),
+			Param ? *GetNameSafe(Param->PropertyClass) : TEXT("none"));
+		return nullptr;
+	}
 	TArray<uint8> Params;
 	Params.SetNumZeroed(AddWidget->ParmsSize);
-	if (FObjectPropertyBase* Param = CastField<FObjectPropertyBase>(AddWidget->ChildProperties))
-	{
-		Param->SetObjectPropertyValue_InContainer(Params.GetData(), Window);
-	}
+	Param->SetObjectPropertyValue_InContainer(Params.GetData(), Window);
 	Equipment->ProcessEvent(AddWidget, Params.GetData());
 	return Window;
 }
@@ -139,9 +149,16 @@ UUserWidget* AAreaActionBase::OpenWindow(TSubclassOf<UUserWidget> Class, const F
 bool AAreaActionBase::BindWindowEvent(UUserWidget* Window, FName Dispatcher, UObject* Target, FName Function)
 {
 	FMulticastDelegateProperty* Property = Window ? FindFProperty<FMulticastDelegateProperty>(Window->GetClass(), Dispatcher) : nullptr;
-	if (!Property || !Target || !Target->FindFunction(Function))
+	const UFunction* Handler = Target ? Target->FindFunction(Function) : nullptr;
+	if (!Property || !Handler)
 	{
 		UE_LOG(LogAreaActionsCpp, Error, TEXT("Cannot bind %s.%s to %s.%s"), *GetNameSafe(Window), *Dispatcher.ToString(), *GetNameSafe(Target), *Function.ToString());
+		return false;
+	}
+	// A handler with other parameters than the dispatcher sends would read garbage from the call (AA-081)
+	if (!Property->SignatureFunction || !Handler->IsSignatureCompatibleWith(Property->SignatureFunction))
+	{
+		UE_LOG(LogAreaActionsCpp, Error, TEXT("Cannot bind %s.%s to %s.%s: the signatures differ"), *GetNameSafe(Window), *Dispatcher.ToString(), *GetNameSafe(Target), *Function.ToString());
 		return false;
 	}
 	FScriptDelegate Delegate;

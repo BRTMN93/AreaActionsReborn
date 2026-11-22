@@ -55,6 +55,9 @@ public:
 
 	virtual void Tick(float DeltaSeconds) override;
 
+	// Jobs finished in this process, one per AAJOB result line (the test mode counts them)
+	static int32 FinishedJobs;
+
 protected:
 	virtual void Init() override;
 	virtual void EndPlay(const EEndPlayReason::Type Reason) override;
