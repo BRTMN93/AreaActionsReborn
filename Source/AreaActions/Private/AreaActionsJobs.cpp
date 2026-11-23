@@ -32,8 +32,8 @@ namespace
 	};
 
 	// The return crates of one job. Stacks go in the moment they leave a building, as they are (their item state too), so a save made
-	// while the job runs finds every item either still in its building or in a crate (AA-078). A crate takes at most MaxStacks stacks,
-	// then the next one starts (AA-085).
+	// while the job runs finds every item either still in its building or in a crate (AA-078). A crate holds one item type (AA-093) and
+	// at most MaxStacks stacks, then the next crate of that type starts (AA-085).
 	class FReturnCrates
 	{
 	public:
@@ -44,12 +44,14 @@ namespace
 
 		// A solid stack into the current crate or a new one next to the player; when the player left or there is no room there, where
 		// Fallback is (the building the items came from), rather than lose them
-		void Add(UWorld* World, const FInventoryStack& Stack, AFGCharacterPlayer* Player, const FVector& Fallback)
+		// Returns the items placed; the rest is counted as lost
+		int32 Add(UWorld* World, const FInventoryStack& Stack, AFGCharacterPlayer* Player, const FVector& Fallback)
 		{
 			FInventoryStack Left = Stack;
+			const TSubclassOf<UFGItemDescriptor> Type = Stack.Item.GetItemClass();
 			while (Left.HasItems())
 			{
-				if (AFGCrate* Crate = Current.Get())
+				if (AFGCrate* Crate = Current.FindRef(Type).Get())
 				{
 					Crate->SetAllowAddingItems(true);
 					const int32 Added = Crate->GetInventory()->AddStack(Left, true);
@@ -65,9 +67,10 @@ namespace
 				if (!Spawn(World, Left, Player, Fallback))
 				{
 					Lost += Left.NumItems;
-					return;
+					return Stack.NumItems - Left.NumItems;
 				}
 			}
+			return Stack.NumItems;
 		}
 
 		// The crates shrink to the stacks they hold; the counts go into the result
@@ -124,11 +127,15 @@ namespace
 			{
 				Parameters.ActorsToIgnore.Add(Player);
 			}
-			AFGCrate* Crate = Player && FailForTest != 1 ? AFGItemPickup_Spawnable::SpawnInventoryCrate(World, { First }, Player->GetActorLocation(), Parameters) : nullptr;
+			// One crate per type stands in rows of five beside the spot, 1.5 m apart, so the game does not have to look for room for each
+			static constexpr int32 Columns[] = { 0, 1, -1, 2, -2 };
+			const FVector Offset(Columns[All.Num() % 5] * 150.0, (All.Num() / 5 + 1) * 150.0, 0.0);
+			AFGCrate* Crate = Player && FailForTest != 1 ? AFGItemPickup_Spawnable::SpawnInventoryCrate(World, { First }, Player->GetActorLocation() + Offset, Parameters) : nullptr;
+			bool bAway = false;
 			if (!Crate)
 			{
-				Crate = AFGItemPickup_Spawnable::SpawnInventoryCrate(World, { First }, Fallback, Parameters);
-				Away += Crate ? 1 : 0;
+				Crate = AFGItemPickup_Spawnable::SpawnInventoryCrate(World, { First }, Fallback + Offset, Parameters);
+				bAway = true;
 			}
 			if (!Crate || !Crate->GetInventory())
 			{
@@ -140,18 +147,20 @@ namespace
 				Crate->Destroy();
 				return false;
 			}
+			Away += bAway ? 1 : 0;
 			Items += Taken;
 			Left.NumItems -= Taken;
 			Crate->SetAllowAddingItems(true);
 			Crate->GetInventory()->Resize(MaxStacks);
 			Crate->SetAllowAddingItems(false);
-			Current = Crate;
+			Current.Add(Left.Item.GetItemClass(), Crate);
 			All.Add(Crate);
 			return true;
 		}
 
 		const TCHAR* Job;
-		TWeakObjectPtr<AFGCrate> Current;
+		// The crate each item type goes into now
+		TMap<TSubclassOf<UFGItemDescriptor>, TWeakObjectPtr<AFGCrate>> Current;
 		TArray<TWeakObjectPtr<AFGCrate>> All;
 		int32 Items = 0;
 		int32 Lost = 0;
@@ -581,7 +590,8 @@ namespace
 		bool bNoSource = false;
 	};
 
-	// MassDismantle (AA-030) by the game's own rules (P5): every building, lightweight and crate in the area; CanDismantle decides, an
+	// MassDismantle (AA-030) by the game's own rules (P5): every building, lightweight and crate in the area; CanDismantle decides for
+	// actors (a lightweight has no actor to ask), an
 	// actor's refund is its GetDismantleRefund (build cost and contents, the contents only with No Build Cost), a lightweight's comes from
 	// its class. With bToCrate the refund goes into the return crates as each building goes; fluids are lost.
 	class FDismantleJob final : public FAreaActionsJob
@@ -645,9 +655,38 @@ namespace
 		{
 			FAreaActionsJob::Finish(World);
 			Crates.Finish(Result);
+			// For a check by hand (AA-093 pt 4): what was dismantled per class and the refund split into build cost and contents
+			const auto Text = [](const auto& Counts)
+			{
+				TArray<FString> Parts;
+				for (const auto& Entry : Counts)
+				{
+					if (Entry.Value != 0)
+					{
+						Parts.Add(FString::Printf(TEXT("%s %d"), *GetNameSafe(Entry.Key.Get()), Entry.Value));
+					}
+				}
+				Parts.Sort();
+				return FString::Join(Parts, TEXT(", "));
+			};
+			UE_LOG(LogAreaActionsCpp, Display, TEXT("MassDismantle buildings: %s"), *Text(Classes));
+			UE_LOG(LogAreaActionsCpp, Display, TEXT("MassDismantle refund cost: %s"), *Text(RefundCost));
+			UE_LOG(LogAreaActionsCpp, Display, TEXT("MassDismantle refund contents: %s"), *Text(RefundContents));
 		}
 
 	private:
+		// Solid stacks into a log tally
+		static void Tally(AreaActionsBuildings::FItemCounts& Out, const TArray<FInventoryStack>& Stacks, int32 Sign = 1)
+		{
+			for (const FInventoryStack& Stack : Stacks)
+			{
+				if (Stack.HasItems() && UFGItemDescriptor::GetForm(Stack.Item.GetItemClass()) == EResourceForm::RF_SOLID)
+				{
+					Out.FindOrAdd(Stack.Item.GetItemClass()) += Sign * Stack.NumItems;
+				}
+			}
+		}
+
 		void Refund(UWorld* World, const TArray<FInventoryStack>& Stacks, const FVector& From)
 		{
 			for (const FInventoryStack& Stack : Stacks)
@@ -661,8 +700,8 @@ namespace
 					Result.Fluid += Stack.NumItems;
 					continue;
 				}
-				Result.Items += Stack.NumItems;
-				Crates.Add(World, Stack, Character.Get(), From);
+				// Only what reached a crate was refunded; the rest is in the result's Lost
+				Result.Items += Crates.Add(World, Stack, Character.Get(), From);
 			}
 		}
 
@@ -676,8 +715,10 @@ namespace
 			{
 				TArray<FInventoryStack> Stacks;
 				Crate->GetInventory()->GetInventoryStacks(Stacks);
+				Tally(RefundContents, Stacks);
 				Refund(World, Stacks, Crate->GetActorLocation());
 			}
+			Classes.FindOrAdd(Crate->GetClass())++;
 			Result.AddCount(Crate->GetClass());
 			++Result.Buildings;
 			Crate->Destroy();
@@ -693,6 +734,8 @@ namespace
 			}
 			if (!IFGDismantleInterface::Execute_CanDismantle(Actor))
 			{
+				// Counted once, also when it is another building's child and comes again from the snapshot
+				Done.Add(Actor);
 				++Result.Skipped;
 				return;
 			}
@@ -723,6 +766,7 @@ namespace
 					}
 					else
 					{
+						Done.Add(Child);
 						++Result.Skipped;
 					}
 				}
@@ -734,10 +778,15 @@ namespace
 			Done.Add(Actor);
 			if (bToCrate)
 			{
-				TArray<FInventoryStack> Stacks;
+				TArray<FInventoryStack> Stacks, Contents;
 				IFGDismantleInterface::Execute_GetDismantleRefund(Actor, Stacks, bNoCost);
+				IFGDismantleInterface::Execute_GetDismantleRefund(Actor, Contents, true);
+				Tally(RefundCost, Stacks);
+				Tally(RefundCost, Contents, -1);
+				Tally(RefundContents, Contents);
 				Refund(World, Stacks, Actor->GetActorLocation());
 			}
+			Classes.FindOrAdd(Actor->GetClass())++;
 			Result.AddCount(Actor->GetClass());
 			++Result.Buildings;
 			IFGDismantleInterface::Execute_Dismantle(Actor);
@@ -756,8 +805,10 @@ namespace
 			{
 				TArray<FInventoryStack> Stacks;
 				Building.Class->GetDefaultObject<AFGBuildable>()->GetLightweightBuildableDismantleRefundReturns(World, AreaActionsBuildings::GetRecipe(World, Building), Data->TypeSpecificData, Stacks);
+				Tally(RefundCost, Stacks);
 				Refund(World, Stacks, Building.Transform.GetLocation());
 			}
+			Classes.FindOrAdd(Building.Class)++;
 			Result.AddCount(Building.Class);
 			++Result.Buildings;
 			Lightweights->RemoveByInstanceIndex(Building.Class, Building.LightweightIndex);
@@ -771,6 +822,10 @@ namespace
 		TArray<TWeakObjectPtr<AFGCrate>> FoundCrates;
 		TSet<TWeakObjectPtr<AActor>> Done;
 		int32 Next = 0;
+		// The log of the refund (Finish)
+		TMap<TSubclassOf<UObject>, int32> Classes;
+		AreaActionsBuildings::FItemCounts RefundCost;
+		AreaActionsBuildings::FItemCounts RefundContents;
 		FReturnCrates Crates{ TEXT("MassDismantle") };
 	};
 }
