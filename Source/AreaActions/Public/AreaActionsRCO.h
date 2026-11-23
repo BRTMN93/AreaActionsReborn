@@ -40,6 +40,10 @@ public:
 	UFUNCTION(Server, Reliable)
 	void ServerPlaceCopies(int32 RequestId, const FAreaActionsArea& Area, const FAreaActionsPlacement& Placement, bool bUseBuildCost, float ContainerDistance);
 
+	// MassDismantle; with bRefundToCrate the game's refund goes into return crates at the player
+	UFUNCTION(Server, Reliable)
+	void ServerDismantle(int32 RequestId, const FAreaActionsArea& Area, bool bRefundToCrate);
+
 	UFUNCTION(Client, Reliable)
 	void ClientResult(int32 RequestId, const FAreaActionsResult& Result);
 	TMulticastDelegate<void(int32 RequestId, const FAreaActionsResult& Result)> OnResult;

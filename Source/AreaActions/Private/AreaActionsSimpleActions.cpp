@@ -25,6 +25,32 @@ namespace
 		return FText::FromString(FString::Join(Parts, TEXT(", ")));
 	}
 
+	// The sentences on the return crates (AA-085): none without a crate, where they stand, and the items no crate could take
+	FText CratesText(const FAreaActionsResult& Result)
+	{
+		TArray<FText> Parts;
+		const FFormatNamedArguments Arguments{ { TEXT("Crates"), Result.Crates }, { TEXT("Away"), Result.CratesAway }, { TEXT("Lost"), Result.Lost } };
+		if (Result.Crates > 0 && Result.CratesAway == 0)
+		{
+			Parts.Add(FText::Format(LOCTEXT("CratesNear", "The items are in {Crates} {Crates}|plural(one=crate,other=crates) next to you."), Arguments));
+		}
+		else if (Result.Crates > 0)
+		{
+			Parts.Add(FText::Format(LOCTEXT("CratesAway", "The items are in {Crates} {Crates}|plural(one=crate,other=crates); {Away} could not be placed next to you and {Away}|plural(one=stands,other=stand) by the buildings."), Arguments));
+		}
+		if (Result.Lost > 0)
+		{
+			Parts.Add(FText::Format(LOCTEXT("CratesLost", "{Lost} items were lost: no crate could be placed."), Arguments));
+		}
+		return FText::Join(FText::FromString(TEXT(" ")), Parts);
+	}
+
+	// "{Message} {Crates}", without a trailing space when there is nothing about crates
+	FText WithCrates(const FText& Message, const FAreaActionsResult& Result)
+	{
+		const FText Crates = CratesText(Result);
+		return Crates.IsEmpty() ? Message : FText::Format(LOCTEXT("WithCrates", "{0} {1}"), Message, Crates);
+	}
 }
 
 void UAreaActionSetRecipe::Start()
@@ -85,10 +111,10 @@ void UAreaActionSetRecipe::OnResult(const FAreaActionsResult& Result)
 		FText Message = FText::Format(LOCTEXT("RecipeSet", "Set recipe to {recipe} for {machines}"), FFormatNamedArguments{ { TEXT("recipe"), RecipeName }, { TEXT("machines"), CountsText(Result) } });
 		if (Result.Items > 0)
 		{
-			Message = FText::Format(LOCTEXT("RecipeCrate", "{message}. {items} items from the machines are in a crate next to you."),
+			Message = FText::Format(LOCTEXT("RecipeItems", "{message}. {items} items were taken from the machines."),
 				FFormatNamedArguments{ { TEXT("message"), Message }, { TEXT("items"), Result.Items } });
 		}
-		Shell->ShowMessage(LOCTEXT("RecipeSetTitle", "Recipes set!"), Message);
+		Shell->ShowMessage(LOCTEXT("RecipeSetTitle", "Recipes set!"), WithCrates(Message, Result));
 	}
 	}
 }
@@ -137,7 +163,7 @@ void UAreaActionClearInventories::OnResult(const FAreaActionsResult& Result)
 		const FFormatNamedArguments Arguments{ { TEXT("Count"), Result.Buildings }, { TEXT("ItemReturnCount"), Result.Items },
 			{ TEXT("Fluid"), FText::AsNumber(Result.Fluid / 1000.0, &OneDecimal) } };
 		FText Message = bToCrate
-			? FText::Format(LOCTEXT("ClearedToCrate", "Cleared {Count} buildings taking a total of {ItemReturnCount} items. The solid items are in a crate next to you."), Arguments)
+			? WithCrates(FText::Format(LOCTEXT("ClearedToCrate", "Cleared {Count} buildings taking a total of {ItemReturnCount} items."), Arguments), Result)
 			: FText::Format(LOCTEXT("Cleared", "Cleared {Count} buildings deleting a total of {ItemReturnCount} items."), Arguments);
 		if (Result.Fluid > 0)
 		{
@@ -147,6 +173,85 @@ void UAreaActionClearInventories::OnResult(const FAreaActionsResult& Result)
 		}
 		Shell->ShowMessage(LOCTEXT("ClearTitle", "Clear complete"), Message);
 	}
+}
+
+void UAreaActionMassDismantle::Start()
+{
+	AAreaActionBase* Shell = GetShell();
+	if (!Shell->OpenChoice(LOCTEXT("DismantleConfirmTitle", "Confirm Mass Dismantle"),
+		LOCTEXT("DismantleAsk", "Dismantle everything in the selected area? The refund can go to crates next to you, or be left out."),
+		LOCTEXT("DismantleToCrate", "Refund to crate"), LOCTEXT("DismantleNoRefund", "No refund"),
+		this, GET_FUNCTION_NAME_CHECKED(UAreaActionMassDismantle, ToCrate), GET_FUNCTION_NAME_CHECKED(UAreaActionMassDismantle, NoRefund)))
+	{
+		Shell->Finish();
+	}
+}
+
+void UAreaActionMassDismantle::ToCrate()
+{
+	Send(true);
+}
+
+void UAreaActionMassDismantle::NoRefund()
+{
+	Send(false);
+}
+
+void UAreaActionMassDismantle::Send(bool bInToCrate)
+{
+	AAreaActionBase* Shell = GetActiveShell();
+	if (UAreaActionsRCO* Rco = Shell ? Shell->GetRco() : nullptr)
+	{
+		if (const int32 Id = Shell->BeginRequest(); Id != INDEX_NONE)
+		{
+			bToCrate = bInToCrate;
+			Rco->ServerDismantle(Id, Shell->GetArea(), bInToCrate);
+		}
+	}
+}
+
+void UAreaActionMassDismantle::OnResult(const FAreaActionsResult& Result)
+{
+	AAreaActionBase* Shell = GetShell();
+	if (Shell->ShowFailure(Result.Code))
+	{
+		return;
+	}
+	FNumberFormattingOptions OneDecimal;
+	OneDecimal.MaximumFractionalDigits = 1;
+	const FFormatNamedArguments Arguments{ { TEXT("Count"), Result.Buildings }, { TEXT("Items"), Result.Items }, { TEXT("Skipped"), Result.Skipped },
+		{ TEXT("Fluid"), FText::AsNumber(Result.Fluid / 1000.0, &OneDecimal) } };
+	const FText Skipped = Result.Skipped > 0
+		? FText::Format(LOCTEXT("DismantleSkipped", "{Skipped} {Skipped}|plural(one=building,other=buildings) the game does not let you dismantle {Skipped}|plural(one=was,other=were) left."), Arguments)
+		: FText::GetEmpty();
+	if (Result.Code == EAreaActionsResultCode::NothingInArea)
+	{
+		const FText Nothing = LOCTEXT("DismantleNothing", "Nothing in the area could be dismantled.");
+		Shell->ShowMessage(LOCTEXT("DismantleFailTitle", "Couldn't dismantle!"), Skipped.IsEmpty() ? Nothing : FText::Format(LOCTEXT("WithSkipped", "{0} {1}"), Nothing, Skipped));
+		return;
+	}
+	TArray<FText> Parts{ FText::Format(LOCTEXT("Dismantled", "Dismantled {Count} buildings."), Arguments) };
+	if (bToCrate)
+	{
+		Parts.Add(FText::Format(LOCTEXT("DismantleRefund", "{Items} items were refunded."), Arguments));
+		if (const FText Crates = CratesText(Result); !Crates.IsEmpty())
+		{
+			Parts.Add(Crates);
+		}
+		if (Result.Fluid > 0)
+		{
+			Parts.Add(FText::Format(LOCTEXT("DismantleFluid", "{Fluid} m³ of fluids were lost."), Arguments));
+		}
+	}
+	else
+	{
+		Parts.Add(LOCTEXT("DismantleNoRefundDone", "Nothing was refunded."));
+	}
+	if (!Skipped.IsEmpty())
+	{
+		Parts.Add(Skipped);
+	}
+	Shell->ShowMessage(LOCTEXT("DismantleTitle", "Dismantle complete"), FText::Join(FText::FromString(TEXT(" ")), Parts));
 }
 
 void UAreaActionSetStationMode::Start()

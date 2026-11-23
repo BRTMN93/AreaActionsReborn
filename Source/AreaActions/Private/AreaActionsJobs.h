@@ -20,6 +20,11 @@ namespace AreaActionsJobs
 	// cost comes from the player's inventory, then the storage containers within ContainerDistance cm of the player, then the dimensional
 	// depot (D17, D18), all or nothing
 	TUniquePtr<FAreaActionsJob> MakePlaceCopies(const FAreaActionsPlacement& Placement, bool bUseCost, double ContainerDistance);
+	// MassDismantle: every building, lightweight and crate in the area the game lets anyone dismantle; with bToCrate the game's refund goes
+	// into return crates at the player, fluids are lost
+	TUniquePtr<FAreaActionsJob> MakeDismantle(bool bToCrate);
+	// The test mode: 1 = return crates find no room next to the player, 2 = no crate can be placed at all (the messages, AA-085); 0 = off
+	void SetCratesFailForTest(int32 Mode);
 	// Most copies one request may build (AreaActions.MaxSpawnPerRequest)
 	int32 GetMaxSpawn();
 }

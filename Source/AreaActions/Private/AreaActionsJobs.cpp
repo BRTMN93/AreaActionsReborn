@@ -11,6 +11,8 @@
 #include "FGCharacterPlayer.h"
 #include "FGCrate.h"
 #include "FGInventoryComponent.h"
+#include "EngineUtils.h"
+#include "FGLightweightBuildableSubsystem.h"
 #include "FGItemPickup_Spawnable.h"
 #include "FGRecipe.h"
 #include "Resources/FGItemDescriptor.h"
@@ -20,8 +22,6 @@ static TAutoConsoleVariable<int32> CVarMaxSpawnPerRequest(TEXT("AreaActions.MaxS
 
 namespace
 {
-	using FReturnedItems = TMap<TSubclassOf<UFGItemDescriptor>, int32>;
-
 	struct FTaken
 	{
 		int32 Solids = 0;
@@ -29,9 +29,137 @@ namespace
 		int32 Fluid = 0;
 	};
 
-	// Counts the inventory's contents and empties it; the solid stacks also go into Returned when it is given (fluids cannot go
-	// into a crate)
-	FTaken TakeAll(UFGInventoryComponent* Inventory, FReturnedItems* Returned)
+	// The return crates of one job. Stacks go in the moment they leave a building, as they are (their item state too), so a save made
+	// while the job runs finds every item either still in its building or in a crate (AA-078). A crate takes at most MaxStacks stacks,
+	// then the next one starts (AA-085).
+	class FReturnCrates
+	{
+	public:
+		// 200 stacks keep a crate's window and the replication of its inventory small: about four Industrial Storage Containers
+		static constexpr int32 MaxStacks = 200;
+
+		explicit FReturnCrates(const TCHAR* InJob) : Job(InJob) {}
+
+		// A solid stack into the current crate or a new one next to the player; when the player left or there is no room there, where
+		// Fallback is (the building the items came from), rather than lose them
+		void Add(UWorld* World, const FInventoryStack& Stack, AFGCharacterPlayer* Player, const FVector& Fallback)
+		{
+			FInventoryStack Left = Stack;
+			while (Left.HasItems())
+			{
+				if (AFGCrate* Crate = Current.Get())
+				{
+					Crate->SetAllowAddingItems(true);
+					const int32 Added = Crate->GetInventory()->AddStack(Left, true);
+					Crate->SetAllowAddingItems(false);
+					Left.NumItems -= Added;
+					Items += Added;
+					if (Added > 0)
+					{
+						continue;
+					}
+				}
+				// A crate that took nothing would be followed by another forever
+				if (!Spawn(World, Left, Player, Fallback))
+				{
+					Lost += Left.NumItems;
+					return;
+				}
+			}
+		}
+
+		// The crates shrink to the stacks they hold; the counts go into the result
+		void Finish(FAreaActionsResult& Result)
+		{
+			for (const TWeakObjectPtr<AFGCrate>& Weak : All)
+			{
+				UFGInventoryComponent* Inventory = Weak.IsValid() ? Weak->GetInventory() : nullptr;
+				if (!Inventory)
+				{
+					continue;
+				}
+				// Only the empty slots after the last stack go: a player may have taken items from the middle meanwhile
+				int32 Used = 0;
+				for (int32 Index = 0; Index < Inventory->GetSizeLinear(); ++Index)
+				{
+					Used = Inventory->IsSomethingOnIndex(Index) ? Index + 1 : Used;
+				}
+				if (Used > 0 && Used < Inventory->GetSizeLinear())
+				{
+					Inventory->Resize(Used);
+				}
+			}
+			Result.Crates = All.Num();
+			Result.CratesAway = Away;
+			Result.Lost = Lost;
+			if (Lost > 0)
+			{
+				UE_LOG(LogAreaActionsCpp, Error, TEXT("%s could not place a crate: %d items lost"), Job, Lost);
+			}
+			if (!All.IsEmpty())
+			{
+				UE_LOG(LogAreaActionsCpp, Display, TEXT("%s crates %d (%d away from the player) with %d items"), Job, All.Num(), Away, Items);
+			}
+		}
+
+		// The test mode's failures (AA-085, the messages): 1 = no room next to the player, 2 = no crate anywhere
+		static int32 FailForTest;
+
+	private:
+		// Takes what the new crate holds out of Left; false when there is no crate or it took nothing
+		bool Spawn(UWorld* World, FInventoryStack& Left, AFGCharacterPlayer* Player, const FVector& Fallback)
+		{
+			if (FailForTest == 2)
+			{
+				return false;
+			}
+			// The first stack within its stack size, the rest goes in after the crate has room
+			FInventoryStack First = Left;
+			First.NumItems = FMath::Min(Left.NumItems, FMath::Max(1, UFGItemDescriptor::GetStackSize(Left.Item.GetItemClass())));
+			FSpawnInventoryCrateParameters Parameters;
+			Parameters.bAllowCrateMerging = false;
+			if (Player)
+			{
+				Parameters.ActorsToIgnore.Add(Player);
+			}
+			AFGCrate* Crate = Player && FailForTest != 1 ? AFGItemPickup_Spawnable::SpawnInventoryCrate(World, { First }, Player->GetActorLocation(), Parameters) : nullptr;
+			if (!Crate)
+			{
+				Crate = AFGItemPickup_Spawnable::SpawnInventoryCrate(World, { First }, Fallback, Parameters);
+				Away += Crate ? 1 : 0;
+			}
+			if (!Crate || !Crate->GetInventory())
+			{
+				return false;
+			}
+			const int32 Taken = Crate->GetInventory()->GetNumItems(nullptr);
+			if (Taken <= 0)
+			{
+				Crate->Destroy();
+				return false;
+			}
+			Items += Taken;
+			Left.NumItems -= Taken;
+			Crate->SetAllowAddingItems(true);
+			Crate->GetInventory()->Resize(MaxStacks);
+			Crate->SetAllowAddingItems(false);
+			Current = Crate;
+			All.Add(Crate);
+			return true;
+		}
+
+		const TCHAR* Job;
+		TWeakObjectPtr<AFGCrate> Current;
+		TArray<TWeakObjectPtr<AFGCrate>> All;
+		int32 Items = 0;
+		int32 Lost = 0;
+		int32 Away = 0;
+	};
+
+	int32 FReturnCrates::FailForTest = 0;
+
+	// Counts the inventory's contents and empties it; the solid stacks go into Crates when it is given (fluids cannot go into a crate)
+	FTaken TakeAll(UFGInventoryComponent* Inventory, FReturnCrates* Crates, AFGCharacterPlayer* Player, const AActor* From)
 	{
 		TArray<FInventoryStack> Stacks;
 		Inventory->GetInventoryStacks(Stacks);
@@ -48,51 +176,13 @@ namespace
 				continue;
 			}
 			Taken.Solids += Stack.NumItems;
-			if (Returned)
+			if (Crates)
 			{
-				Returned->FindOrAdd(Stack.Item.GetItemClass()) += Stack.NumItems;
+				Crates->Add(From->GetWorld(), Stack, Player, From->GetActorLocation());
 			}
 		}
 		Inventory->Empty();
 		return Taken;
-	}
-
-	// One crate with the items next to the player; when the player left or there is no room there, where the last changed building
-	// stands, rather than lose them
-	void SpawnReturnCrate(UWorld* World, const FReturnedItems& Returned, AFGCharacterPlayer* Player, const FVector& Fallback, const TCHAR* JobName)
-	{
-		if (Returned.IsEmpty())
-		{
-			return;
-		}
-		TArray<FInventoryStack> Stacks;
-		int32 Items = 0;
-		for (const TPair<TSubclassOf<UFGItemDescriptor>, int32>& Entry : Returned)
-		{
-			const int32 StackSize = FMath::Max(1, UFGItemDescriptor::GetStackSize(Entry.Key));
-			for (int32 Left = Entry.Value; Left > 0; Left -= StackSize)
-			{
-				Stacks.Emplace(FMath::Min(Left, StackSize), Entry.Key);
-			}
-			Items += Entry.Value;
-		}
-		FSpawnInventoryCrateParameters Parameters;
-		Parameters.bAllowCrateMerging = false;
-		if (Player)
-		{
-			Parameters.ActorsToIgnore.Add(Player);
-		}
-		const AFGCrate* Crate = Player ? AFGItemPickup_Spawnable::SpawnInventoryCrate(World, Stacks, Player->GetActorLocation(), Parameters) : nullptr;
-		if (!Crate)
-		{
-			Crate = AFGItemPickup_Spawnable::SpawnInventoryCrate(World, Stacks, Fallback, Parameters);
-		}
-		if (!Crate)
-		{
-			UE_LOG(LogAreaActionsCpp, Error, TEXT("%s could not spawn the crate: %d items in %d stacks lost"), JobName, Items, Stacks.Num());
-			return;
-		}
-		UE_LOG(LogAreaActionsCpp, Display, TEXT("%s crate %s with %d items in %d stacks"), JobName, *GetNameSafe(Crate), Items, Stacks.Num());
 	}
 
 	class FSetRecipeJob final : public FAreaActionsJob
@@ -126,11 +216,10 @@ namespace
 			{
 				if (Inventory)
 				{
-					Result.Items += TakeAll(Inventory, &Returned).Solids;
+					Result.Items += TakeAll(Inventory, &Crates, Character.Get(), Machine).Solids;
 				}
 			}
 			Machine->SetRecipe(Recipe);
-			LastMachine = Machine->GetActorLocation();
 			++Result.Buildings;
 			Result.AddCount(Machine->GetClass());
 		}
@@ -142,14 +231,13 @@ namespace
 				Result.Code = EAreaActionsResultCode::AlreadySet;
 			}
 			FAreaActionsJob::Finish(World);
-			SpawnReturnCrate(World, Returned, Character.Get(), LastMachine, GetName());
+			Crates.Finish(Result);
 		}
 
 	private:
 		TSubclassOf<UFGRecipe> Recipe;
 		TArray<UClass*> ProducedIn;
-		FReturnedItems Returned;
-		FVector LastMachine = FVector::ZeroVector;
+		FReturnCrates Crates{ TEXT("SetRecipe") };
 		int32 AlreadySet = 0;
 	};
 
@@ -173,7 +261,7 @@ namespace
 			{
 				if (Inventory && Inventory != Upgrades)
 				{
-					const FTaken One = TakeAll(Inventory, bToCrate ? &Returned : nullptr);
+					const FTaken One = TakeAll(Inventory, bToCrate ? &Crates : nullptr, Character.Get(), Actor);
 					Taken.Solids += One.Solids;
 					Taken.Fluid += One.Fluid;
 				}
@@ -183,7 +271,6 @@ namespace
 			{
 				Result.Items += Taken.Solids;
 				Result.Fluid += Taken.Fluid;
-				LastBuilding = Actor->GetActorLocation();
 				++Result.Buildings;
 				Result.AddCount(Actor->GetClass());
 			}
@@ -192,13 +279,12 @@ namespace
 		virtual void Finish(UWorld* World) override
 		{
 			FAreaActionsJob::Finish(World);
-			SpawnReturnCrate(World, Returned, Character.Get(), LastBuilding, GetName());
+			Crates.Finish(Result);
 		}
 
 	private:
 		bool bToCrate;
-		FReturnedItems Returned;
-		FVector LastBuilding = FVector::ZeroVector;
+		FReturnCrates Crates{ TEXT("ClearInventories") };
 	};
 
 	class FSetStationModeJob final : public FAreaActionsJob
@@ -466,17 +552,18 @@ namespace
 			}
 			AFGCharacterPlayer* Player = Character.Get();
 			UFGInventoryComponent* Inventory = Player ? Player->GetInventory() : nullptr;
-			FReturnedItems Left;
+			const FVector Fallback = Area.Polygon.IsEmpty() ? FVector::ZeroVector : FVector(Area.Polygon[0], 0.0);
+			FReturnCrates Crates(GetName());
 			for (const TPair<TSubclassOf<UFGItemDescriptor>, int32>& Entry : Refund)
 			{
 				Result.Items -= Entry.Value;
 				const int32 Added = Inventory ? Inventory->AddStack(FInventoryStack(Entry.Value, Entry.Key), true) : 0;
 				if (Entry.Value > Added)
 				{
-					Left.Add(Entry.Key, Entry.Value - Added);
+					Crates.Add(World, FInventoryStack(Entry.Value - Added, Entry.Key), Player, Fallback);
 				}
 			}
-			SpawnReturnCrate(World, Left, Player, Area.Polygon.IsEmpty() ? FVector::ZeroVector : FVector(Area.Polygon[0], 0.0), GetName());
+			Crates.Finish(Result);
 		}
 
 		FAreaActionsPlacement Placement;
@@ -491,6 +578,195 @@ namespace
 		bool bCostTaken = false;
 		bool bNoSource = false;
 	};
+
+	// MassDismantle (AA-030) by the game's own rules (P5): every building, lightweight and crate in the area; CanDismantle decides, an
+	// actor's refund is its GetDismantleRefund (build cost and contents, the contents only with No Build Cost), a lightweight's comes from
+	// its class. With bToCrate the refund goes into the return crates as each building goes; fluids are lost.
+	class FDismantleJob final : public FAreaActionsJob
+	{
+	public:
+		explicit FDismantleJob(bool bInToCrate) : bToCrate(bInToCrate) {}
+
+		virtual const TCHAR* GetName() const override { return TEXT("MassDismantle"); }
+		virtual int32 GetItems() const override { return FoundCrates.Num() + Buildings.Num(); }
+
+		virtual bool Step(UWorld* World, double EndTime) override
+		{
+			if (!bCollected)
+			{
+				if (!bStarted)
+				{
+					bStarted = true;
+					// Crates are not buildables; the crates this job makes come later and are not among them
+					for (TActorIterator<AFGCrate> It(World); It; ++It)
+					{
+						if (IsValid(*It) && Area.Contains(It->GetActorLocation()))
+						{
+							FoundCrates.Add(*It);
+						}
+					}
+					const AFGCharacterPlayer* Player = Character.Get();
+					const UFGInventoryComponent* Inventory = Player ? Player->GetInventory() : nullptr;
+					bNoCost = Inventory && Inventory->GetNoBuildCost();
+				}
+				if (!Collector.Step(World, Area, Buildings, EndTime))
+				{
+					return false;
+				}
+				bCollected = true;
+			}
+			const int32 Total = FoundCrates.Num() + Buildings.Num();
+			while (Next < Total)
+			{
+				const int32 Index = Next++;
+				if (Index < FoundCrates.Num())
+				{
+					TakeCrate(World, FoundCrates[Index].Get());
+				}
+				else if (const AreaActionsBuildings::FSnapshot& Building = Buildings[Index - FoundCrates.Num()]; Building.LightweightIndex != INDEX_NONE)
+				{
+					DismantleLightweight(World, Building);
+				}
+				else
+				{
+					DismantleActor(World, Building.Actor.Get());
+				}
+				if (FPlatformTime::Seconds() > EndTime)
+				{
+					return Next >= Total;
+				}
+			}
+			return true;
+		}
+
+		virtual void Finish(UWorld* World) override
+		{
+			FAreaActionsJob::Finish(World);
+			Crates.Finish(Result);
+		}
+
+	private:
+		void Refund(UWorld* World, const TArray<FInventoryStack>& Stacks, const FVector& From)
+		{
+			for (const FInventoryStack& Stack : Stacks)
+			{
+				if (!Stack.HasItems())
+				{
+					continue;
+				}
+				if (UFGItemDescriptor::GetForm(Stack.Item.GetItemClass()) != EResourceForm::RF_SOLID)
+				{
+					Result.Fluid += Stack.NumItems;
+					continue;
+				}
+				Result.Items += Stack.NumItems;
+				Crates.Add(World, Stack, Character.Get(), From);
+			}
+		}
+
+		void TakeCrate(UWorld* World, AFGCrate* Crate)
+		{
+			if (!IsValid(Crate))
+			{
+				return;
+			}
+			if (bToCrate && Crate->GetInventory())
+			{
+				TArray<FInventoryStack> Stacks;
+				Crate->GetInventory()->GetInventoryStacks(Stacks);
+				Refund(World, Stacks, Crate->GetActorLocation());
+			}
+			Result.AddCount(Crate->GetClass());
+			++Result.Buildings;
+			Crate->Destroy();
+		}
+
+		// The actor and what the game dismantles along with it (GetChildDismantleActors)
+		void DismantleActor(UWorld* World, AFGBuildable* Actor)
+		{
+			if (!IsValid(Actor) || Actor->GetIsDismantled() || Done.Contains(Actor))
+			{
+				return;
+			}
+			if (!IFGDismantleInterface::Execute_CanDismantle(Actor))
+			{
+				++Result.Skipped;
+				return;
+			}
+			TArray<AActor*> Children;
+			IFGDismantleInterface::Execute_GetChildDismantleActors(Actor, Children);
+			DismantleOne(World, Actor);
+			for (AActor* Child : Children)
+			{
+				const AFGBuildable* Buildable = Cast<AFGBuildable>(Child);
+				if (IsValid(Child) && Child->Implements<UFGDismantleInterface>() && !Done.Contains(Child) && !(Buildable && Buildable->GetIsDismantled()))
+				{
+					if (IFGDismantleInterface::Execute_CanDismantle(Child))
+					{
+						DismantleOne(World, Child);
+					}
+					else
+					{
+						++Result.Skipped;
+					}
+				}
+			}
+		}
+
+		void DismantleOne(UWorld* World, AActor* Actor)
+		{
+			Done.Add(Actor);
+			if (bToCrate)
+			{
+				TArray<FInventoryStack> Stacks;
+				IFGDismantleInterface::Execute_GetDismantleRefund(Actor, Stacks, bNoCost);
+				Refund(World, Stacks, Actor->GetActorLocation());
+			}
+			Result.AddCount(Actor->GetClass());
+			++Result.Buildings;
+			IFGDismantleInterface::Execute_Dismantle(Actor);
+		}
+
+		void DismantleLightweight(UWorld* World, const AreaActionsBuildings::FSnapshot& Building)
+		{
+			AFGLightweightBuildableSubsystem* Lightweights = AFGLightweightBuildableSubsystem::Get(World);
+			const FRuntimeBuildableInstanceData* Data = Lightweights ? Lightweights->GetRuntimeDataForBuildableClassAndIndex(Building.Class, Building.LightweightIndex) : nullptr;
+			// The slot may have been freed and filled with another building since the collection
+			if (!Data || !Data->IsValid() || !Data->Transform.Equals(Building.Transform, 0.01))
+			{
+				return;
+			}
+			if (bToCrate && !bNoCost)
+			{
+				TArray<FInventoryStack> Stacks;
+				Building.Class->GetDefaultObject<AFGBuildable>()->GetLightweightBuildableDismantleRefundReturns(World, AreaActionsBuildings::GetRecipe(World, Building), Data->TypeSpecificData, Stacks);
+				Refund(World, Stacks, Building.Transform.GetLocation());
+			}
+			Result.AddCount(Building.Class);
+			++Result.Buildings;
+			Lightweights->RemoveByInstanceIndex(Building.Class, Building.LightweightIndex);
+		}
+
+		bool bToCrate;
+		bool bNoCost = false;
+		bool bStarted = false;
+		AreaActionsBuildings::FCollector Collector;
+		TArray<AreaActionsBuildings::FSnapshot> Buildings;
+		TArray<TWeakObjectPtr<AFGCrate>> FoundCrates;
+		TSet<TWeakObjectPtr<AActor>> Done;
+		int32 Next = 0;
+		FReturnCrates Crates{ TEXT("MassDismantle") };
+	};
+}
+
+TUniquePtr<FAreaActionsJob> AreaActionsJobs::MakeDismantle(bool bToCrate)
+{
+	return MakeUnique<FDismantleJob>(bToCrate);
+}
+
+void AreaActionsJobs::SetCratesFailForTest(int32 Mode)
+{
+	FReturnCrates::FailForTest = Mode;
 }
 
 TUniquePtr<FAreaActionsJob> AreaActionsJobs::MakeSetRecipe(TSubclassOf<UFGRecipe> Recipe)

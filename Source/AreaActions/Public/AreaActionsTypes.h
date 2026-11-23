@@ -76,6 +76,21 @@ struct AREAACTIONS_API FAreaActionsResult
 	UPROPERTY(BlueprintReadOnly, Category = "Area Actions")
 	int32 Fluid = 0;
 
+	// Return crates made (AA-085); CratesAway of them stand where the last changed building was, not at the player
+	UPROPERTY(BlueprintReadOnly, Category = "Area Actions")
+	int32 Crates = 0;
+
+	UPROPERTY(BlueprintReadOnly, Category = "Area Actions")
+	int32 CratesAway = 0;
+
+	// Solid items that should have gone into a crate but no crate could be placed
+	UPROPERTY(BlueprintReadOnly, Category = "Area Actions")
+	int32 Lost = 0;
+
+	// MassDismantle: buildings the game does not let anyone dismantle (CanDismantle), left standing
+	UPROPERTY(BlueprintReadOnly, Category = "Area Actions")
+	int32 Skipped = 0;
+
 	// Changed buildings per class
 	UPROPERTY(BlueprintReadOnly, Category = "Area Actions")
 	TArray<FAreaActionsClassCount> Counts;

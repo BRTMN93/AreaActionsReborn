@@ -211,6 +211,15 @@ void UAreaActionsRCO::ServerPlaceCopies_Implementation(int32 RequestId, const FA
 	Start(RequestId, Area, AreaActionsJobs::MakePlaceCopies(Placement, bUseBuildCost, Distance));
 }
 
+void UAreaActionsRCO::ServerDismantle_Implementation(int32 RequestId, const FAreaActionsArea& InArea, bool bRefundToCrate)
+{
+	FAreaActionsArea Area = InArea;
+	if (ValidateRequest(RequestId, Area, TEXT("MassDismantle")))
+	{
+		Start(RequestId, Area, AreaActionsJobs::MakeDismantle(bRefundToCrate));
+	}
+}
+
 void UAreaActionsRCO::ClientResult_Implementation(int32 RequestId, const FAreaActionsResult& Result)
 {
 	UE_LOG(LogAreaActionsCpp, Display, TEXT("ClientResult %d: code %d, buildings %d, items %d"), RequestId, static_cast<int32>(Result.Code), Result.Buildings, Result.Items);

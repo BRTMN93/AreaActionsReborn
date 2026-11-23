@@ -8,7 +8,7 @@
 #include "Subsystem/SubsystemActorManager.h"
 
 static TAutoConsoleVariable<float> CVarServerBudgetMs(TEXT("AreaActions.ServerBudgetMs"), 2.0f,
-	TEXT("Time per frame the server spends on area actions, for all players together (ms)"));
+	TEXT("Time per frame the server spends on area actions, for all players together (ms); 0 = one building per frame"));
 
 int32 AAreaActionsServerSubsystem::FinishedJobs = 0;
 
@@ -65,7 +65,7 @@ void AAreaActionsServerSubsystem::Tick(float DeltaSeconds)
 		return;
 	}
 	const double Start = FPlatformTime::Seconds();
-	const double Share = FMath::Max(0.1, CVarServerBudgetMs.GetValueOnGameThread()) / 1000.0 / Jobs.Num();
+	const double Share = FMath::Max(0.0f, CVarServerBudgetMs.GetValueOnGameThread()) / 1000.0 / Jobs.Num();
 	for (int32 Index = 0; Index < Jobs.Num();)
 	{
 		FAreaActionsJob& Job = *Jobs[Index];

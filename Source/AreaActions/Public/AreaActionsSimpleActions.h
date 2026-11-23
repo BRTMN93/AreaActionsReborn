@@ -48,6 +48,27 @@ private:
 	bool bToCrate = false;
 };
 
+// "Refund to crate" or "No refund", then the request; closing the window cancels. The result names the buildings, the refund, the crates
+// and what the game did not let anyone dismantle
+UCLASS()
+class AREAACTIONS_API UAreaActionMassDismantle : public UAreaAction
+{
+	GENERATED_BODY()
+
+public:
+	virtual void Start() override;
+	virtual void OnResult(const FAreaActionsResult& Result) override;
+
+	UFUNCTION()
+	void ToCrate();
+	UFUNCTION()
+	void NoRefund();
+
+private:
+	void Send(bool bInToCrate);
+	bool bToCrate = false;
+};
+
 // "Load" or "Unload", then the request; closing the window cancels
 UCLASS()
 class AREAACTIONS_API UAreaActionSetStationMode : public UAreaAction

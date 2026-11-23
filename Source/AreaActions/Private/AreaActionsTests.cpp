@@ -8,6 +8,14 @@
 #include "AreaActionsCopy.h"
 #include "Hologram/FGHologram.h"
 #include "Buildables/FGBuildableConveyorBelt.h"
+#include "Equipment/FGChainsaw.h"
+#include "AreaActionsJobs.h"
+#include "Algo/AnyOf.h"
+#include "Blueprint/WidgetTree.h"
+#include "Buildables/FGBuildablePowerPole.h"
+#include "Buildables/FGBuildableWire.h"
+#include "FGPowerConnectionComponent.h"
+#include "HAL/IConsoleManager.h"
 #include "Components/CheckBox.h"
 #include "Components/EditableTextBox.h"
 #include "FGCentralStorageSubsystem.h"
@@ -2839,8 +2847,1327 @@ namespace
 		});
 	}
 
+	// --- MassDismantle (AA-030), the return crates (AA-078, AA-085) ---
+
+	// "Desc_IronPlate_C 50, Desc_IronIngot_C 10", sorted, items with a state marked
+	FString StacksText(const TArray<FInventoryStack>& Stacks)
+	{
+		TMap<FString, int32> Sum;
+		for (const FInventoryStack& Stack : Stacks)
+		{
+			if (Stack.HasItems())
+			{
+				Sum.FindOrAdd(GetNameSafe(Stack.Item.GetItemClass()) + (Stack.Item.HasState() ? TEXT("(state)") : TEXT(""))) += Stack.NumItems;
+			}
+		}
+		Sum.KeySort(TLess<FString>());
+		TArray<FString> Parts;
+		for (const TPair<FString, int32>& Entry : Sum)
+		{
+			Parts.Add(FString::Printf(TEXT("%s %d"), *Entry.Key, Entry.Value));
+		}
+		return Parts.IsEmpty() ? TEXT("nothing") : FString::Join(Parts, TEXT(", "));
+	}
+
+	int32 StacksCount(const TArray<FInventoryStack>& Stacks, TSubclassOf<UFGItemDescriptor> ItemClass)
+	{
+		int32 Count = 0;
+		for (const FInventoryStack& Stack : Stacks)
+		{
+			Count += Stack.HasItems() && (!ItemClass || Stack.Item.GetItemClass() == ItemClass) ? Stack.NumItems : 0;
+		}
+		return Count;
+	}
+
+	// Every item in the actor's inventories, read straight from them
+	TArray<FInventoryStack> ContentsOf(const AActor* Actor)
+	{
+		TArray<FInventoryStack> Out;
+		TInlineComponentArray<UFGInventoryComponent*> Inventories(Actor);
+		for (const UFGInventoryComponent* Inventory : Inventories)
+		{
+			TArray<FInventoryStack> Stacks;
+			Inventory->GetInventoryStacks(Stacks);
+			Out.Append(Stacks);
+		}
+		return Out;
+	}
+
+	// A chainsaw with energy stored: an item with a state (FInventoryItem::HasState)
+	FInventoryStack StateItem(float Energy)
+	{
+		FInventoryItem Saw(TSubclassOf<UFGItemDescriptor>(GameClass(TEXT("Desc_Chainsaw"))));
+		FFGChainsawItemState State;
+		State.EnergyStored = Energy;
+		FFGDynamicStruct Dynamic;
+		Dynamic.InitializeAs(State);
+		Saw.SetItemState(Dynamic);
+		FInventoryStack Stack(Saw);
+		Stack.NumItems = 1;
+		return Stack;
+	}
+
+	float StateEnergy(const FInventoryStack& Stack)
+	{
+		const FFGDynamicStruct& State = Stack.Item.GetItemState();
+		return State.IsValid() && State.GetStruct() == FFGChainsawItemState::StaticStruct() ? static_cast<const FFGChainsawItemState*>(State.GetStructValueRaw())->EnergyStored : -1.0f;
+	}
+
+	// A belt of 6 m between two points, as BuildBasic's
+	AFGBuildable* SpawnBelt(const FRun& R, const FVector& At)
+	{
+		UClass* Class = GameClass(TEXT("Build_ConveyorBeltMk1"));
+		AFGBuildableSubsystem* Buildables = AFGBuildableSubsystem::Get(R.GetWorld());
+		const FTransform Transform(At);
+		AFGBuildable* Belt = Class && Buildables ? Buildables->BeginSpawnBuildable(Class, Transform) : nullptr;
+		if (!Belt)
+		{
+			return nullptr;
+		}
+		Belt->SetBuiltWithRecipe(RecipeOfClass(R, Class, TEXT("Recipe_ConveyorBeltMk1")));
+		if (TArray<FSplinePointData>* Spline = Cast<AFGBuildableConveyorBelt>(Belt)->GetMutableSplinePointData())
+		{
+			Spline->Reset();
+			Spline->Emplace(FVector::ZeroVector, FVector(0, 600, 0));
+			Spline->Emplace(FVector(0, 600, 0), FVector(0, 600, 0));
+		}
+		Belt->FinishSpawning(Transform);
+		return Belt;
+	}
+
+	AFGBuildable* SpawnGameBuildable(const FRun& R, const TCHAR* ClassName, const TCHAR* RecipeName, const FVector& At)
+	{
+		UClass* Class = GameClass(ClassName);
+		AFGBuildableSubsystem* Buildables = AFGBuildableSubsystem::Get(R.GetWorld());
+		const FTransform Transform(At);
+		AFGBuildable* Actor = Class && Buildables ? Buildables->BeginSpawnBuildable(Class, Transform) : nullptr;
+		if (Actor)
+		{
+			Actor->SetBuiltWithRecipe(RecipeOfClass(R, Class, RecipeName));
+			Actor->FinishSpawning(Transform);
+		}
+		return Actor;
+	}
+
+	// R8: the game's dismantle called from code: refunds, CanDismantle, Dismantle and the lightweight removal, at scale, and a crate that
+	// grows after it was spawned; nothing comes back after a save and a load
+	void AddDismantleProbe(FRun& R)
+	{
+		struct FProbe
+		{
+			TArray<TWeakObjectPtr<AActor>> Actors;
+			TArray<FString> ClassPaths;
+			TArray<FVector> Places;
+			TWeakObjectPtr<AFGCrate> Crate;
+			FVector Foundation = FVector::ZeroVector;
+			double DismantledAt = 0.0;
+			uint64 DismantledFrame = 0;
+			TArray<TWeakObjectPtr<AActor>> Mass;
+			TArray<FVector> MassPlaces;
+			TArray<FVector> MassFoundations;
+			FVector GrownCrate = FVector::ZeroVector;
+			int32 GrownItems = 0;
+		};
+		TSharedRef<FProbe> P = MakeShared<FProbe>();
+		const FString SaveName = TEXT("AATest_DismantleProbe");
+		R.Steps.Add([P](FRun& Self)
+		{
+			UWorld* World = Self.GetWorld();
+			const FVector Base = Ground(Self, Self.GetPlayer()->GetPawn()->GetActorLocation() + FVector(3000.0, 0.0, 0.0));
+			AFGBuildableManufacturer* Machine = SpawnMachine(Self, Asset::Constructor, Base + FVector(0, -1500, 0), Asset::IronPlate, 10, 5);
+			AFGBuildableStorage* Storage = SpawnStorage(Self, Base + FVector(0, 0, 0), 50, 0);
+			if (Storage)
+			{
+				Storage->GetStorageInventory()->AddStack(StateItem(123.5f), true);
+			}
+			AFGBuildable* Belt = SpawnBelt(Self, Base + FVector(0, 1500, 100));
+			for (AActor* Actor : TArray<AActor*>{ Machine, Storage, Belt })
+			{
+				P->Actors.Add(Actor);
+				P->ClassPaths.Add(Actor ? Actor->GetClass()->GetPathName() : FString());
+				P->Places.Add(Actor ? Actor->GetActorLocation() : FVector::ZeroVector);
+			}
+			FSpawnInventoryCrateParameters Parameters;
+			Parameters.bAllowCrateMerging = false;
+			P->Crate = AFGItemPickup_Spawnable::SpawnInventoryCrate(World, { FInventoryStack(25, Item(Asset::IronRodItem)) }, Base + FVector(1500, 0, 0), Parameters);
+			AreaActionsBuildings::FSnapshot Foundation;
+			Foundation.Class = GameClass(TEXT("Build_Foundation_8x1_01"));
+			Foundation.BuiltWith = RecipeOfClass(Self, Foundation.Class, TEXT("Recipe_Foundation_8x1_01"));
+			P->Foundation = Base + FVector(-1500, 0, 0);
+			const bool bFoundation = Foundation.Class && AreaActionsBuildings::Spawn(World, Foundation, FTransform(P->Foundation));
+			Self.Check(Machine && Storage && Belt && P->Crate.IsValid() && bFoundation, FString::Printf(TEXT("probe built: Constructor %d, container %d, belt %d, crate %d, foundation %d"),
+				Machine != nullptr, Storage != nullptr, Belt != nullptr, P->Crate.IsValid(), bFoundation));
+			return EStep::Next;
+		});
+		R.Steps.Add(WaitFrames(30));
+		R.Steps.Add([P](FRun& Self)
+		{
+			UWorld* World = Self.GetWorld();
+			for (const TWeakObjectPtr<AActor>& Weak : P->Actors)
+			{
+				AActor* Actor = Weak.Get();
+				if (!Actor)
+				{
+					continue;
+				}
+				const bool bCan = IFGDismantleInterface::Execute_CanDismantle(Actor);
+				TArray<FInventoryStack> Full, OnlyContents;
+				IFGDismantleInterface::Execute_GetDismantleRefund(Actor, Full, false);
+				IFGDismantleInterface::Execute_GetDismantleRefund(Actor, OnlyContents, true);
+				TArray<AActor*> Children;
+				IFGDismantleInterface::Execute_GetChildDismantleActors(Actor, Children);
+				const AFGBuildable* Buildable = Cast<AFGBuildable>(Actor);
+				TArray<FInventoryStack> Ingredients;
+				for (const FItemAmount& Each : UFGRecipe::GetIngredients(World, Buildable ? Buildable->GetBuiltWithRecipe() : nullptr))
+				{
+					Ingredients.Emplace(Each.Amount, Each.ItemClass);
+				}
+				const TArray<FInventoryStack> Contents = ContentsOf(Actor);
+				Self.Step(FString::Printf(TEXT("R8 %s: CanDismantle %d, children %d; refund %s; refund without cost %s; contents %s; recipe %s %s"), *Actor->GetClass()->GetName(), bCan,
+					Children.Num(), *StacksText(Full), *StacksText(OnlyContents), *StacksText(Contents), *GetNameSafe(Buildable ? Buildable->GetBuiltWithRecipe() : nullptr), *StacksText(Ingredients)));
+				Self.Check(bCan, FString::Printf(TEXT("R8 %s can be dismantled"), *Actor->GetClass()->GetName()));
+				// The refund without cost is the contents, the full one adds the recipe's ingredients (times the game's own multiplier)
+				Self.Check(StacksText(OnlyContents) == StacksText(Contents), FString::Printf(TEXT("R8 %s refund without cost equals the contents"), *Actor->GetClass()->GetName()));
+				for (const FInventoryStack& Ingredient : Ingredients)
+				{
+					const int32 Extra = StacksCount(Full, Ingredient.Item.GetItemClass()) - StacksCount(OnlyContents, Ingredient.Item.GetItemClass());
+					Self.Check(Extra > 0 && Extra % Ingredient.NumItems == 0, FString::Printf(TEXT("R8 %s refund has %s x%d (%d per recipe)"), *Actor->GetClass()->GetName(),
+						*GetNameSafe(Ingredient.Item.GetItemClass()), Extra, Ingredient.NumItems));
+				}
+				if (Actor->IsA<AFGBuildableStorage>())
+				{
+					const FInventoryStack* Saw = OnlyContents.FindByPredicate([](const FInventoryStack& Stack) { return Stack.Item.HasState(); });
+					Self.Check(Saw && FMath::IsNearlyEqual(StateEnergy(*Saw), 123.5f), FString::Printf(TEXT("R8 refund keeps the chainsaw's state: energy %.1f"), Saw ? StateEnergy(*Saw) : -1.0f));
+				}
+			}
+			int32 Index = INDEX_NONE;
+			UClass* FoundationClass = GameClass(TEXT("Build_Foundation_8x1_01"));
+			const FRuntimeBuildableInstanceData* Data = FindLightweight(World, FoundationClass, P->Foundation, &Index);
+			TArray<FInventoryStack> Lightweight;
+			if (Data)
+			{
+				FoundationClass->GetDefaultObject<AFGBuildable>()->GetLightweightBuildableDismantleRefundReturns(World, Data->BuiltWithRecipe, Data->TypeSpecificData, Lightweight);
+			}
+			Self.Check(Data && !Lightweight.IsEmpty(), FString::Printf(TEXT("R8 lightweight foundation refund from its class: %s"), *StacksText(Lightweight)));
+			for (const TCHAR* Name : { TEXT("Build_TradingPost"), TEXT("Build_SpaceElevator") })
+			{
+				UClass* Class = GameClass(Name);
+				const AFGBuildable* Default = Class ? Class->GetDefaultObject<AFGBuildable>() : nullptr;
+				Self.Step(FString::Printf(TEXT("R8 %s class default CanDismantle %d"), Name, Default ? IFGDismantleInterface::Execute_CanDismantle(Default) : -1));
+			}
+			// The game's dismantle, then the lightweight's removal by its index
+			const double Start = FPlatformTime::Seconds();
+			for (const TWeakObjectPtr<AActor>& Weak : P->Actors)
+			{
+				if (AActor* Actor = Weak.Get())
+				{
+					IFGDismantleInterface::Execute_Dismantle(Actor);
+				}
+			}
+			if (AFGCrate* Crate = P->Crate.Get())
+			{
+				Crate->Destroy();
+			}
+			if (Data)
+			{
+				AFGLightweightBuildableSubsystem::Get(World)->RemoveByInstanceIndex(FoundationClass, Index);
+			}
+			P->DismantledAt = FPlatformTime::Seconds();
+			P->DismantledFrame = GFrameCounter;
+			Self.Step(FString::Printf(TEXT("R8 dismantled 3 actors, destroyed the crate, removed the foundation in %.3f ms"), (P->DismantledAt - Start) * 1000.0));
+			Self.Check(!FindLightweight(World, FoundationClass, P->Foundation), TEXT("R8 the foundation's instance is gone at once"));
+			return EStep::Next;
+		});
+		R.Steps.Add([P](FRun& Self)
+		{
+			const int32 Left = Algo::CountIf(P->Actors, [](const TWeakObjectPtr<AActor>& Weak) { return IsValid(Weak.Get()); });
+			if (Left > 0 && Self.Now() - P->DismantledAt < 20.0)
+			{
+				return EStep::Wait;
+			}
+			Self.Check(Left == 0 && !P->Crate.IsValid(), FString::Printf(TEXT("R8 dismantled actors gone after %.2f s, %llu frames (left %d, crate %d)"),
+				Self.Now() - P->DismantledAt, GFrameCounter - P->DismantledFrame, Left, P->Crate.IsValid()));
+			return EStep::Next;
+		});
+		// At scale: 500 containers with items and 2000 foundations, each set refunded and dismantled in one frame
+		R.Steps.Add([P](FRun& Self)
+		{
+			UWorld* World = Self.GetWorld();
+			const FVector Base = Ground(Self, Self.GetPlayer()->GetPawn()->GetActorLocation() + FVector(12000.0, -10000.0, 0.0));
+			for (int32 Index = 0; Index < 500; ++Index)
+			{
+				const FVector At = Base + FVector((Index % 25) * 800.0, (Index / 25) * 800.0, 0.0);
+				P->Mass.Add(SpawnStorage(Self, At, 10, 0));
+				P->MassPlaces.Add(At);
+			}
+			AreaActionsBuildings::FSnapshot Foundation;
+			Foundation.Class = GameClass(TEXT("Build_Foundation_8x1_01"));
+			Foundation.BuiltWith = RecipeOfClass(Self, Foundation.Class, TEXT("Recipe_Foundation_8x1_01"));
+			for (int32 Index = 0; Index < 2000; ++Index)
+			{
+				const FVector At = Base + FVector((Index % 50) * 800.0, 25000.0 + (Index / 50) * 800.0, 0.0);
+				if (AreaActionsBuildings::Spawn(World, Foundation, FTransform(At)))
+				{
+					P->MassFoundations.Add(At);
+				}
+			}
+			Self.Check(Algo::CountIf(P->Mass, [](const TWeakObjectPtr<AActor>& Weak) { return Weak.IsValid(); }) == 500 && P->MassFoundations.Num() == 2000,
+				FString::Printf(TEXT("R8 scale: %d containers, %d foundations built"), P->Mass.Num(), P->MassFoundations.Num()));
+			return EStep::Next;
+		});
+		R.Steps.Add(WaitFrames(30));
+		R.Steps.Add([P](FRun& Self)
+		{
+			UWorld* World = Self.GetWorld();
+			double Start = FPlatformTime::Seconds();
+			int32 Items = 0;
+			for (const TWeakObjectPtr<AActor>& Weak : P->Mass)
+			{
+				if (AActor* Actor = Weak.Get(); IsValid(Actor) && IFGDismantleInterface::Execute_CanDismantle(Actor))
+				{
+					TArray<FInventoryStack> Refund;
+					IFGDismantleInterface::Execute_GetDismantleRefund(Actor, Refund, false);
+					Items += StacksCount(Refund, nullptr);
+					IFGDismantleInterface::Execute_Dismantle(Actor);
+				}
+			}
+			const double ActorsMs = (FPlatformTime::Seconds() - Start) * 1000.0;
+			Start = FPlatformTime::Seconds();
+			AFGLightweightBuildableSubsystem* Lightweights = AFGLightweightBuildableSubsystem::Get(World);
+			UClass* FoundationClass = GameClass(TEXT("Build_Foundation_8x1_01"));
+			const AFGBuildable* Default = FoundationClass->GetDefaultObject<AFGBuildable>();
+			int32 Removed = 0;
+			for (const FVector& At : P->MassFoundations)
+			{
+				int32 Index = INDEX_NONE;
+				if (const FRuntimeBuildableInstanceData* Data = FindLightweight(World, FoundationClass, At, &Index))
+				{
+					TArray<FInventoryStack> Refund;
+					Default->GetLightweightBuildableDismantleRefundReturns(World, Data->BuiltWithRecipe, Data->TypeSpecificData, Refund);
+					Items += StacksCount(Refund, nullptr);
+					Lightweights->RemoveByInstanceIndex(FoundationClass, Index);
+					++Removed;
+				}
+			}
+			const double LightweightsMs = (FPlatformTime::Seconds() - Start) * 1000.0;
+			Self.Step(FString::Printf(TEXT("R8 scale: 500 containers refunded and dismantled in %.1f ms (%.1f us each); %d foundations in %.1f ms (%.1f us each, the test's own search included); %d items"),
+				ActorsMs, ActorsMs * 2.0, Removed, LightweightsMs, LightweightsMs * 1000.0 / FMath::Max(1, Removed), Items));
+			Self.Check(Removed == 2000, FString::Printf(TEXT("R8 scale: %d of 2000 foundations removed"), Removed));
+			P->DismantledAt = Self.Now();
+			return EStep::Next;
+		});
+		R.Steps.Add([P](FRun& Self)
+		{
+			const int32 Left = Algo::CountIf(P->Mass, [](const TWeakObjectPtr<AActor>& Weak) { return IsValid(Weak.Get()); });
+			if (Left > 0 && Self.Now() - P->DismantledAt < 30.0)
+			{
+				return EStep::Wait;
+			}
+			Self.Check(Left == 0, FString::Printf(TEXT("R8 scale: containers gone after %.2f s (left %d)"), Self.Now() - P->DismantledAt, Left));
+			return EStep::Next;
+		});
+		// A crate grown after its spawn: room made, items added, a stated item kept
+		R.Steps.Add([P](FRun& Self)
+		{
+			FSpawnInventoryCrateParameters Parameters;
+			Parameters.bAllowCrateMerging = false;
+			AFGCrate* Crate = AFGItemPickup_Spawnable::SpawnInventoryCrate(Self.GetWorld(), { FInventoryStack(1, Item(Asset::IronPlateItem)) }, Self.GetPlayer()->GetPawn()->GetActorLocation(), Parameters);
+			UFGInventoryComponent* Inventory = Crate ? Crate->GetInventory() : nullptr;
+			if (!Self.Check(Inventory != nullptr, TEXT("R8 crate spawned")))
+			{
+				return EStep::Next;
+			}
+			const int32 SizeAtSpawn = Inventory->GetSizeLinear();
+			const int32 RefusedBefore = Inventory->AddStack(FInventoryStack(10, Item(Asset::IronRodItem)), true);
+			Crate->SetAllowAddingItems(true);
+			Inventory->Resize(200);
+			int32 Added = 0;
+			for (int32 Index = 0; Index < 150; ++Index)
+			{
+				Added += Inventory->AddStack(FInventoryStack(100, Item(Asset::IronPlateItem)), true);
+			}
+			Added += Inventory->AddStack(StateItem(77.0f), true);
+			Crate->SetAllowAddingItems(false);
+			P->GrownCrate = Crate->GetActorLocation();
+			P->GrownItems = Inventory->GetNumItems(nullptr);
+			Self.Step(FString::Printf(TEXT("R8 crate: %d slots at spawn, %d added before allowing, %d added after; now %d slots, %d items"), SizeAtSpawn, RefusedBefore, Added,
+				Inventory->GetSizeLinear(), P->GrownItems));
+			Self.Check(Added == 15001 && P->GrownItems == 15002, TEXT("R8 crate takes items after its spawn"));
+			return EStep::Next;
+		});
+		AddSaveAndLoad(R, SaveName);
+		R.Steps.Add([P](FRun& Self)
+		{
+			UWorld* World = Self.GetWorld();
+			int32 Back = 0;
+			for (int32 Index = 0; Index < P->ClassPaths.Num(); ++Index)
+			{
+				Back += FindActor(World, LoadClass<UObject>(nullptr, *P->ClassPaths[Index]), P->Places[Index]) ? 1 : 0;
+			}
+			UClass* FoundationClass = GameClass(TEXT("Build_Foundation_8x1_01"));
+			Back += FindLightweight(World, FoundationClass, P->Foundation) ? 1 : 0;
+			UClass* StorageClass = LoadClass<AFGBuildable>(nullptr, Asset::Storage);
+			for (const FVector& At : P->MassPlaces)
+			{
+				Back += FindActor(World, StorageClass, At) ? 1 : 0;
+			}
+			for (const FVector& At : P->MassFoundations)
+			{
+				Back += FindLightweight(World, FoundationClass, At) ? 1 : 0;
+			}
+			Self.Check(Back == 0, FString::Printf(TEXT("R8 loaded: %d dismantled buildings came back"), Back));
+			AFGCrate* Grown = nullptr;
+			for (TActorIterator<AFGCrate> It(World); It; ++It)
+			{
+				if (FVector::Dist(It->GetActorLocation(), P->GrownCrate) < 10.0)
+				{
+					Grown = *It;
+				}
+			}
+			TArray<FInventoryStack> Stacks;
+			if (Grown)
+			{
+				Grown->GetInventory()->GetInventoryStacks(Stacks);
+			}
+			const FInventoryStack* Saw = Stacks.FindByPredicate([](const FInventoryStack& Stack) { return Stack.Item.HasState(); });
+			Self.Check(Grown && StacksCount(Stacks, nullptr) == P->GrownItems && Saw && FMath::IsNearlyEqual(StateEnergy(*Saw), 77.0f),
+				FString::Printf(TEXT("R8 loaded: grown crate %d with %d of %d items, chainsaw energy %.1f"), Grown != nullptr, StacksCount(Stacks, nullptr), P->GrownItems, Saw ? StateEnergy(*Saw) : -1.0f));
+			return EStep::Next;
+		});
+		AddDeleteSave(R, SaveName);
+	}
+
+	using FCounts = AreaActionsBuildings::FItemCounts;
+
+	void AddSolids(FCounts& Out, const TArray<FInventoryStack>& Stacks)
+	{
+		for (const FInventoryStack& Stack : Stacks)
+		{
+			if (Stack.HasItems() && UFGItemDescriptor::GetForm(Stack.Item.GetItemClass()) == EResourceForm::RF_SOLID)
+			{
+				Out.FindOrAdd(Stack.Item.GetItemClass()) += Stack.NumItems;
+			}
+		}
+	}
+
+	int32 Total(const FCounts& Counts)
+	{
+		int32 Sum = 0;
+		for (const TPair<TSubclassOf<UFGItemDescriptor>, int32>& Entry : Counts)
+		{
+			Sum += Entry.Value;
+		}
+		return Sum;
+	}
+
+	bool SameCounts(const FCounts& A, const FCounts& B)
+	{
+		FCounts Left = A;
+		for (const TPair<TSubclassOf<UFGItemDescriptor>, int32>& Entry : B)
+		{
+			Left.FindOrAdd(Entry.Key) -= Entry.Value;
+		}
+		return !Algo::AnyOf(Left, [](const TPair<TSubclassOf<UFGItemDescriptor>, int32>& Entry) { return Entry.Value != 0; });
+	}
+
+	// The items of all crates in the world
+	int32 AllCrateItems(UWorld* World)
+	{
+		int32 Sum = 0;
+		for (TActorIterator<AFGCrate> It(World); It; ++It)
+		{
+			Sum += IsValid(*It) && It->GetInventory() ? It->GetInventory()->GetNumItems(nullptr) : 0;
+		}
+		return Sum;
+	}
+
+	// Load a save made before: back to the main menu, the steps after this run in the loaded world
+	void AddLoad(FRun& R, const FString& SaveName)
+	{
+		R.Steps.Add([SaveName](FRun& Self)
+		{
+			Self.bAwaitWorld = true;
+			Self.bLoadIssued = false;
+			Self.LoadSave = SaveName;
+			Self.AwaitStarted = Self.Now();
+			Self.Step(FString::Printf(TEXT("to the main menu to load %s"), *SaveName));
+			UFGBlueprintFunctionLibrary::TravelToMainMenu(Self.GetPlayer());
+			return EStep::Next;
+		});
+		R.Steps.Add(WaitFrames(30));
+	}
+
+	void SetBudget(float Ms)
+	{
+		if (IConsoleVariable* Budget = IConsoleManager::Get().FindConsoleVariable(TEXT("AreaActions.ServerBudgetMs")))
+		{
+			Budget->Set(Ms, ECVF_SetByCode);
+		}
+	}
+
+	// A Constructor whose input holds 2 m3 of water past its filters (as ClearInventories' scene); the water added
+	int32 AddWater(AFGBuildableManufacturer* Constructor)
+	{
+		UFGInventoryComponent* Input = Constructor ? Constructor->GetInputInventory() : nullptr;
+		if (!Input || Input->GetSizeLinear() == 0)
+		{
+			return 0;
+		}
+		const FItemFilter ItemFilter = Input->mItemFilter;
+		const FFormFilter FormFilter = Input->mFormFilter;
+		Input->mItemFilter.Unbind();
+		Input->mFormFilter.Unbind();
+		const TSubclassOf<UFGItemDescriptor> Allowed = Input->GetAllowedItemOnIndex(0);
+		Input->SetAllowedItemOnIndex(0, nullptr);
+		const int32 Water = Input->AddStackToIndex(0, FInventoryStack(2000, Item(Asset::WaterItem)), true);
+		Input->SetAllowedItemOnIndex(0, Allowed);
+		Input->mItemFilter = ItemFilter;
+		Input->mFormFilter = FormFilter;
+		return Water;
+	}
+
+	// What a dismantle scene holds and what the refund should be
+	struct FDismantleState
+	{
+		FCopyState Pieces;
+		TWeakObjectPtr<AFGCrate> AreaCrate;
+		// (a) the game's refunds read before the action: GetDismantleRefund of each actor, the lightweights' from their class, the crate's
+		// contents
+		FCounts Expected;
+		// (b) the contents read straight from the inventories and the crate, and the actors' refunds without cost: they must agree
+		FCounts Contents;
+		FCounts RefundWithoutCost;
+		int32 Buildings = 0;
+		bool bNoCost = false;
+		int32 CrateItemsBefore = 0;
+		FVector CratePlace = FVector::ZeroVector;
+		int32 CrateItems = 0;
+	};
+	using FDismantleRef = TSharedRef<FDismantleState>;
+
+	// The card's scene: 4 foundations, 2 walls, a Constructor and a container with items, a belt, a pole with a wire, a crate with items
+	void BuildDismantleBasic(FRun& R, FScene& S, FDismantleState& D)
+	{
+		FCopyState& C = D.Pieces;
+		C.Base = Ground(R, S.Center);
+		for (const FVector2D Offset : { FVector2D(-400, -400), FVector2D(400, -400), FVector2D(-400, 400), FVector2D(400, 400) })
+		{
+			AddLightweight(R, C, TEXT("Build_Foundation_8x1_01"), TEXT("Recipe_Foundation_8x1_01"), FTransform(C.Base + FVector(Offset, 0)));
+		}
+		AddLightweight(R, C, TEXT("Build_Wall_8x4_01"), TEXT("Recipe_Wall_8x4_01"), FTransform(C.Base + FVector(0, -800, 100)));
+		AddLightweight(R, C, TEXT("Build_Wall_8x4_01"), TEXT("Recipe_Wall_8x4_01"), FTransform(C.Base + FVector(0, 800, 100)));
+		AFGBuildableManufacturer* Constructor = Cast<AFGBuildableManufacturer>(AddActor(R, S, C, TEXT("Build_ConstructorMk1"), TEXT("Recipe_ConstructorMk1"),
+			FTransform(C.Base + FVector(-2500, -1500, 50))));
+		if (Constructor)
+		{
+			Constructor->SetRecipe(Recipe(Asset::IronPlate));
+			Constructor->GetInputInventory()->AddStack(FInventoryStack(10, Item(Asset::IronIngotItem)), true);
+			Constructor->GetOutputInventory()->AddStack(FInventoryStack(5, Item(Asset::IronPlateItem)), true);
+		}
+		if (AFGBuildableStorage* Storage = Cast<AFGBuildableStorage>(AddActor(R, S, C, TEXT("Build_StorageContainerMk1"), TEXT("Recipe_StorageContainerMk1"),
+			FTransform(C.Base + FVector(-2500, 0, 50)))))
+		{
+			Storage->GetStorageInventory()->AddStack(FInventoryStack(50, Item(Asset::IronPlateItem)), true);
+			Storage->GetStorageInventory()->AddStack(FInventoryStack(30, Item(Asset::IronIngotItem)), true);
+		}
+		AddActor(R, S, C, TEXT("Build_ConveyorBeltMk1"), TEXT("Recipe_ConveyorBeltMk1"), FTransform(C.Base + FVector(-2500, 1500, 150)), [](AFGBuildable* Actor)
+		{
+			if (TArray<FSplinePointData>* Spline = Cast<AFGBuildableConveyorBelt>(Actor)->GetMutableSplinePointData())
+			{
+				Spline->Reset();
+				Spline->Emplace(FVector::ZeroVector, FVector(0, 600, 0));
+				Spline->Emplace(FVector(0, 600, 0), FVector(0, 600, 0));
+			}
+		});
+		AFGBuildablePowerPole* Pole = Cast<AFGBuildablePowerPole>(AddActor(R, S, C, TEXT("Build_PowerPoleMK1"), TEXT("Recipe_PowerPoleMk1"),
+			FTransform(C.Base + FVector(2500, -1500, 50))));
+		AFGBuildableWire* Wire = Cast<AFGBuildableWire>(AddActor(R, S, C, TEXT("Build_PowerLine"), TEXT("Recipe_PowerLine"), FTransform(C.Base + FVector(0, -1500, 300))));
+		UFGPowerConnectionComponent* MachinePlug = Constructor ? Constructor->FindComponentByClass<UFGPowerConnectionComponent>() : nullptr;
+		const bool bWired = Pole && Wire && MachinePlug && Pole->GetPowerConnections().Num() > 0 && Wire->Connect(Pole->GetPowerConnection(0), MachinePlug);
+		R.Check(bWired, FString::Printf(TEXT("wire from the pole to the Constructor: pole %d, wire %d, plug %d, length %.0f"), Pole != nullptr, Wire != nullptr,
+			MachinePlug != nullptr, Wire ? Wire->GetLength() : -1.0f));
+		FSpawnInventoryCrateParameters Parameters;
+		Parameters.bAllowCrateMerging = false;
+		D.AreaCrate = AFGItemPickup_Spawnable::SpawnInventoryCrate(R.GetWorld(), { FInventoryStack(25, Item(Asset::IronRodItem)) }, C.Base + FVector(2500, 1500, 100), Parameters);
+		R.Check(D.AreaCrate.IsValid() && S.Area.Contains(D.AreaCrate->GetActorLocation()), TEXT("crate with 25 rods in the area"));
+		for (const FVector& Place : S.ControlPlaces())
+		{
+			S.Controls.Add(SpawnStorage(R, Place, 15, 0));
+		}
+		D.Buildings = C.Pattern.Num() + 1;
+	}
+
+	// (a) and (b) read right before the request
+	void RecordRefund(FRun& R, const FScene& S, FDismantleState& D)
+	{
+		UWorld* World = R.GetWorld();
+		D.Expected.Reset();
+		D.Contents.Reset();
+		D.RefundWithoutCost.Reset();
+		for (const TWeakObjectPtr<AFGBuildable>& Weak : S.Inside)
+		{
+			if (AFGBuildable* Actor = Weak.Get())
+			{
+				TArray<FInventoryStack> Refund, WithoutCost;
+				IFGDismantleInterface::Execute_GetDismantleRefund(Actor, Refund, D.bNoCost);
+				IFGDismantleInterface::Execute_GetDismantleRefund(Actor, WithoutCost, true);
+				AddSolids(D.Expected, Refund);
+				AddSolids(D.RefundWithoutCost, WithoutCost);
+				AddSolids(D.Contents, ContentsOf(Actor));
+			}
+		}
+		for (FPiece& Piece : D.Pieces.Pattern)
+		{
+			const FRuntimeBuildableInstanceData* Data = Piece.bLightweight ? FindLightweight(World, Piece.Class, Piece.Transform.GetLocation()) : nullptr;
+			if (Data && !D.bNoCost)
+			{
+				TArray<FInventoryStack> Refund;
+				Piece.Class->GetDefaultObject<AFGBuildable>()->GetLightweightBuildableDismantleRefundReturns(World, Data->BuiltWithRecipe, Data->TypeSpecificData, Refund);
+				AddSolids(D.Expected, Refund);
+			}
+		}
+		if (const AFGCrate* Crate = D.AreaCrate.Get())
+		{
+			TArray<FInventoryStack> Stacks;
+			Crate->GetInventory()->GetInventoryStacks(Stacks);
+			AddSolids(D.Expected, Stacks);
+			AddSolids(D.Contents, Stacks);
+			AddSolids(D.RefundWithoutCost, Stacks);
+		}
+		R.Check(SameCounts(D.RefundWithoutCost, D.Contents), FString::Printf(TEXT("(b) the game's refund without cost %d equals the contents read straight %d"),
+			Total(D.RefundWithoutCost), Total(D.Contents)));
+		R.Step(FString::Printf(TEXT("expected refund %s (%d items)"), *ItemsText(D.Expected), Total(D.Expected)));
+	}
+
+	void AddDismantleScene(FRun& R, const FSceneRef& S, const FDismantleRef& D, double Side = 0.0)
+	{
+		AddScene(R, S, 4000.0, [D](FRun& Self, FScene& Scene) { BuildDismantleBasic(Self, Scene, *D); }, Side);
+		R.Steps.Add([S, D](FRun& Self)
+		{
+			RecordRefund(Self, *S, *D);
+			CountWorld(Self, D->Pieces);
+			D->Pieces.JobsBefore = AAreaActionsServerSubsystem::FinishedJobs;
+			return EStep::Next;
+		});
+	}
+
+	// The menu, the question answered with its first (Refund to crate) or second (No refund) button, the result
+	void AddDismantle(FRun& R, const FSceneRef& S, bool bToCrate)
+	{
+		AddOpenAction(R, TEXT("MassDismantle"));
+		AddOnWindow(R, TEXT("Widget_MessageYesNo"), [bToCrate](FRun& Self, UUserWidget* Window)
+		{
+			// The answers are named after what they do (D16)
+			const UButton* Button = Cast<UButton>(Window->GetWidgetFromName(bToCrate ? TEXT("YesButton") : TEXT("NoButton")));
+			FString Label;
+			if (Button)
+			{
+				UWidgetTree::ForWidgetAndChildren(const_cast<UButton*>(Button), [&Label](UWidget* Child)
+				{
+					if (const UTextBlock* Text = Cast<UTextBlock>(Child))
+					{
+						Label = Text->GetText().ToString();
+					}
+				});
+			}
+			const TCHAR* Want = bToCrate ? TEXT("Refund to crate") : TEXT("No refund");
+			Self.Check(Label == Want, FString::Printf(TEXT("button reads '%s' (want '%s')"), *Label, Want));
+			Self.Check(PressButton(Window, bToCrate ? TEXT("YesButton") : TEXT("NoButton")), FString::Printf(TEXT("'%s' pressed"), Want));
+		});
+		AddResultWindow(R, S);
+	}
+
+	// Every building of the scene is gone, actors after their dismantle effect, the controls stay with their items
+	void AddCheckGone(FRun& R, const FSceneRef& S, const FDismantleRef& D)
+	{
+		TSharedRef<double> Since = MakeShared<double>(0.0);
+		R.Steps.Add([S, D, Since](FRun& Self)
+		{
+			*Since = *Since > 0.0 ? *Since : Self.Now();
+			const int32 Left = Algo::CountIf(S->Inside, [](const TWeakObjectPtr<AFGBuildable>& Weak) { return IsValid(Weak.Get()); });
+			if (Left > 0 && Self.Now() - *Since < 15.0)
+			{
+				return EStep::Wait;
+			}
+			Self.Check(Left == 0, FString::Printf(TEXT("actors gone: %d of %d left"), Left, S->Inside.Num()));
+			int32 Lightweights = 0;
+			for (const FPiece& Piece : D->Pieces.Pattern)
+			{
+				Lightweights += Piece.bLightweight && FindLightweight(Self.GetWorld(), Piece.Class, Piece.Transform.GetLocation()) ? 1 : 0;
+			}
+			Self.Check(Lightweights == 0, FString::Printf(TEXT("lightweight instances left: %d"), Lightweights));
+			Self.Check(!D->AreaCrate.IsValid(), TEXT("the area's crate is gone"));
+			for (int32 Index = 0; Index < S->Controls.Num(); ++Index)
+			{
+				Self.Check(StorageItems(S->Controls[Index].Get()) == 15, FString::Printf(TEXT("control container %d (W4): %d items"), Index, StorageItems(S->Controls[Index].Get())));
+			}
+			return EStep::Next;
+		});
+	}
+
+	// One new crate next to the player with exactly the expected refund
+	void AddCheckRefundCrate(FRun& R, const FSceneRef& S, const FDismantleRef& D)
+	{
+		R.Steps.Add([S, D](FRun& Self)
+		{
+			const TArray<AFGCrate*> Crates = NewCrates(Self, *S);
+			FCounts InCrate;
+			for (const AFGCrate* Crate : Crates)
+			{
+				TArray<FInventoryStack> Stacks;
+				Crate->GetInventory()->GetInventoryStacks(Stacks);
+				AddSolids(InCrate, Stacks);
+			}
+			Self.Check(Crates.Num() == 1 && SameCounts(InCrate, D->Expected), FString::Printf(TEXT("new crates %d; in them %s (%d), expected %s (%d)"), Crates.Num(),
+				*ItemsText(InCrate), Total(InCrate), *ItemsText(D->Expected), Total(D->Expected)));
+			const double Distance = Crates.Num() == 1 ? FVector::Dist(Crates[0]->GetActorLocation(), Self.GetPlayer()->GetPawn()->GetActorLocation()) : -1.0;
+			Self.Check(Distance >= 0.0 && Distance < 1500.0, FString::Printf(TEXT("crate next to the player: %.0f cm"), Distance));
+			if (Crates.Num() == 1)
+			{
+				D->CratePlace = Crates[0]->GetActorLocation();
+				D->CrateItems = Total(InCrate);
+			}
+			const FString Want = FString::Printf(TEXT("Dismantled %d buildings. %d items were refunded. The items are in 1 crate next to you."), D->Buildings, Total(D->Expected));
+			Self.Check(S->Message.Contains(Want), FString::Printf(TEXT("result '%s' has '%s'"), *S->Message, *Want));
+			Self.Check(AAreaActionsServerSubsystem::FinishedJobs - D->Pieces.JobsBefore == 1, TEXT("one AAJOB line"));
+			return EStep::Next;
+		});
+	}
+
+	void AddDismantleBasic(FRun& R)
+	{
+		FSceneRef S = MakeShared<FScene>();
+		FDismantleRef D = MakeShared<FDismantleState>();
+		AddDismantleScene(R, S, D);
+		AddDismantle(R, S, true);
+		AddCheckGone(R, S, D);
+		AddCheckRefundCrate(R, S, D);
+	}
+
+	void AddDismantleNoCrate(FRun& R)
+	{
+		FSceneRef S = MakeShared<FScene>();
+		FDismantleRef D = MakeShared<FDismantleState>();
+		AddDismantleScene(R, S, D);
+		AddDismantle(R, S, false);
+		AddCheckGone(R, S, D);
+		R.Steps.Add([S, D](FRun& Self)
+		{
+			Self.Check(NewCrates(Self, *S).IsEmpty(), FString::Printf(TEXT("no new crate: %d"), NewCrates(Self, *S).Num()));
+			const FString Want = FString::Printf(TEXT("Dismantled %d buildings. Nothing was refunded."), D->Buildings);
+			Self.Check(S->Message.Contains(Want), FString::Printf(TEXT("result '%s' has '%s'"), *S->Message, *Want));
+			return EStep::Next;
+		});
+	}
+
+	void AddDismantleNoCost(FRun& R)
+	{
+		FSceneRef S = MakeShared<FScene>();
+		FDismantleRef D = MakeShared<FDismantleState>();
+		D->bNoCost = true;
+		R.Steps.Add([](FRun& Self)
+		{
+			AFGGameState* State = Self.GetWorld()->GetGameState<AFGGameState>();
+			if (State)
+			{
+				State->SetCheatNoCost(true);
+			}
+			Self.Check(State && PlayerInventory(Self)->GetNoBuildCost(), TEXT("No Build Cost on"));
+			return EStep::Next;
+		});
+		AddDismantleScene(R, S, D);
+		R.Steps.Add([D](FRun& Self)
+		{
+			Self.Check(SameCounts(D->Expected, D->Contents), FString::Printf(TEXT("expected refund is the contents only: %d of %d"), Total(D->Expected), Total(D->Contents)));
+			return EStep::Next;
+		});
+		AddDismantle(R, S, true);
+		AddCheckGone(R, S, D);
+		AddCheckRefundCrate(R, S, D);
+		R.Steps.Add([](FRun& Self)
+		{
+			if (AFGGameState* State = Self.GetWorld()->GetGameState<AFGGameState>())
+			{
+				State->SetCheatNoCost(false);
+			}
+			return EStep::Next;
+		});
+	}
+
+	// The HUB and the Space Elevator, and a railroad switch lever (which the game dismantles only with its track): CanDismantle of each,
+	// read right before the request, decides what goes
+	void AddDismantleProtected(FRun& R)
+	{
+		struct FProtected
+		{
+			TArray<TWeakObjectPtr<AFGBuildable>> Buildings;
+			TArray<bool> CanDismantle;
+			int32 Refused = 0;
+		};
+		FSceneRef S = MakeShared<FScene>();
+		TSharedRef<FProtected> P = MakeShared<FProtected>();
+		AddScene(R, S, 6000.0, [P](FRun& Self, FScene& Scene)
+		{
+			const FVector Base = Ground(Self, Scene.Center);
+			struct FWhat { const TCHAR* Class; const TCHAR* Recipe; FVector Offset; };
+			for (const FWhat& What : { FWhat{ TEXT("Build_TradingPost"), TEXT("Recipe_TradingPost"), FVector(-3000, -3000, 0) },
+				FWhat{ TEXT("Build_SpaceElevator"), TEXT("Recipe_SpaceElevator"), FVector(1500, 1500, 0) },
+				FWhat{ TEXT("Build_RailroadSwitchControl"), TEXT("Recipe_RailroadSwitchControl"), FVector(-3000, 3000, 0) } })
+			{
+				AFGBuildable* Building = SpawnGameBuildable(Self, What.Class, What.Recipe, Base + What.Offset);
+				Self.Step(FString::Printf(TEXT("%s spawned: %d"), What.Class, Building != nullptr));
+				if (Building)
+				{
+					P->Buildings.Add(Building);
+					Scene.Inside.Add(Building);
+				}
+			}
+			for (const FVector& Place : Scene.ControlPlaces())
+			{
+				Scene.Controls.Add(SpawnStorage(Self, Place, 15, 0));
+			}
+		});
+		R.Steps.Add([P](FRun& Self)
+		{
+			for (const TWeakObjectPtr<AFGBuildable>& Weak : P->Buildings)
+			{
+				const bool bCan = Weak.IsValid() && IFGDismantleInterface::Execute_CanDismantle(Weak.Get());
+				P->CanDismantle.Add(bCan);
+				P->Refused += bCan ? 0 : 1;
+				Self.Step(FString::Printf(TEXT("%s CanDismantle %d"), *GetNameSafe(Weak.IsValid() ? Weak->GetClass() : nullptr), bCan));
+			}
+			Self.Check(P->Refused > 0, FString::Printf(TEXT("the scene has %d buildings the game refuses to dismantle"), P->Refused));
+			return EStep::Next;
+		});
+		AddDismantle(R, S, true);
+		R.Steps.Add(WaitFrames(60));
+		R.Steps.Add([S, P](FRun& Self)
+		{
+			for (int32 Index = 0; Index < P->Buildings.Num(); ++Index)
+			{
+				const bool bStands = IsValid(P->Buildings[Index].Get()) && !P->Buildings[Index]->GetIsDismantled();
+				Self.Check(bStands != P->CanDismantle[Index], FString::Printf(TEXT("building %d: CanDismantle %d, stands %d"), Index, P->CanDismantle[Index], bStands));
+			}
+			const FString Want = FString::Printf(TEXT("%d %s the game does not let you dismantle %s left."), P->Refused, P->Refused == 1 ? TEXT("building") : TEXT("buildings"),
+				P->Refused == 1 ? TEXT("was") : TEXT("were"));
+			Self.Check(S->Message.Contains(Want), FString::Printf(TEXT("result '%s' has '%s'"), *S->Message, *Want));
+			for (int32 Index = 0; Index < S->Controls.Num(); ++Index)
+			{
+				Self.Check(StorageItems(S->Controls[Index].Get()) == 15, FString::Printf(TEXT("control container %d (W4): %d items"), Index, StorageItems(S->Controls[Index].Get())));
+			}
+			return EStep::Next;
+		});
+	}
+
+	void AddDismantleSaveLoad(FRun& R)
+	{
+		FSceneRef S = MakeShared<FScene>();
+		FDismantleRef D = MakeShared<FDismantleState>();
+		const FString SaveName = TEXT("AATest_DismantleSaveLoad");
+		AddDismantleScene(R, S, D);
+		AddDismantle(R, S, true);
+		AddCheckGone(R, S, D);
+		AddCheckRefundCrate(R, S, D);
+		AddSaveAndLoad(R, SaveName);
+		R.Steps.Add([D](FRun& Self)
+		{
+			UWorld* World = Self.GetWorld();
+			int32 Back = 0;
+			for (FPiece& Piece : D->Pieces.Pattern)
+			{
+				Piece.Resolve();
+				const FVector At = Piece.Transform.GetLocation();
+				Back += (Piece.bLightweight ? FindLightweight(World, Piece.Class, At) != nullptr : FindActor(World, Piece.Class, At) != nullptr) ? 1 : 0;
+			}
+			Self.Check(Back == 0, FString::Printf(TEXT("loaded: %d of %d dismantled buildings came back"), Back, D->Pieces.Pattern.Num()));
+			const AFGCrate* Crate = nullptr;
+			for (TActorIterator<AFGCrate> It(World); It; ++It)
+			{
+				Crate = FVector::Dist(It->GetActorLocation(), D->CratePlace) < 10.0 ? *It : Crate;
+			}
+			const int32 Items = Crate ? Crate->GetInventory()->GetNumItems(nullptr) : -1;
+			Self.Check(Items == D->CrateItems, FString::Printf(TEXT("loaded: the refund crate holds %d of %d items"), Items, D->CrateItems));
+			return EStep::Next;
+		});
+		AddDeleteSave(R, SaveName);
+	}
+
+	// W5 on 4938 foundations and 103 containers with items, at one height above the ground
+	void AddDismantleLarge(FRun& R)
+	{
+		// 71 x 71 = 5041 places
+		static constexpr int32 Side = 71;
+		static constexpr double Spacing = 800.0;
+		FSceneRef S = MakeShared<FScene>();
+		TSharedRef<TArray<FVector>> Foundations = MakeShared<TArray<FVector>>();
+		AddEquipTool(R);
+		R.Steps.Add([S](FRun& Self)
+		{
+			PlaceScene(Self, *S, Side * Spacing / 2.0, 2000.0);
+			S->Center.Z += 2000.0;
+			S->Area.MinZ = S->Center.Z - 500.0;
+			S->Area.MaxZ = S->Center.Z + 500.0;
+			for (const FVector& Place : S->ControlPlaces())
+			{
+				S->Controls.Add(SpawnStorage(Self, Place, 15, 0));
+			}
+			ListenResults(Self, S);
+			return EStep::Next;
+		});
+		for (int32 Batch = 0; Batch < 6; ++Batch)
+		{
+			R.Steps.Add([S, Foundations, Batch](FRun& Self)
+			{
+				AreaActionsBuildings::FSnapshot Foundation;
+				Foundation.Class = GameClass(TEXT("Build_Foundation_8x1_01"));
+				Foundation.BuiltWith = RecipeOfClass(Self, Foundation.Class, TEXT("Recipe_Foundation_8x1_01"));
+				for (int32 Index = Batch * 1000; Index < FMath::Min((Batch + 1) * 1000, Side * Side); ++Index)
+				{
+					const FVector At = S->Center + FVector((Index % Side - Side / 2.0 + 0.5) * Spacing, (Index / Side - Side / 2.0 + 0.5) * Spacing, 0.0);
+					// Every 49th place holds a container instead
+					if (Index % 49 == 0)
+					{
+						S->Inside.Add(SpawnStorage(Self, At, 10, 0));
+					}
+					else if (AreaActionsBuildings::Spawn(Self.GetWorld(), Foundation, FTransform(At)))
+					{
+						Foundations->Add(At);
+					}
+				}
+				return EStep::Next;
+			});
+		}
+		R.Steps.Add(WaitFrames(30));
+		R.Steps.Add([S, Foundations](FRun& Self)
+		{
+			Self.Check(S->Inside.Num() + Foundations->Num() == Side * Side && AllValid(S->Inside), FString::Printf(TEXT("%d containers and %d foundations built"),
+				S->Inside.Num(), Foundations->Num()));
+			Self.Check(SetToolArea(Self, *S), TEXT("tool area set"));
+			SnapshotCrates(Self, *S);
+			Self.MaxFrameMs = 0.0;
+			Self.bMeasureFrames = true;
+			Self.StepTimeoutSec = 180.0;
+			return EStep::Next;
+		});
+		AddDismantle(R, S, true);
+		R.Steps.Add([S, Foundations](FRun& Self)
+		{
+			Self.bMeasureFrames = false;
+			Self.StepTimeoutSec = 60.0;
+			Self.Check(Self.MaxFrameMs <= 200.0, FString::Printf(TEXT("longest frame during the job: %.1f ms (W5: 200)"), Self.MaxFrameMs));
+			Self.Check(S->Message.Contains(FString::Printf(TEXT("Dismantled %s buildings."), *FText::AsNumber(Side * Side).ToString())), FString::Printf(TEXT("result '%s'"), *S->Message));
+			int32 Left = 0;
+			UClass* FoundationClass = GameClass(TEXT("Build_Foundation_8x1_01"));
+			for (const FVector& At : *Foundations)
+			{
+				Left += FindLightweight(Self.GetWorld(), FoundationClass, At) ? 1 : 0;
+			}
+			Self.Check(Left == 0, FString::Printf(TEXT("foundations left: %d"), Left));
+			for (int32 Index = 0; Index < S->Controls.Num(); ++Index)
+			{
+				Self.Check(StorageItems(S->Controls[Index].Get()) == 15, FString::Printf(TEXT("control container %d (W4): %d items"), Index, StorageItems(S->Controls[Index].Get())));
+			}
+			return EStep::Next;
+		});
+	}
+
+	// AA-078 (1): one building per frame, a save while the job is half done, the save loaded: every item is in a building or a crate
+	enum class EJobKind : uint8 { SetRecipe, Clear, Dismantle };
+
+	void AddSaveDuringJob(FRun& R, EJobKind Kind, int32 RequestId)
+	{
+		static constexpr int32 Count = 25;
+		struct FJobState
+		{
+			TArray<FVector> Places;
+			FString ClassPath;
+			int32 Before = 0;
+			int32 CostEach = 0;
+			int32 SaveResult = -1;
+			uint64 SentFrame = 0;
+			int32 DoneAtSave = 0;
+		};
+		const TCHAR* Names[] = { TEXT("SetRecipe"), TEXT("ClearInventories"), TEXT("MassDismantle") };
+		const FString Name = Names[static_cast<int32>(Kind)];
+		const FString SaveName = FString::Printf(TEXT("AATest_SaveDuringJob_%s"), *Name);
+		FSceneRef S = MakeShared<FScene>();
+		TSharedRef<FJobState> J = MakeShared<FJobState>();
+		auto Done = [Kind](const AFGBuildable* Building)
+		{
+			switch (Kind)
+			{
+			case EJobKind::SetRecipe:
+				return Cast<AFGBuildableManufacturer>(Building) && Cast<AFGBuildableManufacturer>(Building)->GetCurrentRecipe() == Recipe(Asset::IronRod);
+			case EJobKind::Clear:
+				return StorageItems(Building) == 0;
+			default:
+				return !IsValid(Building) || Building->GetIsDismantled();
+			}
+		};
+		auto ItemsAt = [](UWorld* World, const FJobState& State, int32& OutMissing)
+		{
+			int32 Sum = 0;
+			OutMissing = 0;
+			UClass* Class = LoadClass<UObject>(nullptr, *State.ClassPath);
+			for (const FVector& At : State.Places)
+			{
+				const AFGBuildable* Building = FindActor(World, Class, At);
+				OutMissing += Building ? 0 : 1;
+				for (const FInventoryStack& Stack : Building ? ContentsOf(Building) : TArray<FInventoryStack>())
+				{
+					Sum += Stack.HasItems() ? Stack.NumItems : 0;
+				}
+			}
+			return Sum;
+		};
+		AddScene(R, S, 4000.0, [Kind, J](FRun& Self, FScene& Scene)
+		{
+			MakeAvailable(Self, Asset::IronRod);
+			for (int32 Index = 0; Index < Count; ++Index)
+			{
+				const FVector At = Scene.Center + FVector(-2800.0 + (Index % 5) * 1400.0, -2800.0 + (Index / 5) * 1400.0, 0.0);
+				AFGBuildable* Building = Kind == EJobKind::SetRecipe ? static_cast<AFGBuildable*>(SpawnMachine(Self, Asset::Constructor, At, Asset::IronPlate, 10, 5)) : SpawnStorage(Self, At, 50, 30);
+				Scene.Inside.Add(Building);
+				if (Building)
+				{
+					J->Places.Add(Building->GetActorLocation());
+					J->ClassPath = Building->GetClass()->GetPathName();
+				}
+			}
+			for (const FVector& Place : Scene.ControlPlaces())
+			{
+				Scene.Controls.Add(SpawnStorage(Self, Place, 15, 0));
+			}
+		});
+		R.Steps.Add([S, J, Kind, RequestId, Name, ItemsAt](FRun& Self)
+		{
+			int32 Missing = 0;
+			J->Before = ItemsAt(Self.GetWorld(), *J, Missing) + AllCrateItems(Self.GetWorld());
+			for (const FItemAmount& Ingredient : UFGRecipe::GetIngredients(Self.GetWorld(), GameClass(TEXT("Recipe_StorageContainerMk1"))))
+			{
+				J->CostEach += Ingredient.Amount;
+			}
+			SetBudget(0.0f);
+			J->SentFrame = GFrameCounter;
+			Self.Step(FString::Printf(TEXT("%s: %d items in the buildings and crates; request %d with a budget of 0 ms"), *Name, J->Before, RequestId));
+			UAreaActionsRCO* Rco = UAreaActionsRCO::Of(Self.GetPlayer());
+			switch (Kind)
+			{
+			case EJobKind::SetRecipe:
+				Rco->ServerSetRecipe(RequestId, S->Area, Recipe(Asset::IronRod));
+				break;
+			case EJobKind::Clear:
+				Rco->ServerClearInventories(RequestId, S->Area, true);
+				break;
+			default:
+				Rco->ServerDismantle(RequestId, S->Area, true);
+				break;
+			}
+			return EStep::Next;
+		});
+		R.Steps.Add([S, J, Done, SaveName](FRun& Self)
+		{
+			const int32 Changed = Algo::CountIf(S->Inside, [&Done](const TWeakObjectPtr<AFGBuildable>& Weak) { return Done(Weak.Get()); });
+			if (Changed < Count / 2)
+			{
+				return EStep::Wait;
+			}
+			J->DoneAtSave = Changed;
+			Self.Step(FString::Printf(TEXT("saving %s with %d of %d buildings done, %llu frames after the request"), *SaveName, Changed, Count, GFrameCounter - J->SentFrame));
+			UFGSaveSession::Get(Self.GetWorld())->SaveGame(SaveName, FOnSaveGameComplete::CreateLambda([J](bool bOk, const FText&, void*) { J->SaveResult = bOk ? 1 : 0; }), nullptr);
+			return EStep::Next;
+		});
+		R.Steps.Add([S, J, RequestId](FRun& Self)
+		{
+			const FAreaActionsResult* Result = S->Results.Find(RequestId);
+			if (J->SaveResult < 0 || !Result)
+			{
+				return EStep::Wait;
+			}
+			SetBudget(2.0f);
+			Self.Check(J->SaveResult == 1, TEXT("saved during the job"));
+			Self.Check(J->DoneAtSave < Count, FString::Printf(TEXT("the save came mid-job: %d of %d done"), J->DoneAtSave, Count));
+			Self.Check(Result->Code == EAreaActionsResultCode::Ok && Result->Buildings == Count && GFrameCounter - J->SentFrame >= 10,
+				FString::Printf(TEXT("job done: code %d, buildings %d, %llu frames (at least 10)"), static_cast<int32>(Result->Code), Result->Buildings, GFrameCounter - J->SentFrame));
+			return EStep::Next;
+		});
+		AddLoad(R, SaveName);
+		R.Steps.Add([J, Kind, Name, ItemsAt](FRun& Self)
+		{
+			int32 Missing = 0;
+			const int32 InBuildings = ItemsAt(Self.GetWorld(), *J, Missing);
+			const int32 InCrates = AllCrateItems(Self.GetWorld());
+			// A building dismantled before the save gave its build cost too
+			const int32 Want = J->Before + (Kind == EJobKind::Dismantle ? Missing * J->CostEach : 0);
+			Self.Check(InBuildings + InCrates == Want && (Kind == EJobKind::Dismantle ? Missing > 0 && Missing < Count : Missing == 0),
+				FString::Printf(TEXT("%s loaded: %d in the buildings + %d in crates = %d, want %d (%d buildings missing, cost %d each)"), *Name, InBuildings, InCrates,
+					InBuildings + InCrates, Want, Missing, J->CostEach));
+			return EStep::Next;
+		});
+		AddDeleteSave(R, SaveName);
+	}
+
+	// AA-078 (2): a chainsaw with energy stored keeps it in the crate, through "Move to crate" and through MassDismantle
+	void AddCrateItemState(FRun& R, bool bDismantle, float Energy, double Side)
+	{
+		FSceneRef S = MakeShared<FScene>();
+		AddScene(R, S, 4000.0, [Energy](FRun& Self, FScene& Scene)
+		{
+			AFGBuildableStorage* Storage = SpawnStorage(Self, Scene.Slot(0), 10, 0);
+			if (Storage)
+			{
+				Storage->GetStorageInventory()->AddStack(StateItem(Energy), true);
+			}
+			Scene.Inside.Add(Storage);
+			for (const FVector& Place : Scene.ControlPlaces())
+			{
+				Scene.Controls.Add(SpawnStorage(Self, Place, 15, 0));
+			}
+		}, Side);
+		if (bDismantle)
+		{
+			AddDismantle(R, S, true);
+		}
+		else
+		{
+			AddOpenAction(R, TEXT("ClearInventories"));
+			AddPress(R, TEXT("Widget_MessageYesNo"), TEXT("NoButton"));
+			AddResultWindow(R, S);
+		}
+		R.Steps.Add([S, Energy, bDismantle](FRun& Self)
+		{
+			const TArray<AFGCrate*> Crates = NewCrates(Self, *S);
+			TArray<FInventoryStack> Stacks;
+			if (Crates.Num() == 1)
+			{
+				Crates[0]->GetInventory()->GetInventoryStacks(Stacks);
+			}
+			const FInventoryStack* Saw = Stacks.FindByPredicate([](const FInventoryStack& Stack) { return Stack.Item.HasState(); });
+			Self.Check(Crates.Num() == 1 && Saw && FMath::IsNearlyEqual(StateEnergy(*Saw), Energy), FString::Printf(TEXT("%s: crates %d, chainsaw energy %.1f (want %.1f)"),
+				bDismantle ? TEXT("MassDismantle") : TEXT("Move to crate"), Crates.Num(), Saw ? StateEnergy(*Saw) : -1.0f, Energy));
+			return EStep::Next;
+		});
+	}
+
+	// AA-085 (1): more stacks than one crate takes: crates of 200 stacks, the last one partly filled, every item there
+	void AddCrateSplit(FRun& R, bool bDismantle, double Side)
+	{
+		constexpr int32 Containers = 10;
+		struct FSplit
+		{
+			FCounts Taken;
+		};
+		FSceneRef S = MakeShared<FScene>();
+		TSharedRef<FSplit> P = MakeShared<FSplit>();
+		AddScene(R, S, 4000.0, [P, bDismantle](FRun& Self, FScene& Scene)
+		{
+			const TSubclassOf<UFGItemDescriptor> Plate = Item(Asset::IronPlateItem);
+			const int32 PlateStack = UFGItemDescriptor::GetStackSize(Plate);
+			for (int32 Index = 0; Index < Containers; ++Index)
+			{
+				AFGBuildableStorage* Storage = SpawnStorage(Self, Scene.Slot(Index), 0, 0);
+				if (Storage)
+				{
+					UFGInventoryComponent* Inventory = Storage->GetStorageInventory();
+					P->Taken.FindOrAdd(Plate) += Inventory->AddStack(FInventoryStack(Inventory->GetSizeLinear() * PlateStack, Plate), true);
+					if (bDismantle)
+					{
+						TArray<FInventoryStack> Cost;
+						IFGDismantleInterface::Execute_GetDismantleRefund(Storage, Cost, false);
+						FCounts Refund;
+						AddSolids(Refund, Cost);
+						for (const TPair<TSubclassOf<UFGItemDescriptor>, int32>& Entry : Refund)
+						{
+							// The refund holds the contents again: only the build cost is extra
+							P->Taken.FindOrAdd(Entry.Key) += Entry.Key == Plate ? Entry.Value - Inventory->GetNumItems(Plate) : Entry.Value;
+						}
+					}
+				}
+				Scene.Inside.Add(Storage);
+			}
+			for (const FVector& Place : Scene.ControlPlaces())
+			{
+				Scene.Controls.Add(SpawnStorage(Self, Place, 15, 0));
+			}
+		}, Side);
+		if (bDismantle)
+		{
+			AddDismantle(R, S, true);
+		}
+		else
+		{
+			AddOpenAction(R, TEXT("ClearInventories"));
+			AddPress(R, TEXT("Widget_MessageYesNo"), TEXT("NoButton"));
+			AddResultWindow(R, S);
+		}
+		R.Steps.Add([S, P, bDismantle](FRun& Self)
+		{
+			const TArray<AFGCrate*> Crates = NewCrates(Self, *S);
+			FCounts InCrates;
+			int32 Full = 0;
+			int32 Stacks = 0;
+			for (const AFGCrate* Crate : Crates)
+			{
+				TArray<FInventoryStack> Each;
+				Crate->GetInventory()->GetInventoryStacks(Each);
+				AddSolids(InCrates, Each);
+				Full += Each.Num() == 200 ? 1 : 0;
+				Self.Check(Each.Num() <= 200 && Crate->GetInventory()->GetSizeLinear() == Each.Num(), FString::Printf(TEXT("crate %s: %d stacks in %d slots (at most 200)"),
+					*Crate->GetName(), Each.Num(), Crate->GetInventory()->GetSizeLinear()));
+			}
+			for (const TPair<TSubclassOf<UFGItemDescriptor>, int32>& Entry : P->Taken)
+			{
+				Stacks += FMath::DivideAndRoundUp(Entry.Value, UFGItemDescriptor::GetStackSize(Entry.Key));
+			}
+			const int32 Least = FMath::DivideAndRoundUp(Stacks, 200);
+			Self.Check(Crates.Num() >= Least && Crates.Num() <= Least + 1 && Full == Crates.Num() - 1 && SameCounts(InCrates, P->Taken),
+				FString::Printf(TEXT("%s: %d crates (%d full) for %d stacks; in them %s, taken %s"), bDismantle ? TEXT("MassDismantle") : TEXT("Move to crate"), Crates.Num(), Full,
+					Stacks, *ItemsText(InCrates), *ItemsText(P->Taken)));
+			const FString Want = FString::Printf(TEXT("The items are in %d crates next to you."), Crates.Num());
+			Self.Check(S->Message.Contains(Want), FString::Printf(TEXT("result '%s' has '%s'"), *S->Message, *Want));
+			return EStep::Next;
+		});
+	}
+
+	// AA-085 (2): only fluids taken: no word of a crate; no room next to the player: the crate stands by the building and the message says
+	// so; no crate at all: the items are named lost and an Error line is written
+	void AddCrateMessages(FRun& R)
+	{
+		{
+			FSceneRef S = MakeShared<FScene>();
+			AddScene(R, S, 4000.0, [](FRun& Self, FScene& Scene)
+			{
+				AFGBuildableManufacturer* Constructor = SpawnMachine(Self, Asset::Constructor, Scene.Slot(0), Asset::IronPlate, 0, 0);
+				Self.Check(AddWater(Constructor) == 2000, TEXT("2 m³ of water in the Constructor"));
+				Scene.Inside.Add(Constructor);
+				for (const FVector& Place : Scene.ControlPlaces())
+				{
+					Scene.Controls.Add(SpawnStorage(Self, Place, 15, 0));
+				}
+			});
+			AddOpenAction(R, TEXT("ClearInventories"));
+			AddPress(R, TEXT("Widget_MessageYesNo"), TEXT("NoButton"));
+			AddResultWindow(R, S);
+			R.Steps.Add([S](FRun& Self)
+			{
+				Self.Check(NewCrates(Self, *S).IsEmpty() && !S->Message.Contains(TEXT("crate")) && S->Message.Contains(TEXT("2 m³ of fluids were deleted")),
+					FString::Printf(TEXT("fluids only: new crates %d, message '%s'"), NewCrates(Self, *S).Num(), *S->Message));
+				return EStep::Next;
+			});
+		}
+		for (const int32 Mode : { 1, 2 })
+		{
+			FSceneRef S = MakeShared<FScene>();
+			TSharedRef<int32> Errors = MakeShared<int32>(0);
+			TSharedRef<TUniquePtr<FErrorCounter>> Counter = MakeShared<TUniquePtr<FErrorCounter>>();
+			AddScene(R, S, 4000.0, [](FRun& Self, FScene& Scene)
+			{
+				Scene.Inside.Add(SpawnStorage(Self, Scene.Slot(0), 20, 0));
+				for (const FVector& Place : Scene.ControlPlaces())
+				{
+					Scene.Controls.Add(SpawnStorage(Self, Place, 15, 0));
+				}
+			}, Mode * 12000.0);
+			R.Steps.Add([Mode, Counter](FRun& Self)
+			{
+				AreaActionsJobs::SetCratesFailForTest(Mode);
+				*Counter = MakeUnique<FErrorCounter>();
+				return EStep::Next;
+			});
+			AddOpenAction(R, TEXT("ClearInventories"));
+			AddPress(R, TEXT("Widget_MessageYesNo"), TEXT("NoButton"));
+			AddResultWindow(R, S);
+			R.Steps.Add([S, Mode, Counter](FRun& Self)
+			{
+				AreaActionsJobs::SetCratesFailForTest(0);
+				const int32 ErrorLines = (*Counter)->Errors;
+				Counter->Reset();
+				const TArray<AFGCrate*> Crates = NewCrates(Self, *S);
+				if (Mode == 1)
+				{
+					const FVector Storage = S->Slot(0);
+					const double Distance = Crates.Num() == 1 ? FVector::Dist2D(Crates[0]->GetActorLocation(), Storage) : -1.0;
+					Self.Check(Crates.Num() == 1 && Distance >= 0.0 && Distance < 1500.0 && Crates[0]->GetInventory()->GetNumItems(nullptr) == 20,
+						FString::Printf(TEXT("no room at the player: crates %d, %.0f cm from the container"), Crates.Num(), Distance));
+					const TCHAR* Want = TEXT("The items are in 1 crate; 1 could not be placed next to you and stands by the buildings.");
+					Self.Check(S->Message.Contains(Want) && ErrorLines == 0, FString::Printf(TEXT("result '%s' has '%s'; error lines %d"), *S->Message, Want, ErrorLines));
+				}
+				else
+				{
+					const TCHAR* Want = TEXT("20 items were lost: no crate could be placed.");
+					Self.Check(Crates.IsEmpty() && S->Message.Contains(Want) && !S->Message.Contains(TEXT("next to you")) && ErrorLines == 1,
+						FString::Printf(TEXT("no crate: crates %d, result '%s' has '%s', error lines %d (want 1)"), Crates.Num(), *S->Message, Want, ErrorLines));
+				}
+				return EStep::Next;
+			});
+		}
+	}
+
 	bool BuildScenario(FRun& R)
 	{
+		if (R.Name == TEXT("DismantleBasic"))
+		{
+			AddDismantleBasic(R);
+			return true;
+		}
+		if (R.Name == TEXT("DismantleNoCrate"))
+		{
+			AddDismantleNoCrate(R);
+			return true;
+		}
+		if (R.Name == TEXT("DismantleNoCost"))
+		{
+			AddDismantleNoCost(R);
+			return true;
+		}
+		if (R.Name == TEXT("DismantleProtected"))
+		{
+			AddDismantleProtected(R);
+			return true;
+		}
+		if (R.Name == TEXT("DismantleSaveLoad"))
+		{
+			R.StepTimeoutSec = 60.0;
+			AddDismantleSaveLoad(R);
+			return true;
+		}
+		if (R.Name == TEXT("DismantleLarge"))
+		{
+			R.StepTimeoutSec = 60.0;
+			AddDismantleLarge(R);
+			return true;
+		}
+		if (R.Name == TEXT("SaveDuringJob"))
+		{
+			R.StepTimeoutSec = 60.0;
+			AddSaveDuringJob(R, EJobKind::SetRecipe, 301);
+			AddSaveDuringJob(R, EJobKind::Clear, 302);
+			AddSaveDuringJob(R, EJobKind::Dismantle, 303);
+			return true;
+		}
+		if (R.Name == TEXT("CrateItemState"))
+		{
+			AddCrateItemState(R, false, 55.5f, 0.0);
+			AddCrateItemState(R, true, 66.5f, 12000.0);
+			return true;
+		}
+		if (R.Name == TEXT("CrateSplit"))
+		{
+			AddCrateSplit(R, false, 0.0);
+			AddCrateSplit(R, true, 12000.0);
+			return true;
+		}
+		if (R.Name == TEXT("CrateMessages"))
+		{
+			AddCrateMessages(R);
+			return true;
+		}
+		if (R.Name == TEXT("DismantleProbe"))
+		{
+			R.StepTimeoutSec = 60.0;
+			AddDismantleProbe(R);
+			return true;
+		}
 		if (R.Name == TEXT("CopyBasic"))
 		{
 			AddCopyBasic(R);
