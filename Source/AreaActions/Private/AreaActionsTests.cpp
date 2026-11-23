@@ -61,6 +61,8 @@
 #include "AreaActionsServerSubsystem.h"
 #include "AreaActionsWorldModule.h"
 #include "Containers/Ticker.h"
+#include "Misc/CoreDelegates.h"
+#include "UObject/UObjectGlobals.h"
 #include "Engine/World.h"
 #include "GenericPlatform/GenericPlatformMisc.h"
 #include "Kismet/GameplayStatics.h"
@@ -291,6 +293,30 @@ namespace
 				return EStep::Wait;
 			}
 			*Until = 0;
+			return EStep::Next;
+		};
+	}
+
+	// Waits until the game has settled after a scene was built (streaming, first loads of meshes and materials): Frames frames in a row under
+	// 50 ms, at most 25 s (the step timeout is 30 s), so W5 measures the job and not the scene's own hitches
+	FStepFn WaitCalm(int32 Frames)
+	{
+		struct FState { int32 Calm = 0; double Start = 0.0; };
+		return [Frames, State = MakeShared<FState>()](FRun& Self) mutable
+		{
+			if (State->Start == 0.0)
+			{
+				State->Start = FPlatformTime::Seconds();
+				State->Calm = 0;
+			}
+			State->Calm = FApp::GetDeltaTime() < 0.05 ? State->Calm + 1 : 0;
+			const double Waited = FPlatformTime::Seconds() - State->Start;
+			if (State->Calm < Frames && Waited < 25.0)
+			{
+				return EStep::Wait;
+			}
+			Self.Step(FString::Printf(TEXT("game settled: %d calm frames after %.1f s"), State->Calm, Waited));
+			State->Start = 0.0;
 			return EStep::Next;
 		};
 	}
@@ -3405,6 +3431,8 @@ namespace
 		D.Expected.Reset();
 		D.Contents.Reset();
 		D.RefundWithoutCost.Reset();
+		// (b) for the cost: each actor's own cost times the game's multiplier (GetDismantleRefundReturns), the lightweights' as in (a)
+		FCounts CostOnly;
 		for (const TWeakObjectPtr<AFGBuildable>& Weak : S.Inside)
 		{
 			if (AFGBuildable* Actor = Weak.Get())
@@ -3412,7 +3440,39 @@ namespace
 				TArray<FInventoryStack> Refund, WithoutCost;
 				IFGDismantleInterface::Execute_GetDismantleRefund(Actor, Refund, D.bNoCost);
 				IFGDismantleInterface::Execute_GetDismantleRefund(Actor, WithoutCost, true);
-				AddSolids(D.Expected, Refund);
+				FCounts Own;
+				AddSolids(Own, Refund);
+				// The game's refund of a building includes the wires on its power connections; every wire of the scene is in it on its own,
+				// so it is taken out of the buildings it hangs on and counted once
+				TInlineComponentArray<UFGCircuitConnectionComponent*> Connections(Actor);
+				for (const UFGCircuitConnectionComponent* Connection : Connections)
+				{
+					TArray<AFGBuildableWire*> Wires;
+					Connection->GetWires(Wires);
+					for (AFGBuildableWire* Wire : Wires)
+					{
+						TArray<FInventoryStack> WireRefund;
+						IFGDismantleInterface::Execute_GetDismantleRefund(Wire, WireRefund, D.bNoCost);
+						FCounts Hanging;
+						AddSolids(Hanging, WireRefund);
+						for (const TPair<TSubclassOf<UFGItemDescriptor>, int32>& Entry : Hanging)
+						{
+							Own.FindOrAdd(Entry.Key) -= Entry.Value;
+						}
+					}
+				}
+				TArray<FInventoryStack> Cost;
+				if (!D.bNoCost)
+				{
+					Actor->GetDismantleRefundReturns(Cost);
+					AddSolids(CostOnly, Cost);
+				}
+				R.Step(FString::Printf(TEXT("refund of %s: game %s, wires taken out %s; cost %s"), *Actor->GetClass()->GetName(), *StacksText(Refund),
+					*ItemsText(Own), *StacksText(Cost)));
+				for (const TPair<TSubclassOf<UFGItemDescriptor>, int32>& Entry : Own)
+				{
+					D.Expected.FindOrAdd(Entry.Key) += Entry.Value;
+				}
 				AddSolids(D.RefundWithoutCost, WithoutCost);
 				AddSolids(D.Contents, ContentsOf(Actor));
 			}
@@ -3425,6 +3485,7 @@ namespace
 				TArray<FInventoryStack> Refund;
 				Piece.Class->GetDefaultObject<AFGBuildable>()->GetLightweightBuildableDismantleRefundReturns(World, Data->BuiltWithRecipe, Data->TypeSpecificData, Refund);
 				AddSolids(D.Expected, Refund);
+				AddSolids(CostOnly, Refund);
 			}
 		}
 		if (const AFGCrate* Crate = D.AreaCrate.Get())
@@ -3437,6 +3498,13 @@ namespace
 		}
 		R.Check(SameCounts(D.RefundWithoutCost, D.Contents), FString::Printf(TEXT("(b) the game's refund without cost %d equals the contents read straight %d"),
 			Total(D.RefundWithoutCost), Total(D.Contents)));
+		FCounts CostAndContents = CostOnly;
+		for (const TPair<TSubclassOf<UFGItemDescriptor>, int32>& Entry : D.Contents)
+		{
+			CostAndContents.FindOrAdd(Entry.Key) += Entry.Value;
+		}
+		R.Check(SameCounts(D.Expected, CostAndContents), FString::Printf(TEXT("(a) %s equals (b) cost and contents %s"), *ItemsText(D.Expected),
+			*ItemsText(CostAndContents)));
 		R.Step(FString::Printf(TEXT("expected refund %s (%d items)"), *ItemsText(D.Expected), Total(D.Expected)));
 	}
 
@@ -3753,6 +3821,18 @@ namespace
 			});
 		}
 		R.Steps.Add(WaitFrames(30));
+		R.Steps.Add(WaitCalm(60));
+		// Building 5000 lightweights leaves the physics scene a few seconds of work in the background; the first change to it before that
+		// is done waits for it in TG_DuringPhysics (measured: 0.4 to 6.8 s in one frame right after the build, 36 ms after 25 s). Real
+		// players do not dismantle a fresh 5000-building scene, so the job is measured after it
+		R.Steps.Add([Until = MakeShared<double>(0.0)](FRun& Self)
+		{
+			if (*Until == 0.0)
+			{
+				*Until = FPlatformTime::Seconds() + 25.0;
+			}
+			return FPlatformTime::Seconds() < *Until ? EStep::Wait : EStep::Next;
+		});
 		R.Steps.Add([S, Foundations](FRun& Self)
 		{
 			Self.Check(S->Inside.Num() + Foundations->Num() == Side * Side && AllValid(S->Inside), FString::Printf(TEXT("%d containers and %d foundations built"),
@@ -4446,6 +4526,70 @@ namespace
 	}
 }
 
+// W5 diagnosis: while a scenario measures frames, a frame over 100 ms is logged split into its phases, with the garbage collection in it
+static void WatchFramePhases()
+{
+	static bool bWatching = false;
+	if (bWatching)
+	{
+		return;
+	}
+	bWatching = true;
+	struct FPhases { double Begin = 0.0, WorldStart = 0.0, PreActors = 0.0, PostActors = 0.0, GcStart = 0.0, Gc = 0.0; double Groups[TG_MAX] = {}; };
+	static FPhases Phases;
+	// One probe at the start of each tick group (leaked on purpose: a level that goes away unregisters them, nothing destroys them later)
+	struct FProbe : FTickFunction
+	{
+		virtual void ExecuteTick(float, ELevelTick, ENamedThreads::Type, const FGraphEventRef&) override
+		{
+			if (Phases.Groups[TickGroup] == 0.0)
+			{
+				Phases.Groups[TickGroup] = FPlatformTime::Seconds();
+			}
+		}
+		virtual FString DiagnosticMessage() override { return TEXT("AreaActions frame phase probe"); }
+	};
+	if (UWorld* World = Run ? Run->GetWorld() : nullptr)
+	{
+		for (const ETickingGroup Group : { TG_PrePhysics, TG_StartPhysics, TG_DuringPhysics, TG_EndPhysics, TG_PostPhysics, TG_PostUpdateWork, TG_LastDemotable })
+		{
+			FProbe* Probe = new FProbe();
+			Probe->bCanEverTick = true;
+			Probe->bTickEvenWhenPaused = true;
+			Probe->bHighPriority = true;
+			Probe->TickGroup = Group;
+			Probe->EndTickGroup = Group;
+			Probe->RegisterTickFunction(World->PersistentLevel);
+		}
+	}
+	FCoreDelegates::OnBeginFrame.AddLambda([] { Phases = FPhases(); Phases.Begin = FPlatformTime::Seconds(); });
+	FWorldDelegates::OnWorldTickStart.AddLambda([](UWorld*, ELevelTick, float) { if (Phases.WorldStart == 0.0) { Phases.WorldStart = FPlatformTime::Seconds(); } });
+	FWorldDelegates::OnWorldPreActorTick.AddLambda([](UWorld*, ELevelTick, float) { if (Phases.PreActors == 0.0) { Phases.PreActors = FPlatformTime::Seconds(); } });
+	FWorldDelegates::OnWorldPostActorTick.AddLambda([](UWorld*, ELevelTick, float) { Phases.PostActors = FPlatformTime::Seconds(); });
+	FCoreUObjectDelegates::GetPreGarbageCollectDelegate().AddLambda([] { Phases.GcStart = FPlatformTime::Seconds(); });
+	FCoreUObjectDelegates::GetPostGarbageCollect().AddLambda([] { if (Phases.GcStart > 0.0) { Phases.Gc += FPlatformTime::Seconds() - Phases.GcStart; } });
+	FCoreDelegates::OnEndFrame.AddLambda([]
+	{
+		const double End = FPlatformTime::Seconds();
+		if (Run && Run->bMeasureFrames && Phases.Begin > 0.0 && End - Phases.Begin > 0.1)
+		{
+			const auto Ms = [](double From, double To) { return From > 0.0 && To >= From ? (To - From) * 1000.0 : -1.0; };
+			UE_LOG(LogAreaActionsCpp, Display, TEXT("AATEST %s step frame phases: total %.1f ms, to world tick %.1f, to actor ticks %.1f, actor ticks %.1f, after actor ticks %.1f, GC %.1f"),
+				*Run->Name, (End - Phases.Begin) * 1000.0, Ms(Phases.Begin, Phases.WorldStart), Ms(Phases.WorldStart, Phases.PreActors), Ms(Phases.PreActors, Phases.PostActors),
+				Ms(Phases.PostActors, End), Phases.Gc * 1000.0);
+			FString Groups;
+			double Last = Phases.PreActors;
+			for (const ETickingGroup Group : { TG_PrePhysics, TG_StartPhysics, TG_DuringPhysics, TG_EndPhysics, TG_PostPhysics, TG_PostUpdateWork, TG_LastDemotable })
+			{
+				Groups += FString::Printf(TEXT(" %d:%.1f"), static_cast<int32>(Group), Ms(Last, Phases.Groups[Group]));
+				Last = Phases.Groups[Group] > 0.0 ? Phases.Groups[Group] : Last;
+			}
+			UE_LOG(LogAreaActionsCpp, Display, TEXT("AATEST %s step frame phases: up to each tick group's start%s, from the last group's start to the actor ticks' end %.1f"), *Run->Name, *Groups,
+				Ms(Last, Phases.PostActors));
+		}
+	});
+}
+
 void FAreaActionsTests::StartFromCommandLine(UWorld* World)
 {
 	FString Name;
@@ -4477,6 +4621,7 @@ void FAreaActionsTests::StartFromCommandLine(UWorld* World)
 		Finish(*Run);
 		return;
 	}
+	WatchFramePhases();
 	FTSTicker::GetCoreTicker().AddTicker(FTickerDelegate::CreateStatic(&Tick));
 }
 
