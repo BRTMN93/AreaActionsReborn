@@ -786,8 +786,9 @@ namespace
 		return Out;
 	}
 
-	// AA-093: every crate holds one item type, and a type takes as many crates as its stacks need at 200 per crate. Out gets all the
-	// items, Far the largest distance from Near
+	// AA-093: the crates hold the items packed: each crate's stacks sorted by type (a type's stacks next to each other), a type in one
+	// crate unless it has more than 200 stacks, and as many crates as first-fit-decreasing packing needs (PackedCrates). Far is the
+	// largest distance from Near
 	struct FCratesSeen
 	{
 		AreaActionsBuildings::FItemCounts Items;
@@ -795,7 +796,7 @@ namespace
 		int32 Types = 0;
 		double Far = 0.0;
 		bool bOneTypeEach = true;
-		FString Text() const { return FString::Printf(TEXT("%d types, one type per crate and crates per type by 200 stacks: %s, farthest %.0f cm"), Types, bOneTypeEach ? TEXT("yes") : TEXT("no"), Far); }
+		FString Text() const { return FString::Printf(TEXT("%d types, sorted and each type in one crate: %s, farthest %.0f cm"), Types, bOneTypeEach ? TEXT("yes") : TEXT("no"), Far); }
 	};
 
 	FCratesSeen SeeCrates(const TArray<AFGCrate*>& Crates, const FVector& Near)
@@ -807,30 +808,66 @@ namespace
 			TArray<FInventoryStack> Each;
 			Crate->GetInventory()->GetInventoryStacks(Each);
 			TSet<UClass*> Kinds;
+			UClass* Last = nullptr;
 			for (const FInventoryStack& Stack : Each)
 			{
-				Kinds.Add(Stack.Item.GetItemClass());
-				if (Stack.HasItems())
-				{
-					Seen.Items.FindOrAdd(Stack.Item.GetItemClass()) += Stack.NumItems;
-					Seen.All += Stack.NumItems;
-				}
+				UClass* Kind = Stack.Item.GetItemClass();
+				// A type that comes back after another one is not sorted
+				Seen.bOneTypeEach &= Kind == Last || !Kinds.Contains(Kind);
+				Kinds.Add(Kind);
+				Last = Kind;
+				Seen.Items.FindOrAdd(Kind) += Stack.NumItems;
+				Seen.All += Stack.NumItems;
+				++PerType.FindOrAdd(Kind).Value;
 			}
-			Seen.bOneTypeEach &= Kinds.Num() == 1;
-			if (Kinds.Num() == 1)
+			for (UClass* Kind : Kinds)
 			{
-				TPair<int32, int32>& Entry = PerType.FindOrAdd(Each[0].Item.GetItemClass());
-				++Entry.Key;
-				Entry.Value += Each.Num();
+				++PerType.FindOrAdd(Kind).Key;
 			}
 			Seen.Far = FMath::Max(Seen.Far, FVector::Dist(Crate->GetActorLocation(), Near));
 		}
 		for (const TPair<UClass*, TPair<int32, int32>>& Entry : PerType)
 		{
-			Seen.bOneTypeEach &= Entry.Value.Key == FMath::DivideAndRoundUp(Entry.Value.Value, 200);
+			// Crates holding the type: one, or for a type over 200 stacks its whole crates and at most one more with its rest
+			Seen.bOneTypeEach &= Entry.Value.Key <= FMath::DivideAndRoundUp(Entry.Value.Value, 200);
 		}
 		Seen.Types = PerType.Num();
 		return Seen;
+	}
+
+	// The crates the packing needs for these items: a type's whole crates of 200 stacks, then the rests by first-fit-decreasing
+	int32 PackedCrates(const AreaActionsBuildings::FItemCounts& Items)
+	{
+		int32 Whole = 0;
+		TArray<int32> Rests;
+		for (const TPair<TSubclassOf<UFGItemDescriptor>, int32>& Entry : Items)
+		{
+			if (Entry.Value <= 0)
+			{
+				continue;
+			}
+			const int32 Stacks = FMath::DivideAndRoundUp(Entry.Value, FMath::Max(1, UFGItemDescriptor::GetStackSize(Entry.Key)));
+			Whole += Stacks / 200;
+			if (Stacks % 200 > 0)
+			{
+				Rests.Add(Stacks % 200);
+			}
+		}
+		Rests.Sort(TGreater<int32>());
+		TArray<int32> Bins;
+		for (const int32 Rest : Rests)
+		{
+			int32* Into = Bins.FindByPredicate([Rest](int32 Used) { return Used + Rest <= 200; });
+			if (Into)
+			{
+				*Into += Rest;
+			}
+			else
+			{
+				Bins.Add(Rest);
+			}
+		}
+		return Whole + Bins.Num();
 	}
 
 	// The result's sentence about the crates next to the player
@@ -1140,12 +1177,12 @@ namespace
 			const AFGBuildableManufacturer* Assembler = Machine(*S, 3);
 			Self.Check(Assembler && Assembler->GetCurrentRecipe() == Recipe(Asset::ReinforcedPlate), TEXT("Assembler keeps its recipe"));
 			CheckControlMachines(Self, *S, Asset::IronPlate, 6);
-			// D8: crates with exactly the machines' items, one per item type (AA-093)
+			// D8: one crate with exactly the machines' items, sorted (AA-093)
 			const TArray<AFGCrate*> Crates = NewCrates(Self, *S);
 			const FCratesSeen Seen = SeeCrates(Crates, Self.GetPlayer()->GetPawn()->GetActorLocation());
 			const int32 Ingots = Seen.Items.FindRef(Item(Asset::IronIngotItem));
 			const int32 Plates = Seen.Items.FindRef(Item(Asset::IronPlateItem));
-			Self.Check(Crates.Num() == 2 && Seen.bOneTypeEach && Ingots == 37 && Plates == 9 && Seen.All == 46,
+			Self.Check(Crates.Num() == 1 && Seen.bOneTypeEach && Ingots == 37 && Plates == 9 && Seen.All == 46,
 				FString::Printf(TEXT("new crates %d (%s); ingots %d of 37, plates %d of 9, all %d of 46"), Crates.Num(), *Seen.Text(), Ingots, Plates, Seen.All));
 			Self.Check(!Crates.IsEmpty() && Seen.Far < 1500.0, FString::Printf(TEXT("crates next to the player: %.0f cm"), Seen.Far));
 			return EStep::Next;
@@ -1281,12 +1318,12 @@ namespace
 				Self.Check(Crates.IsEmpty(), FString::Printf(TEXT("no new crate: %d"), Crates.Num()));
 				return EStep::Next;
 			}
-			// Plates 50 + 20 + 5, ingots 30, rods 25: every solid item of the area, no water, nothing more; one crate per type (AA-093)
+			// Plates 50 + 20 + 5, ingots 30, rods 25: every solid item of the area, no water, nothing more; one crate, sorted (AA-093)
 			const FCratesSeen Seen = SeeCrates(Crates, Self.GetPlayer()->GetPawn()->GetActorLocation());
 			const int32 Plates = Seen.Items.FindRef(Item(Asset::IronPlateItem));
 			const int32 Ingots = Seen.Items.FindRef(Item(Asset::IronIngotItem));
 			const int32 Rods = Seen.Items.FindRef(Item(Asset::IronRodItem));
-			Self.Check(Crates.Num() == 3 && Seen.bOneTypeEach && Plates == 75 && Ingots == 30 && Rods == 25 && Seen.All == S->Expected,
+			Self.Check(Crates.Num() == 1 && Seen.bOneTypeEach && Plates == 75 && Ingots == 30 && Rods == 25 && Seen.All == S->Expected,
 				FString::Printf(TEXT("new crates %d (%s); plates %d of 75, ingots %d of 30, rods %d of 25, all %d of %d"), Crates.Num(), *Seen.Text(), Plates, Ingots, Rods,
 					Seen.All, S->Expected));
 			Self.Check(!Crates.IsEmpty() && Seen.Far < 1500.0, FString::Printf(TEXT("crates next to the player: %.0f cm"), Seen.Far));
@@ -3569,7 +3606,7 @@ namespace
 	}
 
 	// The menu, the question answered with its first (Refund to crate) or second (No refund) button, the result
-	void AddDismantle(FRun& R, const FSceneRef& S, bool bToCrate)
+	void AddDismantle(FRun& R, const FSceneRef& S, bool bToCrate, bool bResult = true)
 	{
 		AddOpenAction(R, TEXT("MassDismantle"));
 		AddOnWindow(R, TEXT("Widget_MessageYesNo"), [bToCrate](FRun& Self, UUserWidget* Window)
@@ -3591,7 +3628,10 @@ namespace
 			Self.Check(Label == Want, FString::Printf(TEXT("button reads '%s' (want '%s')"), *Label, Want));
 			Self.Check(PressButton(Window, bToCrate ? TEXT("YesButton") : TEXT("NoButton")), FString::Printf(TEXT("'%s' pressed"), Want));
 		});
-		AddResultWindow(R, S);
+		if (bResult)
+		{
+			AddResultWindow(R, S);
+		}
 	}
 
 	// Every building of the scene is gone, actors after their dismantle effect, the controls stay with their items
@@ -3622,7 +3662,7 @@ namespace
 		});
 	}
 
-	// New crates next to the player, one per item type of the refund (AA-093), with exactly the expected refund
+	// New crates next to the player, packed (AA-093), with exactly the expected refund
 	void AddCheckRefundCrate(FRun& R, const FSceneRef& S, const FDismantleRef& D)
 	{
 		R.Steps.Add([S, D](FRun& Self)
@@ -3630,12 +3670,7 @@ namespace
 			const TArray<AFGCrate*> Crates = NewCrates(Self, *S);
 			const FCratesSeen Seen = SeeCrates(Crates, Self.GetPlayer()->GetPawn()->GetActorLocation());
 			const FCounts& InCrate = Seen.Items;
-			int32 Types = 0;
-			for (const TPair<TSubclassOf<UFGItemDescriptor>, int32>& Entry : D->Expected)
-			{
-				Types += Entry.Value > 0 ? 1 : 0;
-			}
-			Self.Check(Crates.Num() == Types && Seen.bOneTypeEach && SameCounts(InCrate, D->Expected), FString::Printf(TEXT("new crates %d (%s); in them %s (%d), expected %s (%d)"),
+			Self.Check(Crates.Num() == PackedCrates(D->Expected) && Seen.bOneTypeEach && SameCounts(InCrate, D->Expected), FString::Printf(TEXT("new crates %d (%s); in them %s (%d), expected %s (%d)"),
 				Crates.Num(), *Seen.Text(), *ItemsText(InCrate), Total(InCrate), *ItemsText(D->Expected), Total(D->Expected)));
 			Self.Check(!Crates.IsEmpty() && Seen.Far < 1500.0, FString::Printf(TEXT("crates next to the player: %.0f cm"), Seen.Far));
 			D->CrateItems = Total(InCrate);
@@ -3659,6 +3694,60 @@ namespace
 		AddDismantle(R, S, true);
 		AddCheckGone(R, S, D);
 		AddCheckRefundCrate(R, S, D);
+	}
+
+	// AA-030 pt 1, the user's leftovers: buildings the first pass does not take (here two built in the area after the collection) go
+	// with the sweeps; the job runs one building per frame so they come while it runs
+	void AddDismantleSweep(FRun& R)
+	{
+		FSceneRef S = MakeShared<FScene>();
+		FDismantleRef D = MakeShared<FDismantleState>();
+		struct FLate { TWeakObjectPtr<AFGBuildableStorage> Storage; FVector Foundation = FVector::ZeroVector; TSubclassOf<AFGBuildable> Class; };
+		TSharedRef<FLate> Late = MakeShared<FLate>();
+		R.Steps.Add([](FRun& Self)
+		{
+			SetBudget(0.0f);
+			return EStep::Next;
+		});
+		AddDismantleScene(R, S, D);
+		AddDismantle(R, S, true, false);
+		R.Steps.Add(WaitFrames(3));
+		R.Steps.Add([S, D, Late](FRun& Self)
+		{
+			const FVector Base = D->Pieces.Base;
+			Late->Storage = SpawnStorage(Self, Base + FVector(1200.0, 2500.0, 50.0), 5, 0);
+			AreaActionsBuildings::FSnapshot Foundation;
+			Foundation.Class = GameClass(TEXT("Build_Foundation_8x1_01"));
+			Foundation.BuiltWith = RecipeOfClass(Self, Foundation.Class, TEXT("Recipe_Foundation_8x1_01"));
+			Late->Class = Foundation.Class;
+			Late->Foundation = Base + FVector(-1200.0, 2800.0, 0.0);
+			const bool bFoundation = Foundation.Class && AreaActionsBuildings::Spawn(Self.GetWorld(), Foundation, FTransform(Late->Foundation));
+			const bool bRunning = AAreaActionsServerSubsystem::FinishedJobs == D->Pieces.JobsBefore;
+			Self.Check(Late->Storage.IsValid() && bFoundation && S->Area.Contains(Late->Storage->GetActorLocation()) && S->Area.Contains(Late->Foundation) && bRunning,
+				FString::Printf(TEXT("a container and a foundation built in the area while the job runs (job running %d)"), bRunning));
+			return EStep::Next;
+		});
+		AddResultWindow(R, S);
+		AddCheckGone(R, S, D);
+		TSharedRef<double> Since = MakeShared<double>(0.0);
+		R.Steps.Add([S, D, Late, Since](FRun& Self)
+		{
+			if (*Since == 0.0)
+			{
+				*Since = FPlatformTime::Seconds();
+			}
+			const bool bStorageGone = !Late->Storage.IsValid() || Late->Storage->GetIsDismantled();
+			const bool bFoundationGone = FindLightweight(Self.GetWorld(), Late->Class, Late->Foundation) == nullptr;
+			if ((!bStorageGone || !bFoundationGone) && FPlatformTime::Seconds() - *Since < 3.0)
+			{
+				return EStep::Wait;
+			}
+			SetBudget(2.0f);
+			Self.Check(bStorageGone && bFoundationGone, FString::Printf(TEXT("the late container gone %d, the late foundation gone %d"), bStorageGone, bFoundationGone));
+			const FString Want = FString::Printf(TEXT("Dismantled %d buildings."), D->Buildings + 2);
+			Self.Check(S->Message.Contains(Want), FString::Printf(TEXT("result '%s' has '%s'"), *S->Message, *Want));
+			return EStep::Next;
+		});
 	}
 
 	void AddDismantleNoCrate(FRun& R)
@@ -4085,7 +4174,7 @@ namespace
 		}
 		R.Steps.Add([S, Energy, bDismantle](FRun& Self)
 		{
-			// One crate per item type (AA-093): the chainsaw's crate holds the chainsaw alone
+			// The crates packed (AA-093); the chainsaw keeps its state
 			const TArray<AFGCrate*> Crates = NewCrates(Self, *S);
 			const FCratesSeen Seen = SeeCrates(Crates, Self.GetPlayer()->GetPawn()->GetActorLocation());
 			TArray<FInventoryStack> Stacks;
@@ -4172,12 +4261,8 @@ namespace
 			{
 				Stacks += FMath::DivideAndRoundUp(Entry.Value, UFGItemDescriptor::GetStackSize(Entry.Key));
 			}
-			// One type per crate (AA-093): each type takes its own crates, at 200 stacks each
-			int32 WantCrates = 0;
-			for (const TPair<TSubclassOf<UFGItemDescriptor>, int32>& Entry : P->Taken)
-			{
-				WantCrates += FMath::DivideAndRoundUp(FMath::DivideAndRoundUp(Entry.Value, UFGItemDescriptor::GetStackSize(Entry.Key)), 200);
-			}
+			// Packed (AA-093): as many crates as first-fit-decreasing needs, each type in one crate unless it has more than 200 stacks
+			const int32 WantCrates = PackedCrates(P->Taken);
 			const FCratesSeen Seen = SeeCrates(Crates, Self.GetPlayer()->GetPawn()->GetActorLocation());
 			Self.Check(Crates.Num() == WantCrates && Seen.bOneTypeEach && SameCounts(InCrates, P->Taken),
 				FString::Printf(TEXT("%s: %d crates (want %d, %d full, %s) for %d stacks; in them %s, taken %s"), bDismantle ? TEXT("MassDismantle") : TEXT("Move to crate"),
@@ -4267,6 +4352,11 @@ namespace
 		if (R.Name == TEXT("DismantleBasic"))
 		{
 			AddDismantleBasic(R);
+			return true;
+		}
+		if (R.Name == TEXT("DismantleSweep"))
+		{
+			AddDismantleSweep(R);
 			return true;
 		}
 		if (R.Name == TEXT("DismantleNoCrate"))

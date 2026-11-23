@@ -12,6 +12,7 @@
 #include "FGCrate.h"
 #include "FGInventoryComponent.h"
 #include "EngineUtils.h"
+#include "Algo/Count.h"
 #include "Buildables/FGBuildableWire.h"
 #include "FGCircuitConnectionComponent.h"
 #include "FGLightweightBuildableSubsystem.h"
@@ -32,8 +33,9 @@ namespace
 	};
 
 	// The return crates of one job. Stacks go in the moment they leave a building, as they are (their item state too), so a save made
-	// while the job runs finds every item either still in its building or in a crate (AA-078). A crate holds one item type (AA-093) and
-	// at most MaxStacks stacks, then the next crate of that type starts (AA-085).
+	// while the job runs finds every item either still in its building or in a crate (AA-078). A crate takes at most MaxStacks stacks
+	// (AA-085). At the end the crates are packed again (AA-093): as few crates as the stacks need, each item type whole in one crate and
+	// the stacks sorted by type; only a type with more than MaxStacks stacks of its own spans crates.
 	class FReturnCrates
 	{
 	public:
@@ -43,15 +45,16 @@ namespace
 		explicit FReturnCrates(const TCHAR* InJob) : Job(InJob) {}
 
 		// A solid stack into the current crate or a new one next to the player; when the player left or there is no room there, where
-		// Fallback is (the building the items came from), rather than lose them
-		// Returns the items placed; the rest is counted as lost
+		// Fallback is (the building the items came from), rather than lose them. Returns the items placed; the rest is counted as lost
 		int32 Add(UWorld* World, const FInventoryStack& Stack, AFGCharacterPlayer* Player, const FVector& Fallback)
 		{
+			LastWorld = World;
+			LastPlayer = Player;
+			LastFallback = Fallback;
 			FInventoryStack Left = Stack;
-			const TSubclassOf<UFGItemDescriptor> Type = Stack.Item.GetItemClass();
 			while (Left.HasItems())
 			{
-				if (AFGCrate* Crate = Current.FindRef(Type).Get())
+				if (AFGCrate* Crate = Current.Get())
 				{
 					Crate->SetAllowAddingItems(true);
 					const int32 Added = Crate->GetInventory()->AddStack(Left, true);
@@ -73,9 +76,10 @@ namespace
 			return Stack.NumItems;
 		}
 
-		// The crates shrink to the stacks they hold; the counts go into the result
+		// Packs the crates again, shrinks them to the stacks they hold; the counts go into the result
 		void Finish(FAreaActionsResult& Result)
 		{
+			Repack();
 			for (const TWeakObjectPtr<AFGCrate>& Weak : All)
 			{
 				UFGInventoryComponent* Inventory = Weak.IsValid() ? Weak->GetInventory() : nullptr;
@@ -91,9 +95,12 @@ namespace
 				}
 				if (Used > 0 && Used < Inventory->GetSizeLinear())
 				{
+					Weak->SetAllowAddingItems(true);
 					Inventory->Resize(Used);
+					Weak->SetAllowAddingItems(false);
 				}
 			}
+			Away = Algo::CountIf(All, [this](const TWeakObjectPtr<AFGCrate>& Weak) { return AwayCrates.Contains(Weak); });
 			Result.Crates = All.Num();
 			Result.CratesAway = Away;
 			Result.Lost = Lost;
@@ -111,57 +118,204 @@ namespace
 		static int32 FailForTest;
 
 	private:
-		// Takes what the new crate holds out of Left; false when there is no crate or it took nothing
-		bool Spawn(UWorld* World, FInventoryStack& Left, AFGCharacterPlayer* Player, const FVector& Fallback)
+		// All stacks out of the crates and back in by first-fit-decreasing: a type's whole crates first, then the rest of each type,
+		// the largest first, into the first crate with room for all of it. Item states stay (stacks with a state are moved as they are)
+		void Repack()
 		{
-			if (FailForTest == 2)
+			TArray<AFGCrate*> Crates;
+			TMap<UClass*, TArray<FInventoryStack>> ByType;
+			for (const TWeakObjectPtr<AFGCrate>& Weak : All)
 			{
-				return false;
+				AFGCrate* Crate = Weak.Get();
+				UFGInventoryComponent* Inventory = Crate ? Crate->GetInventory() : nullptr;
+				if (!Inventory)
+				{
+					continue;
+				}
+				Crates.Add(Crate);
+				TArray<FInventoryStack> Stacks;
+				Inventory->GetInventoryStacks(Stacks);
+				for (const FInventoryStack& Stack : Stacks)
+				{
+					if (Stack.HasItems())
+					{
+						ByType.FindOrAdd(Stack.Item.GetItemClass()).Add(Stack);
+					}
+				}
+				Crate->SetAllowAddingItems(true);
+				Inventory->Empty();
+				Inventory->Resize(MaxStacks);
+				Crate->SetAllowAddingItems(false);
 			}
-			// The first stack within its stack size, the rest goes in after the crate has room
-			FInventoryStack First = Left;
-			First.NumItems = FMath::Min(Left.NumItems, FMath::Max(1, UFGItemDescriptor::GetStackSize(Left.Item.GetItemClass())));
+			if (Crates.IsEmpty())
+			{
+				return;
+			}
+			ByType.KeySort([](const UClass& A, const UClass& B) { return A.GetName() < B.GetName(); });
+			TArray<TArray<FInventoryStack>> Bins;
+			TArray<TArray<FInventoryStack>> Rests;
+			for (TPair<UClass*, TArray<FInventoryStack>>& Entry : ByType)
+			{
+				TArray<FInventoryStack> Stacks = MergeStacks(Entry.Key, Entry.Value);
+				while (Stacks.Num() >= MaxStacks)
+				{
+					Bins.Emplace(Stacks.GetData(), MaxStacks);
+					Stacks.RemoveAt(0, MaxStacks, EAllowShrinking::No);
+				}
+				if (!Stacks.IsEmpty())
+				{
+					Rests.Add(MoveTemp(Stacks));
+				}
+			}
+			const int32 WholeBins = Bins.Num();
+			Rests.StableSort([](const TArray<FInventoryStack>& A, const TArray<FInventoryStack>& B) { return A.Num() > B.Num(); });
+			for (TArray<FInventoryStack>& Rest : Rests)
+			{
+				int32 Into = INDEX_NONE;
+				for (int32 Index = WholeBins; Index < Bins.Num() && Into == INDEX_NONE; ++Index)
+				{
+					Into = Bins[Index].Num() + Rest.Num() <= MaxStacks ? Index : INDEX_NONE;
+				}
+				if (Into == INDEX_NONE)
+				{
+					Bins.Emplace();
+					Into = Bins.Num() - 1;
+				}
+				Bins[Into].Append(Rest);
+			}
+			TArray<TWeakObjectPtr<AFGCrate>> Kept;
+			for (int32 Index = 0; Index < Bins.Num(); ++Index)
+			{
+				TArray<FInventoryStack>& Bin = Bins[Index];
+				Bin.StableSort([](const FInventoryStack& A, const FInventoryStack& B) { return GetNameSafe(A.Item.GetItemClass()) < GetNameSafe(B.Item.GetItemClass()); });
+				AFGCrate* Crate = Index < Crates.Num() ? Crates[Index] : nullptr;
+				int32 From = 0;
+				if (!Crate)
+				{
+					bool bAway = false;
+					Crate = NewCrate(LastWorld.Get(), Bin[0], LastPlayer.Get(), LastFallback, bAway);
+					if (!Crate)
+					{
+						for (const FInventoryStack& Stack : Bin)
+						{
+							Lost += Stack.NumItems;
+							Items -= Stack.NumItems;
+						}
+						continue;
+					}
+					From = 1;
+					if (bAway)
+					{
+						AwayCrates.Add(Crate);
+					}
+				}
+				Crate->SetAllowAddingItems(true);
+				Crate->GetInventory()->Resize(MaxStacks);
+				for (int32 Stack = From; Stack < Bin.Num(); ++Stack)
+				{
+					const int32 Added = Crate->GetInventory()->AddStack(Bin[Stack], true);
+					Lost += Bin[Stack].NumItems - Added;
+					Items -= Bin[Stack].NumItems - Added;
+				}
+				Crate->SetAllowAddingItems(false);
+				Kept.Add(Crate);
+			}
+			for (int32 Index = Bins.Num(); Index < Crates.Num(); ++Index)
+			{
+				Crates[Index]->Destroy();
+			}
+			All = MoveTemp(Kept);
+			Current = nullptr;
+		}
+
+		// A type's stacks as full stacks of its stack size; stacks with an item state stay one by one
+		static TArray<FInventoryStack> MergeStacks(UClass* Type, const TArray<FInventoryStack>& Stacks)
+		{
+			if (Stacks.ContainsByPredicate([](const FInventoryStack& Stack) { return Stack.Item.HasState(); }))
+			{
+				return Stacks;
+			}
+			int32 Count = 0;
+			for (const FInventoryStack& Stack : Stacks)
+			{
+				Count += Stack.NumItems;
+			}
+			const int32 Size = FMath::Max(1, UFGItemDescriptor::GetStackSize(TSubclassOf<UFGItemDescriptor>(Type)));
+			TArray<FInventoryStack> Out;
+			for (; Count > 0; Count -= Size)
+			{
+				Out.Emplace(FMath::Min(Count, Size), TSubclassOf<UFGItemDescriptor>(Type));
+			}
+			return Out;
+		}
+
+		// A crate with First in it next to the player, or by Fallback when there is no room there; rows of five, 1.5 m apart, so the
+		// game does not have to look for room for each
+		AFGCrate* NewCrate(UWorld* World, const FInventoryStack& First, AFGCharacterPlayer* Player, const FVector& Fallback, bool& bAway)
+		{
+			if (!World || FailForTest == 2)
+			{
+				return nullptr;
+			}
 			FSpawnInventoryCrateParameters Parameters;
 			Parameters.bAllowCrateMerging = false;
 			if (Player)
 			{
 				Parameters.ActorsToIgnore.Add(Player);
 			}
-			// One crate per type stands in rows of five beside the spot, 1.5 m apart, so the game does not have to look for room for each
 			static constexpr int32 Columns[] = { 0, 1, -1, 2, -2 };
-			const FVector Offset(Columns[All.Num() % 5] * 150.0, (All.Num() / 5 + 1) * 150.0, 0.0);
+			const int32 Place = All.Num() + Extra++;
+			const FVector Offset(Columns[Place % 5] * 150.0, (Place / 5 + 1) * 150.0, 0.0);
 			AFGCrate* Crate = Player && FailForTest != 1 ? AFGItemPickup_Spawnable::SpawnInventoryCrate(World, { First }, Player->GetActorLocation() + Offset, Parameters) : nullptr;
-			bool bAway = false;
+			bAway = false;
 			if (!Crate)
 			{
 				Crate = AFGItemPickup_Spawnable::SpawnInventoryCrate(World, { First }, Fallback + Offset, Parameters);
 				bAway = true;
 			}
-			if (!Crate || !Crate->GetInventory())
-			{
-				return false;
-			}
-			const int32 Taken = Crate->GetInventory()->GetNumItems(nullptr);
-			if (Taken <= 0)
+			if (Crate && (!Crate->GetInventory() || Crate->GetInventory()->GetNumItems(nullptr) != First.NumItems))
 			{
 				Crate->Destroy();
+				return nullptr;
+			}
+			return Crate;
+		}
+
+		// Takes what the new crate holds out of Left; false when there is no crate or it took nothing
+		bool Spawn(UWorld* World, FInventoryStack& Left, AFGCharacterPlayer* Player, const FVector& Fallback)
+		{
+			// The first stack within its stack size, the rest goes in after the crate has room
+			FInventoryStack First = Left;
+			First.NumItems = FMath::Min(Left.NumItems, FMath::Max(1, UFGItemDescriptor::GetStackSize(Left.Item.GetItemClass())));
+			bool bAway = false;
+			AFGCrate* Crate = NewCrate(World, First, Player, Fallback, bAway);
+			if (!Crate)
+			{
 				return false;
 			}
-			Away += bAway ? 1 : 0;
-			Items += Taken;
-			Left.NumItems -= Taken;
+			if (bAway)
+			{
+				AwayCrates.Add(Crate);
+			}
+			Items += First.NumItems;
+			Left.NumItems -= First.NumItems;
 			Crate->SetAllowAddingItems(true);
 			Crate->GetInventory()->Resize(MaxStacks);
 			Crate->SetAllowAddingItems(false);
-			Current.Add(Left.Item.GetItemClass(), Crate);
+			Current = Crate;
 			All.Add(Crate);
 			return true;
 		}
 
 		const TCHAR* Job;
-		// The crate each item type goes into now
-		TMap<TSubclassOf<UFGItemDescriptor>, TWeakObjectPtr<AFGCrate>> Current;
+		TWeakObjectPtr<AFGCrate> Current;
 		TArray<TWeakObjectPtr<AFGCrate>> All;
+		TSet<TWeakObjectPtr<AFGCrate>> AwayCrates;
+		// Where the last stack came from, for crates the packing at the end needs beyond the ones there are
+		TWeakObjectPtr<UWorld> LastWorld;
+		TWeakObjectPtr<AFGCharacterPlayer> LastPlayer;
+		FVector LastFallback = FVector::ZeroVector;
+		int32 Extra = 0;
 		int32 Items = 0;
 		int32 Lost = 0;
 		int32 Away = 0;
@@ -645,15 +799,25 @@ namespace
 				}
 				if (FPlatformTime::Seconds() > EndTime)
 				{
-					return Next >= Total;
+					return false;
 				}
 			}
-			return true;
+			return Sweep(World, EndTime);
 		}
 
 		virtual void Finish(UWorld* World) override
 		{
 			FAreaActionsJob::Finish(World);
+			// What the game still refuses after the last sweep stays; each counted once
+			TMap<TSubclassOf<UObject>, int32> Left;
+			for (const TWeakObjectPtr<AFGBuildable>& Weak : Refused)
+			{
+				if (Weak.IsValid() && !Weak->GetIsDismantled())
+				{
+					++Result.Skipped;
+					Left.FindOrAdd(Weak->GetClass())++;
+				}
+			}
 			Crates.Finish(Result);
 			// For a check by hand (AA-093 pt 4): what was dismantled per class and the refund split into build cost and contents
 			const auto Text = [](const auto& Counts)
@@ -672,9 +836,74 @@ namespace
 			UE_LOG(LogAreaActionsCpp, Display, TEXT("MassDismantle buildings: %s"), *Text(Classes));
 			UE_LOG(LogAreaActionsCpp, Display, TEXT("MassDismantle refund cost: %s"), *Text(RefundCost));
 			UE_LOG(LogAreaActionsCpp, Display, TEXT("MassDismantle refund contents: %s"), *Text(RefundContents));
+			UE_LOG(LogAreaActionsCpp, Display, TEXT("MassDismantle sweeps %d, left because the game refuses: %s"), Sweeps, *Text(Left));
 		}
 
 	private:
+		// After the first pass the area is collected again and what is still there is dismantled, until a sweep finds nothing more the
+		// game lets go (at most MaxSweeps). The game refuses some buildings while another one hangs on them (a pole under a belt, a
+		// part of a bigger building) and a dismantled actor stays about 0.4 s, so each sweep waits SweepWait first
+		bool Sweep(UWorld* World, double EndTime)
+		{
+			static constexpr int32 MaxSweeps = 5;
+			static constexpr double SweepWait = 0.6;
+			while (true)
+			{
+				if (!bSweeping)
+				{
+					if (Sweeps >= MaxSweeps)
+					{
+						return true;
+					}
+					if (SweepFrom == 0.0)
+					{
+						SweepFrom = FPlatformTime::Seconds() + SweepWait;
+					}
+					if (FPlatformTime::Seconds() < SweepFrom)
+					{
+						return false;
+					}
+					bSweeping = true;
+					bSwept = false;
+					SweepCollector = AreaActionsBuildings::FCollector();
+					SweepBuildings.Reset();
+					SweepNext = 0;
+					SweepBefore = Result.Buildings;
+					++Sweeps;
+				}
+				if (!bSwept)
+				{
+					if (!SweepCollector.Step(World, Area, SweepBuildings, EndTime))
+					{
+						return false;
+					}
+					bSwept = true;
+				}
+				while (SweepNext < SweepBuildings.Num())
+				{
+					const AreaActionsBuildings::FSnapshot& Building = SweepBuildings[SweepNext++];
+					if (Building.LightweightIndex != INDEX_NONE)
+					{
+						DismantleLightweight(World, Building);
+					}
+					else
+					{
+						DismantleActor(World, Building.Actor.Get());
+					}
+					if (FPlatformTime::Seconds() > EndTime)
+					{
+						return false;
+					}
+				}
+				bSweeping = false;
+				SweepFrom = 0.0;
+				if (Result.Buildings == SweepBefore)
+				{
+					return true;
+				}
+			}
+		}
+
 		// Solid stacks into a log tally
 		static void Tally(AreaActionsBuildings::FItemCounts& Out, const TArray<FInventoryStack>& Stacks, int32 Sign = 1)
 		{
@@ -734,9 +963,8 @@ namespace
 			}
 			if (!IFGDismantleInterface::Execute_CanDismantle(Actor))
 			{
-				// Counted once, also when it is another building's child and comes again from the snapshot
-				Done.Add(Actor);
-				++Result.Skipped;
+				// Asked again by the next sweep; Finish counts what is still refused
+				Refused.Add(Actor);
 				return;
 			}
 			TArray<AActor*> Children;
@@ -764,9 +992,12 @@ namespace
 					{
 						DismantleOne(World, Child);
 					}
+					else if (AFGBuildable* Refuses = Cast<AFGBuildable>(Child))
+					{
+						Refused.Add(Refuses);
+					}
 					else
 					{
-						Done.Add(Child);
 						++Result.Skipped;
 					}
 				}
@@ -822,6 +1053,16 @@ namespace
 		TArray<TWeakObjectPtr<AFGCrate>> FoundCrates;
 		TSet<TWeakObjectPtr<AActor>> Done;
 		int32 Next = 0;
+		TSet<TWeakObjectPtr<AFGBuildable>> Refused;
+		// The sweeps after the first pass
+		AreaActionsBuildings::FCollector SweepCollector;
+		TArray<AreaActionsBuildings::FSnapshot> SweepBuildings;
+		int32 SweepNext = 0;
+		int32 SweepBefore = 0;
+		int32 Sweeps = 0;
+		double SweepFrom = 0.0;
+		bool bSweeping = false;
+		bool bSwept = false;
 		// The log of the refund (Finish)
 		TMap<TSubclassOf<UObject>, int32> Classes;
 		AreaActionsBuildings::FItemCounts RefundCost;
