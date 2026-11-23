@@ -72,6 +72,8 @@
 namespace
 {
 	enum class EStep : uint8 { Next, Wait };
+	// Two game instances: who runs a step
+	enum class ESide : uint8 { Each, Host, Client };
 
 	struct FRun;
 	using FStepFn = TFunction<EStep(FRun&)>;
@@ -117,12 +119,125 @@ namespace
 			return bOk;
 		}
 
+		// Two game instances on one computer (AA-040), scenarios named MP_<name>: the host and the client (-AATestRole=client) hold the same
+		// list of steps and each runs the steps marked for its side; at every change of side they wait for each other. The client's player
+		// runs the action and the host builds and checks the world, unless bPeerActs is off (the host acts, the client watches).
+		bool bMp = false;
+		bool bClient = false;
+		bool bPeerActs = true;
+		TArray<TPair<int32, ESide>> Marks;
+		// Host: the client's controller
+		TWeakObjectPtr<APlayerController> Peer;
+		bool bLinked = false;
+		double Created = 0.0;
+		double LastHello = 0.0;
+		FDelegateHandle LinkHandle;
+		// The acting player's place, the same numbers in both games: every scene is laid out from it
+		FVector Origin = FVector::ZeroVector;
+		// The last section the other game reported done, the sections this game reported, values the other game sent (by kind)
+		int32 OtherDone = -1;
+		TSet<int32> Sent;
+		TMap<int32, int32> Shared;
+		// Most mod windows, tool indicators and action actors alive in this game at once (AA-040 point 2)
+		int32 MaxWindows = 0, MaxIndicators = 0, MaxActions = 0;
+
 		double Now() const { return FPlatformTime::Seconds(); }
 		UWorld* GetWorld() const { return World.Get(); }
-		APlayerController* GetPlayer() const { return World.IsValid() ? UGameplayStatics::GetPlayerController(World.Get(), 0) : nullptr; }
+		APlayerController* GetLocalPlayer() const { return World.IsValid() ? UGameplayStatics::GetPlayerController(World.Get(), 0) : nullptr; }
+		// The player the scenario is about: the one who has the tool and runs the action
+		APlayerController* GetPlayer() const { return bMp && !bClient && bPeerActs ? Peer.Get() : GetLocalPlayer(); }
+		// This game runs the action's windows
+		bool Acts() const { return !bMp || bClient == bPeerActs; }
 	};
 
 	TUniquePtr<FRun> Run;
+
+	// The steps added from here on belong to Side (two game instances; one game alone runs them all)
+	void Mark(FRun& R, ESide Side)
+	{
+		R.Marks.Emplace(R.Steps.Num(), Side);
+	}
+
+	// Messages between the two games ride on the RCO's ping and its answer, which a game without the test mode has as well: 5 bits of
+	// kind, 24 bits of value, one bit per direction (the server echoes every ping, and Smoke pings with plain numbers)
+	constexpr int32 FromClient = 1 << 30, FromHost = 1 << 29;
+	// Kinds 1 to 30 carry values (FRun::Shared)
+	constexpr int32 MsgSection = 0, MsgHello = 31;
+	constexpr int32 MsgOriginX = 1, MsgOriginY = 2, MsgOriginZ = 3;
+
+	void Send(FRun& R, int32 Kind, int32 Value)
+	{
+		const int32 Token = (Kind << 24) | (Value & 0xFFFFFF);
+		if (R.bClient)
+		{
+			if (UAreaActionsRCO* Rco = UAreaActionsRCO::Of(R.GetLocalPlayer()))
+			{
+				Rco->ServerPing(FromClient | Token);
+			}
+		}
+		else if (UAreaActionsRCO* Rco = UAreaActionsRCO::Of(R.Peer.Get()))
+		{
+			Rco->ClientPong(FromHost | Token);
+		}
+	}
+
+	void Receive(FRun& R, int32 Token)
+	{
+		const int32 Kind = (Token >> 24) & 31;
+		int32 Value = Token & 0xFFFFFF;
+		if (Value & 0x800000)
+		{
+			Value -= 0x1000000;
+		}
+		if (Kind == MsgSection)
+		{
+			R.OtherDone = FMath::Max(R.OtherDone, Value);
+		}
+		else if (Kind == MsgHello)
+		{
+			R.bLinked = true;
+		}
+		else
+		{
+			R.Shared.Add(Kind, Value);
+		}
+	}
+
+	// Splits the steps by their marks: this game keeps its own, and at the end of every section tells the other game and waits for it
+	void ApplySides(FRun& R)
+	{
+		TArray<FStepFn> Out;
+		if (R.Marks.IsEmpty() || R.Marks[0].Key > 0)
+		{
+			R.Marks.Insert(TPair<int32, ESide>(0, ESide::Each), 0);
+		}
+		for (int32 Section = 0; Section < R.Marks.Num(); ++Section)
+		{
+			const int32 From = R.Marks[Section].Key;
+			const int32 To = R.Marks.IsValidIndex(Section + 1) ? R.Marks[Section + 1].Key : R.Steps.Num();
+			if (From == To)
+			{
+				continue;
+			}
+			const ESide Side = R.Marks[Section].Value;
+			const bool bMine = Side == ESide::Each || (Side == ESide::Client) == R.bClient;
+			const bool bOthers = Side == ESide::Each || (Side == ESide::Client) != R.bClient;
+			for (int32 Index = From; bMine && Index < To; ++Index)
+			{
+				Out.Add(R.Steps[Index]);
+			}
+			Out.Add([Section, bMine, bOthers](FRun& Self)
+			{
+				if (bMine && !Self.Sent.Contains(Section))
+				{
+					Self.Sent.Add(Section);
+					Send(Self, MsgSection, Section);
+				}
+				return bOthers && Self.OtherDone < Section ? EStep::Wait : EStep::Next;
+			});
+		}
+		R.Steps = MoveTemp(Out);
+	}
 
 	void AddSmoke(FRun& R, bool bFailOnPurpose)
 	{
@@ -351,8 +466,84 @@ namespace
 		return World->LineTraceSingleByChannel(Hit, FVector(At, 100000.0), FVector(At, -100000.0), ECC_WorldStatic, Params);
 	}
 
+	// The side whose player has the tool and runs the action
+	ESide ActSide(const FRun& R)
+	{
+		return R.bPeerActs ? ESide::Client : ESide::Host;
+	}
+
+	// Two games: the host puts the acting player at the test place and the other one 40 m behind it (the scenes lie ahead, along +X),
+	// and sends the place; the client waits until it stands where the host put it
+	void AddMpPlace(FRun& R)
+	{
+		Mark(R, ESide::Host);
+		R.Steps.Add([](FRun& Self)
+		{
+			AFGCharacterPlayer* Own = Self.GetLocalPlayer() ? Cast<AFGCharacterPlayer>(Self.GetLocalPlayer()->GetPawn()) : nullptr;
+			if (!Own || !Self.Peer.IsValid() || !Cast<AFGCharacterPlayer>(Self.Peer->GetPawn()))
+			{
+				return EStep::Wait;
+			}
+			// The host's own character goes first: the ground there streams in around it
+			Self.Step(FString::Printf(TEXT("host to X=%.0f Y=%.0f from %s"), TestPlace.X, TestPlace.Y, *Own->GetActorLocation().ToCompactString()));
+			Own->GetCharacterMovement()->SetMovementMode(MOVE_Flying);
+			Own->TeleportTo(FVector(TestPlace, 30000.0), FRotator::ZeroRotator);
+			return EStep::Next;
+		});
+		R.Steps.Add([](FRun& Self)
+		{
+			FHitResult Hit, BehindHit;
+			AFGCharacterPlayer* Own = Cast<AFGCharacterPlayer>(Self.GetLocalPlayer()->GetPawn());
+			AFGCharacterPlayer* Theirs = Self.Peer.IsValid() ? Cast<AFGCharacterPlayer>(Self.Peer->GetPawn()) : nullptr;
+			const FVector2D Behind(TestPlace.X - 4000.0, TestPlace.Y);
+			if (!Own || !Theirs || !TraceGround(Self.GetWorld(), TestPlace, Hit) || !TraceGround(Self.GetWorld(), Behind, BehindHit))
+			{
+				return EStep::Wait;
+			}
+			const double Up = Own->GetSimpleCollisionHalfHeight() + 20.0;
+			// Whole centimetres: the place travels as three numbers
+			Self.Origin = FVector(TestPlace.X, TestPlace.Y, FMath::RoundToDouble(Hit.Location.Z + Up));
+			AFGCharacterPlayer* Acting = Self.bPeerActs ? Theirs : Own;
+			AFGCharacterPlayer* Watching = Self.bPeerActs ? Own : Theirs;
+			Own->GetCharacterMovement()->SetMovementMode(MOVE_Walking);
+			Watching->TeleportTo(BehindHit.Location + FVector(0, 0, Up), FRotator::ZeroRotator);
+			Acting->TeleportTo(Self.Origin, FRotator::ZeroRotator);
+			Self.GetLocalPlayer()->SetControlRotation(FRotator::ZeroRotator);
+			Send(Self, MsgOriginX, FMath::RoundToInt32(Self.Origin.X));
+			Send(Self, MsgOriginY, FMath::RoundToInt32(Self.Origin.Y));
+			Send(Self, MsgOriginZ, FMath::RoundToInt32(Self.Origin.Z));
+			Self.Check(true, FString::Printf(TEXT("place %s for the %s's player, the other one at %s"), *Self.Origin.ToCompactString(), Self.bPeerActs ? TEXT("client") : TEXT("host"),
+				*Watching->GetActorLocation().ToCompactString()));
+			return EStep::Next;
+		});
+		Mark(R, ESide::Client);
+		R.Steps.Add([Calm = MakeShared<int32>(0)](FRun& Self)
+		{
+			Self.Origin = FVector(Self.Shared.FindRef(MsgOriginX), Self.Shared.FindRef(MsgOriginY), Self.Shared.FindRef(MsgOriginZ));
+			const AFGCharacterPlayer* Own = GetCharacter(Self);
+			const FVector Want = Self.Origin - FVector(Self.bPeerActs ? 0.0 : 4000.0, 0.0, 0.0);
+			// Standing there on ground that has streamed in, for half a second
+			const bool bThere = Own && FVector::Dist2D(Own->GetActorLocation(), Want) < 300.0 && Own->GetCharacterMovement()->IsMovingOnGround();
+			*Calm = bThere ? *Calm + 1 : 0;
+			if (*Calm < 30)
+			{
+				return EStep::Wait;
+			}
+			Self.GetLocalPlayer()->SetControlRotation(FRotator::ZeroRotator);
+			Self.Check(true, FString::Printf(TEXT("place %s from the host, standing at %s"), *Self.Origin.ToCompactString(), *Own->GetActorLocation().ToCompactString()));
+			return EStep::Next;
+		});
+		Mark(R, ESide::Each);
+		R.Steps.Add(WaitFrames(30));
+	}
+
 	void AddPlace(FRun& R)
 	{
+		if (R.bMp)
+		{
+			AddMpPlace(R);
+			return;
+		}
 		R.Steps.Add([](FRun& Self)
 		{
 			AFGCharacterPlayer* Character = GetCharacter(Self);
@@ -417,6 +608,8 @@ namespace
 	// The player takes the tool in hand: one tool item in the arms slot, made the active one
 	void AddEquipTool(FRun& R)
 	{
+		// The inventory is the server's
+		Mark(R, ESide::Host);
 		R.Steps.Add([](FRun& Self)
 		{
 			AFGCharacterPlayer* Character = GetCharacter(Self);
@@ -445,6 +638,7 @@ namespace
 			Arms->SetActiveIndex(Free);
 			return EStep::Next;
 		});
+		Mark(R, ActSide(R));
 		R.Steps.Add([](FRun& Self)
 		{
 			AAreaActionsEquipment* Tool = GetTool(Self);
@@ -461,6 +655,13 @@ namespace
 	void AddToolMenu(FRun& R)
 	{
 		AddEquipTool(R);
+		R.Steps.Add([](FRun& Self)
+		{
+			// The tool's own window, made by its Blueprint when this game's player takes the tool
+			const UUserWidget* Status = Cast<UUserWidget>(ObjectValue(GetTool(Self), TEXT("StatusWidget")));
+			Self.Check(Status && Status->IsInViewport(), FString::Printf(TEXT("the tool's status window: %s"), *GetNameSafe(Status)));
+			return EStep::Next;
+		});
 		R.Steps.Add([](FRun& Self)
 		{
 			Self.Step(TEXT("right mouse button"));
@@ -701,13 +902,15 @@ namespace
 
 	void PlaceScene(const FRun& R, FScene& S, double HalfSize, double Ahead, double Side = 0.0)
 	{
-		const APawn* Pawn = R.GetPlayer()->GetPawn();
-		const FVector Forward = Pawn->GetActorForwardVector().GetSafeNormal2D();
+		// Two games lay the scene out from the place the host sent, along +X
+		const APawn* Pawn = R.bMp ? nullptr : R.GetPlayer()->GetPawn();
+		const FVector At = Pawn ? Pawn->GetActorLocation() : R.Origin;
+		const FVector Forward = Pawn ? Pawn->GetActorForwardVector().GetSafeNormal2D() : FVector::ForwardVector;
 		const FVector Right = FVector(-Forward.Y, Forward.X, 0.0);
 		S.HalfSize = HalfSize;
-		S.Center = Pawn->GetActorLocation() + Forward * (HalfSize + Ahead) + Right * Side + FVector(0, 0, 300);
-		S.Area.MinZ = Pawn->GetActorLocation().Z - 3000.0;
-		S.Area.MaxZ = Pawn->GetActorLocation().Z + 3000.0;
+		S.Center = At + Forward * (HalfSize + Ahead) + Right * Side + FVector(0, 0, 300);
+		S.Area.MinZ = At.Z - 3000.0;
+		S.Area.MaxZ = At.Z + 3000.0;
 		S.Corners.Reset();
 		S.Area.Polygon.Reset();
 		for (const FVector2D Sign : { FVector2D(-1, -1), FVector2D(1, -1), FVector2D(1, 1), FVector2D(-1, 1) })
@@ -1065,11 +1268,38 @@ namespace
 	void AddCheckRecipeWindowLayout(FRun& R)
 	{
 		AddOnWindow(R, TEXT("Widget_SetRecipe"), [](FRun& Self, UUserWidget* Window) {});
-		R.Steps.Add(WaitFrames(5));
+		// -AATestBreakLayout: the checks measure a list that is never drawn (no size, no rows), so they must fail after the wait (AA-094)
+		static const auto GetList = [](UUserWidget* Window) -> UListView*
+		{
+			if (Window && FParse::Param(FCommandLine::Get(), TEXT("AATestBreakLayout")))
+			{
+				return NewObject<UListView>(Window);
+			}
+			return Window ? Cast<UListView>(Window->GetWidgetFromName(TEXT("RecipeList"))) : nullptr;
+		};
+		// The window is laid out some frames after it opens, more under load (AA-094): wait for a list with a size and a row, at most 2 s;
+		// after that the checks below run on whatever is there
+		R.Steps.Add([Since = MakeShared<double>(0.0)](FRun& Self)
+		{
+			if (*Since == 0.0)
+			{
+				*Since = Self.Now();
+			}
+			UListView* List = GetList(TopWindow(Self));
+			const bool bLaidOut = List && List->GetCachedGeometry().GetAbsoluteSize().X > 0.0 && List->GetDisplayedEntryWidgets().Num() > 0;
+			if (!bLaidOut && Self.Now() - *Since < 2.0)
+			{
+				return EStep::Wait;
+			}
+			Self.Step(FString::Printf(TEXT("recipe window laid out: %s after %.2f s"), bLaidOut ? TEXT("yes") : TEXT("no"), Self.Now() - *Since));
+			*Since = 0.0;
+			return EStep::Next;
+		});
+		// One more frame: the rows' own text boxes get their size a pass after the rows appear
+		R.Steps.Add(WaitFrames(2));
 		R.Steps.Add([](FRun& Self)
 		{
-			UUserWidget* Window = TopWindow(Self);
-			UListView* List = Window ? Cast<UListView>(Window->GetWidgetFromName(TEXT("RecipeList"))) : nullptr;
+			UListView* List = GetList(TopWindow(Self));
 			FVector2D Viewport = FVector2D::ZeroVector;
 			if (GEngine && GEngine->GameViewport)
 			{
@@ -1108,16 +1338,28 @@ namespace
 	void AddScene(FRun& R, const FSceneRef& S, double HalfSize, TFunction<void(FRun&, FScene&)> Build, double Side = 0.0)
 	{
 		AddEquipTool(R);
-		R.Steps.Add([S, HalfSize, Build, Side](FRun& Self)
+		// Two games: both know where the scene is, the host builds it, the acting player's game sets the tool
+		Mark(R, ESide::Each);
+		R.Steps.Add([S, HalfSize, Side](FRun& Self)
 		{
 			PlaceScene(Self, *S, HalfSize, 1000.0, Side);
+			return EStep::Next;
+		});
+		Mark(R, ESide::Host);
+		R.Steps.Add([S, Build](FRun& Self)
+		{
 			Build(Self, *S);
 			Self.Check(S->Inside.Num() > 0 && AllValid(S->Inside) && S->Controls.Num() == 3 && AllValid(S->Controls),
 				FString::Printf(TEXT("scene: %d in the area, %d controls"), S->Inside.Num(), S->Controls.Num()));
-			Self.Check(SetToolArea(Self, *S), TEXT("tool area set"));
 			SnapshotCrates(Self, *S);
-			ListenResults(Self, S);
 			S->RejectsBefore = UAreaActionsRCO::RejectCount;
+			return EStep::Next;
+		});
+		Mark(R, ActSide(R));
+		R.Steps.Add([S](FRun& Self)
+		{
+			Self.Check(SetToolArea(Self, *S), TEXT("tool area set"));
+			ListenResults(Self, S);
 			return EStep::Next;
 		});
 		R.Steps.Add(WaitFrames(10));
@@ -1892,6 +2134,11 @@ namespace
 
 	FVector Ground(const FRun& R, const FVector& At)
 	{
+		if (R.bMp)
+		{
+			// Two games must get the same number: the test place is flat, the acting player stands about 110 cm above its ground
+			return FVector(At.X, At.Y, R.Origin.Z - 60.0);
+		}
 		FVector Hit;
 		return GroundBelow(R.GetWorld(), At, Hit) ? Hit + FVector(0, 0, 50) : At;
 	}
@@ -4349,6 +4596,20 @@ namespace
 
 	bool BuildScenario(FRun& R)
 	{
+		if (R.Name == TEXT("MP_Smoke"))
+		{
+			// The client takes the tool and opens its menu; R10: what the host's game makes of it is counted by Watch
+			FSceneRef S = MakeShared<FScene>();
+			AddToolMenu(R);
+			R.Steps.Add([S](FRun& Self)
+			{
+				PlaceScene(Self, *S, 1000.0, 500.0);
+				Self.Check(SetToolArea(Self, *S), TEXT("tool area set"));
+				return EStep::Next;
+			});
+			R.Steps.Add(WaitFrames(60));
+			return true;
+		}
 		if (R.Name == TEXT("DismantleBasic"))
 		{
 			AddDismantleBasic(R);
@@ -4597,12 +4858,109 @@ namespace
 		{
 			return;
 		}
-		// Exit from the next core tick, never from inside a world tick or timer
+		// Exit from the next core tick, never from inside a world tick or timer. Two games: 2 s later, so the last message to the other
+		// game leaves first
 		FTSTicker::GetCoreTicker().AddTicker(FTickerDelegate::CreateLambda([](float)
 		{
 			FPlatformMisc::RequestExit(false, TEXT("AreaActions test mode"));
 			return false;
-		}));
+		}), R.bMp ? 2.0f : 0.0f);
+	}
+
+	// Host: a message of the client's game; its first one says which player is the client
+	void OnHostPing(UAreaActionsRCO* From, int32 Token)
+	{
+		if (!Run || !Run->bMp || Run->bClient || Run->bEnded || !From || !(Token & FromClient))
+		{
+			return;
+		}
+		FRun& R = *Run;
+		if (((Token >> 24) & 31) == MsgHello)
+		{
+			if (!R.bLinked)
+			{
+				R.Peer = From->GetOwnerPlayerController();
+				R.Step(FString::Printf(TEXT("the client's game joined: %s"), *GetNameSafe(R.Peer.Get())));
+			}
+			Receive(R, Token);
+			Send(R, MsgHello, 0);
+		}
+		else if (UAreaActionsRCO::Of(R.Peer.Get()) == From)
+		{
+			Receive(R, Token);
+		}
+	}
+
+	// Two games before the first step: the client says hello every second until the host answers. False when it took too long.
+	bool Link(FRun& R)
+	{
+		UAreaActionsRCO* Rco = R.bClient && R.World.IsValid() ? UAreaActionsRCO::Of(R.GetLocalPlayer()) : nullptr;
+		if (Rco && GetCharacter(R))
+		{
+			if (!R.LinkHandle.IsValid())
+			{
+				R.LinkHandle = Rco->OnPong.AddLambda([](int32 Token)
+				{
+					if (Run && !Run->bEnded && (Token & FromHost))
+					{
+						Receive(*Run, Token);
+					}
+				});
+			}
+			if (R.Now() - R.LastHello > 1.0)
+			{
+				R.LastHello = R.Now();
+				Send(R, MsgHello, 0);
+			}
+		}
+		return R.Now() - R.Created < 240.0;
+	}
+
+	// AA-040 point 2: what this game holds of the mod's windows, the tool's indicators and action actors right now
+	void Watch(FRun& R)
+	{
+		static const TCHAR* Indicators[] = { TEXT("/AreaActions/Equipment/AreaActions/Indicators/AreaActionsCorner.AreaActionsCorner_C"),
+			TEXT("/AreaActions/Equipment/AreaActions/Indicators/AreaActionsWall.AreaActionsWall_C"), TEXT("/AreaActions/Equipment/AreaActions/Indicators/AreaActionsZ.AreaActionsZ_C") };
+		static TMap<const UClass*, bool> Ours;
+		const UWorld* World = R.GetWorld();
+		const auto CountOf = [World](const UClass* Class)
+		{
+			TArray<UObject*> Found;
+			GetObjectsOfClass(Class, Found, true, RF_ClassDefaultObject | RF_ArchetypeObject);
+			int32 Count = 0;
+			for (const UObject* Each : Found)
+			{
+				Count += IsValid(Each) && Each->GetWorld() == World ? 1 : 0;
+			}
+			return Count;
+		};
+		TArray<UObject*> Widgets;
+		GetObjectsOfClass(UUserWidget::StaticClass(), Widgets, true, RF_ClassDefaultObject | RF_ArchetypeObject);
+		int32 Windows = 0;
+		for (const UObject* Widget : Widgets)
+		{
+			bool* bOurs = Ours.Find(Widget->GetClass());
+			if (!bOurs)
+			{
+				bOurs = &Ours.Add(Widget->GetClass(), Widget->GetClass()->GetPathName().StartsWith(TEXT("/AreaActions/")));
+			}
+			// A widget made for a player has that player's world; the templates inside a widget class have none
+			Windows += *bOurs && IsValid(Widget) && Widget->GetWorld() == World ? 1 : 0;
+		}
+		int32 Markers = 0;
+		for (const TCHAR* Path : Indicators)
+		{
+			const UClass* Class = FindObject<UClass>(nullptr, Path);
+			Markers += Class ? CountOf(Class) : 0;
+		}
+		const int32 Actions = CountOf(AAreaActionBase::StaticClass());
+		if (Windows > R.MaxWindows || Markers > R.MaxIndicators || Actions > R.MaxActions)
+		{
+			R.Step(FString::Printf(TEXT("here now: mod windows %d, tool indicators %d, action actors %d"), Windows, Markers, Actions));
+		}
+		R.MaxWindows = FMath::Max(R.MaxWindows, Windows);
+		R.MaxIndicators = FMath::Max(R.MaxIndicators, Markers);
+		R.MaxActions = FMath::Max(R.MaxActions, Actions);
 	}
 
 	bool Tick(float)
@@ -4642,11 +5000,28 @@ namespace
 			}
 			return true;
 		}
+		if (R.bMp && !R.bLinked)
+		{
+			if (!Link(R))
+			{
+				R.Check(false, TEXT("the other game did not answer in 240 s"));
+				Finish(R);
+				return false;
+			}
+			// The load settles after the two games have met
+			R.Started = R.Now();
+			R.StartFrame = GFrameCounter;
+			return true;
+		}
 		if (!R.World.IsValid())
 		{
 			R.Check(false, TEXT("the game world is gone"));
 			Finish(R);
 			return false;
+		}
+		if (R.bMp)
+		{
+			Watch(R);
 		}
 		// Let the load settle: 3 s and 10 frames
 		if (!R.bStarted)
@@ -4757,22 +5132,64 @@ void FAreaActionsTests::StartFromCommandLine(UWorld* World)
 		Run->Step(FString::Printf(TEXT("loaded into %s, net mode %d"), *World->GetMapName(), static_cast<int32>(World->GetNetMode())));
 		return;
 	}
-	if (Run || !World || !FParse::Value(FCommandLine::Get(), TEXT("AATest="), Name))
+	FString Role;
+	const bool bClient = FParse::Value(FCommandLine::Get(), TEXT("AATestRole="), Role) && Role == TEXT("client");
+	if (Run && Run->bClient && !Run->bLinked && World && World->GetNetMode() == NM_Client)
+	{
+		// The client's game passes through its main menu on the way to the host: the scenario follows it into the newest world
+		Run->World = World;
+		Run->Step(FString::Printf(TEXT("now in %s, net mode %d"), *World->GetMapName(), static_cast<int32>(World->GetNetMode())));
+		return;
+	}
+	if (Run || !World || !FParse::Value(FCommandLine::Get(), TEXT("AATest="), Name) || (bClient && World->GetNetMode() != NM_Client))
 	{
 		return;
 	}
 	Run = MakeUnique<FRun>();
 	Run->Name = Name;
 	Run->World = World;
-	Run->Started = FPlatformTime::Seconds();
+	Run->Started = Run->Created = FPlatformTime::Seconds();
 	Run->StartFrame = GFrameCounter;
-	UE_LOG(LogAreaActionsCpp, Display, TEXT("AATEST %s step scenario in %s, net mode %d"), *Name, *World->GetMapName(), static_cast<int32>(World->GetNetMode()));
+	// MP_<name>: two game instances; in MP_Host<name> the host's own player acts and the client watches
+	Run->bMp = Name.StartsWith(TEXT("MP_"));
+	Run->bClient = bClient;
+	Run->bPeerActs = !Name.StartsWith(TEXT("MP_Host"));
+	UE_LOG(LogAreaActionsCpp, Display, TEXT("AATEST %s step scenario in %s, net mode %d%s"), *Name, *World->GetMapName(), static_cast<int32>(World->GetNetMode()),
+		Run->bMp ? (bClient ? TEXT(", the client of two games") : TEXT(", the host of two games")) : TEXT(""));
+	if (Run->bMp)
+	{
+		Run->StepTimeoutSec = 120.0;
+		static FDelegateHandle PingHandle;
+		if (!bClient && !PingHandle.IsValid())
+		{
+			PingHandle = UAreaActionsRCO::OnPing.AddStatic(&OnHostPing);
+		}
+	}
 	AddPlace(*Run);
 	if (!BuildScenario(*Run))
 	{
 		Run->Check(false, TEXT("unknown scenario"));
 		Finish(*Run);
 		return;
+	}
+	if (Run->bMp)
+	{
+		// AA-040 point 2: the windows and indicators exist only in the game of the player who acts
+		Mark(*Run, ESide::Each);
+		Run->Steps.Add([](FRun& Self)
+		{
+			const FString Seen = FString::Printf(TEXT("mod windows %d, tool indicators %d, action actors %d"), Self.MaxWindows, Self.MaxIndicators, Self.MaxActions);
+			if (Self.Acts())
+			{
+				Self.Check(Self.MaxIndicators > 0, FString::Printf(TEXT("this game's player acted: here at most %s"), *Seen));
+			}
+			else
+			{
+				Self.Check(Self.MaxWindows == 0 && Self.MaxIndicators == 0 && Self.MaxActions == 0, FString::Printf(TEXT("the other game's player acted: here at most %s (want 0)"), *Seen));
+			}
+			return EStep::Next;
+		});
+		ApplySides(*Run);
 	}
 	WatchFramePhases();
 	FTSTicker::GetCoreTicker().AddTicker(FTickerDelegate::CreateStatic(&Tick));

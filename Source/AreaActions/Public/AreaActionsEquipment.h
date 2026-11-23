@@ -16,6 +16,10 @@ class AREAACTIONS_API AAreaActionsEquipment : public AFGEquipment
 	GENERATED_BODY()
 
 public:
+	// The Blueprint's WasEquipped and WasUnEquipped make and remove the tool's windows, indicators and input mode. The game calls both for
+	// every player's tool, also on the server and on the other clients: there only the game's own part runs, the Blueprint's is skipped.
+	virtual void ProcessEvent(UFunction* Function, void* Parameters) override;
+
 	// The 8 corners of the building's box in the world: its clearance box, or without one, the bounds of its class default and of its
 	// lightweight instance meshes. Empty for classes the copy skips that have no clearance (as the original did).
 	UFUNCTION(BlueprintCallable, Category = "Area Actions")
@@ -38,4 +42,8 @@ public:
 
 	// The selection as a request carries it, read from the Blueprint's CornerLocations, MinZ and MaxZ; false when they are missing
 	bool GetArea(FAreaActionsArea& Out) const;
+
+private:
+	// The Blueprint's WasEquipped ran here (the tool is this game's own player's), so its WasUnEquipped has to run as well
+	bool bEquippedLocally = false;
 };

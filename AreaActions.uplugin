@@ -8,6 +8,8 @@
 	"Category": "Modding",
 	"CreatedBy": "Mircea Roata",
 	"GameVersion": ">=520140",
+	"RequiredOnRemote": true,
+	"RemoteVersionRange": ">=1.6.7",
 	"CreatedByURL": "https://github.com/mircearoata/SatisfactoryAreaActions",
 	"DocsURL": "",
 	"MarketplaceURL": "",

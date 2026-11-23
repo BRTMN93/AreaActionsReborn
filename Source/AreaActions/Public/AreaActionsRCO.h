@@ -27,6 +27,8 @@ public:
 	UFUNCTION(Client, Reliable)
 	void ClientPong(int32 Token);
 	TMulticastDelegate<void(int32 Token)> OnPong;
+	// Server side: a player's ping arrived (the test mode's two game instances talk through the ping and its answer)
+	static TMulticastDelegate<void(UAreaActionsRCO* From, int32 Token)> OnPing;
 
 	// Recipe is any class the client sends; the server accepts recipes only
 	UFUNCTION(Server, Reliable)

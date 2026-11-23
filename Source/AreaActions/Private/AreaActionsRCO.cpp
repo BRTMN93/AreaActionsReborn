@@ -34,6 +34,7 @@ namespace
 }
 
 int32 UAreaActionsRCO::RejectCount = 0;
+TMulticastDelegate<void(UAreaActionsRCO*, int32)> UAreaActionsRCO::OnPing;
 
 void UAreaActionsRCO::GetLifetimeReplicatedProps(TArray<FLifetimeProperty>& OutLifetimeProps) const
 {
@@ -51,6 +52,7 @@ void UAreaActionsRCO::ServerPing_Implementation(int32 Token)
 {
 	UE_LOG(LogAreaActionsCpp, Display, TEXT("ServerPing %d"), Token);
 	ClientPong(Token);
+	OnPing.Broadcast(this, Token);
 }
 
 void UAreaActionsRCO::ClientPong_Implementation(int32 Token)

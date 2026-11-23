@@ -6,6 +6,34 @@
 #include "Buildables/FGBuildable.h"
 #include "InstanceData.h"
 
+void AAreaActionsEquipment::ProcessEvent(UFunction* Function, void* Parameters)
+{
+	static const FName Equipped(TEXT("WasEquipped")), UnEquipped(TEXT("WasUnEquipped"));
+	const FName Name = Function ? Function->GetFName() : NAME_None;
+	if (Name != Equipped && Name != UnEquipped)
+	{
+		Super::ProcessEvent(Function, Parameters);
+		return;
+	}
+	// On taking the tool away the instigator may be gone already, so the answer of WasEquipped is kept
+	const bool bLocal = Name == Equipped ? IsLocalInstigator() : bEquippedLocally;
+	bEquippedLocally = Name == Equipped && bLocal;
+	UE_LOG(LogAreaActionsCpp, Display, TEXT("Tool %s: %s player's, net mode %d"), *Name.ToString(), bLocal ? TEXT("this") : TEXT("another"),
+		GetWorld() ? static_cast<int32>(GetWorld()->GetNetMode()) : -1);
+	if (bLocal)
+	{
+		Super::ProcessEvent(Function, Parameters);
+	}
+	else if (Name == Equipped)
+	{
+		AFGEquipment::WasEquipped_Implementation();
+	}
+	else
+	{
+		AFGEquipment::WasUnEquipped_Implementation();
+	}
+}
+
 bool AAreaActionsEquipment::GetLocalBox(const AFGBuildable* Buildable, FBox& OutBox)
 {
 	OutBox.Init();
