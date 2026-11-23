@@ -196,8 +196,16 @@ namespace
 					Crate = NewCrate(LastWorld.Get(), Bin[0], LastPlayer.Get(), LastFallback, bAway);
 					if (!Crate)
 					{
-						for (const FInventoryStack& Stack : Bin)
+						// No crate beyond the ones there were: the stacks go wherever the kept crates have room. They always fit, the old
+						// crates held them all before and merging only lowers the number of stacks; anything left would be lost
+						for (FInventoryStack Stack : Bin)
 						{
+							for (int32 Other = 0; Other < Crates.Num() && Stack.HasItems(); ++Other)
+							{
+								Crates[Other]->SetAllowAddingItems(true);
+								Stack.NumItems -= Crates[Other]->GetInventory()->AddStack(Stack, true);
+								Crates[Other]->SetAllowAddingItems(false);
+							}
 							Lost += Stack.NumItems;
 							Items -= Stack.NumItems;
 						}
@@ -228,20 +236,23 @@ namespace
 			Current = nullptr;
 		}
 
-		// A type's stacks as full stacks of its stack size; stacks with an item state stay one by one
+		// A type's stacks without an item state as full stacks of its stack size; stacks with a state stay as they are
 		static TArray<FInventoryStack> MergeStacks(UClass* Type, const TArray<FInventoryStack>& Stacks)
 		{
-			if (Stacks.ContainsByPredicate([](const FInventoryStack& Stack) { return Stack.Item.HasState(); }))
-			{
-				return Stacks;
-			}
+			TArray<FInventoryStack> Out;
 			int32 Count = 0;
 			for (const FInventoryStack& Stack : Stacks)
 			{
-				Count += Stack.NumItems;
+				if (Stack.Item.HasState())
+				{
+					Out.Add(Stack);
+				}
+				else
+				{
+					Count += Stack.NumItems;
+				}
 			}
 			const int32 Size = FMath::Max(1, UFGItemDescriptor::GetStackSize(TSubclassOf<UFGItemDescriptor>(Type)));
-			TArray<FInventoryStack> Out;
 			for (; Count > 0; Count -= Size)
 			{
 				Out.Emplace(FMath::Min(Count, Size), TSubclassOf<UFGItemDescriptor>(Type));
