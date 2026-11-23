@@ -12,6 +12,8 @@
 #include "FGCrate.h"
 #include "FGInventoryComponent.h"
 #include "EngineUtils.h"
+#include "Buildables/FGBuildableWire.h"
+#include "FGCircuitConnectionComponent.h"
 #include "FGLightweightBuildableSubsystem.h"
 #include "FGItemPickup_Spawnable.h"
 #include "FGRecipe.h"
@@ -681,7 +683,8 @@ namespace
 			Crate->Destroy();
 		}
 
-		// The actor and what the game dismantles along with it (GetChildDismantleActors)
+		// The actor and what the game dismantles along with it: GetChildDismantleActors and the wires on its power connections, which the
+		// game destroys with it, so they are refunded first
 		void DismantleActor(UWorld* World, AFGBuildable* Actor)
 		{
 			if (!IsValid(Actor) || Actor->GetIsDismantled() || Done.Contains(Actor))
@@ -695,6 +698,19 @@ namespace
 			}
 			TArray<AActor*> Children;
 			IFGDismantleInterface::Execute_GetChildDismantleActors(Actor, Children);
+			TInlineComponentArray<UFGCircuitConnectionComponent*> Connections(Actor);
+			for (const UFGCircuitConnectionComponent* Connection : Connections)
+			{
+				TArray<AFGBuildableWire*> Wires;
+				Connection->GetWires(Wires);
+				for (AFGBuildableWire* Wire : Wires)
+				{
+					if (IsValid(Wire) && !Wire->GetIsDismantled() && !Done.Contains(Wire) && IFGDismantleInterface::Execute_CanDismantle(Wire))
+					{
+						DismantleOne(World, Wire);
+					}
+				}
+			}
 			DismantleOne(World, Actor);
 			for (AActor* Child : Children)
 			{

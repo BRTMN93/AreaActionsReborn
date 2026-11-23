@@ -16,6 +16,7 @@
 #include "Buildables/FGBuildableWire.h"
 #include "FGPowerConnectionComponent.h"
 #include "HAL/IConsoleManager.h"
+#include "Buildables/FGBuildableBlueprintDesigner.h"
 #include "Components/CheckBox.h"
 #include "Components/EditableTextBox.h"
 #include "FGCentralStorageSubsystem.h"
@@ -3594,8 +3595,9 @@ namespace
 		});
 	}
 
-	// The HUB and the Space Elevator, and a railroad switch lever (which the game dismantles only with its track): CanDismantle of each,
-	// read right before the request, decides what goes
+	// The HUB and the Space Elevator, and a blueprint designer with a building inside (which the game refuses to dismantle): CanDismantle
+	// of each, read right before the request, decides what goes. The designer's building stands outside the polygon (its place is), inside
+	// the designer's floor.
 	void AddDismantleProtected(FRun& R)
 	{
 		struct FProtected
@@ -3612,7 +3614,7 @@ namespace
 			struct FWhat { const TCHAR* Class; const TCHAR* Recipe; FVector Offset; };
 			for (const FWhat& What : { FWhat{ TEXT("Build_TradingPost"), TEXT("Recipe_TradingPost"), FVector(-3000, -3000, 0) },
 				FWhat{ TEXT("Build_SpaceElevator"), TEXT("Recipe_SpaceElevator"), FVector(1500, 1500, 0) },
-				FWhat{ TEXT("Build_RailroadSwitchControl"), TEXT("Recipe_RailroadSwitchControl"), FVector(-3000, 3000, 0) } })
+				FWhat{ TEXT("Build_BlueprintDesigner"), TEXT("Recipe_BlueprintDesigner"), FVector(-3000, Scene.HalfSize - 500.0, 0) } })
 			{
 				AFGBuildable* Building = SpawnGameBuildable(Self, What.Class, What.Recipe, Base + What.Offset);
 				Self.Step(FString::Printf(TEXT("%s spawned: %d"), What.Class, Building != nullptr));
@@ -3622,6 +3624,19 @@ namespace
 					Scene.Inside.Add(Building);
 				}
 			}
+			AFGBuildableBlueprintDesigner* Designer = P->Buildings.IsEmpty() ? nullptr : Cast<AFGBuildableBlueprintDesigner>(P->Buildings.Last().Get());
+			UClass* MachineClass = LoadClass<AFGBuildable>(nullptr, Asset::Constructor);
+			AFGBuildableSubsystem* Buildables = AFGBuildableSubsystem::Get(Self.GetWorld());
+			const FTransform Inner(Base + FVector(-3000, Scene.HalfSize + 500.0, 100));
+			AFGBuildable* Machine = Designer && MachineClass ? Buildables->BeginSpawnBuildable(MachineClass, Inner) : nullptr;
+			if (Machine)
+			{
+				Machine->SetInsideBlueprintDesigner(Designer);
+				Machine->FinishSpawning(Inner);
+				Designer->OnBuildableConstructedInsideDesigner(Machine);
+			}
+			Self.Check(Designer && Machine && Designer->HasBuildings() && !Scene.Area.Contains(Machine->GetActorLocation()),
+				FString::Printf(TEXT("designer %d holds a Constructor outside the polygon: %d"), Designer != nullptr, Designer && Designer->HasBuildings()));
 			for (const FVector& Place : Scene.ControlPlaces())
 			{
 				Scene.Controls.Add(SpawnStorage(Self, Place, 15, 0));
@@ -3823,6 +3838,7 @@ namespace
 		AddScene(R, S, 4000.0, [Kind, J](FRun& Self, FScene& Scene)
 		{
 			MakeAvailable(Self, Asset::IronRod);
+			Self.Step(FString::Printf(TEXT("scene at %s"), *Scene.Center.ToCompactString()));
 			for (int32 Index = 0; Index < Count; ++Index)
 			{
 				const FVector At = Scene.Center + FVector(-2800.0 + (Index % 5) * 1400.0, -2800.0 + (Index / 5) * 1400.0, 0.0);
@@ -3838,7 +3854,7 @@ namespace
 			{
 				Scene.Controls.Add(SpawnStorage(Self, Place, 15, 0));
 			}
-		});
+		}, (static_cast<int32>(Kind) - 1) * 15000.0);
 		R.Steps.Add([S, J, Kind, RequestId, Name, ItemsAt](FRun& Self)
 		{
 			int32 Missing = 0;
@@ -4366,6 +4382,10 @@ namespace
 		if (R.bMeasureFrames)
 		{
 			R.MaxFrameMs = FMath::Max(R.MaxFrameMs, FApp::GetDeltaTime() * 1000.0);
+			if (FApp::GetDeltaTime() > 0.1)
+			{
+				UE_LOG(LogAreaActionsCpp, Display, TEXT("AATEST %s step slow frame %.1f ms at step %d"), *R.Name, FApp::GetDeltaTime() * 1000.0, R.Index + 1);
+			}
 		}
 		if (R.bAwaitWorld)
 		{
