@@ -40,6 +40,8 @@
 #include "Components/Button.h"
 #include "EngineUtils.h"
 #include "FGCrate.h"
+#include "AkComponent.h"
+#include "UI/FGInteractWidget.h"
 #include "FGItemPickup_Spawnable.h"
 #include "FGRecipe.h"
 #include "FGRecipeManager.h"
@@ -113,6 +115,12 @@ namespace
 
 		bool Check(bool bOk, const FString& What)
 		{
+			if (bDry)
+			{
+				// A try that does not count (see Eventually)
+				DryFails += bOk ? 0 : 1;
+				return bOk;
+			}
 			++Total;
 			Passed += bOk ? 1 : 0;
 			UE_LOG(LogAreaActionsCpp, Display, TEXT("AATEST %s check %s %s"), *Name, bOk ? TEXT("PASS") : TEXT("FAIL"), *What);
@@ -125,6 +133,17 @@ namespace
 		bool bMp = false;
 		bool bClient = false;
 		bool bPeerActs = true;
+		// The scenario's name without MP_ or MP_Host
+		FString Scenario;
+		// Checks made while this is on neither count nor log, only DryFails says how many would fail
+		bool bDry = false;
+		int32 DryFails = 0;
+		// Client: buildings of the scene this game has not got from the host (see SpawnBuildable)
+		int32 Missing = 0;
+		// Host: the client's game left on purpose, nothing waits for it any more
+		bool bPeerLeft = false;
+		// While the steps are listed: the ones from here on come after the client has left (the host's own player acts)
+		bool bBuildAfterLeave = false;
 		TArray<TPair<int32, ESide>> Marks;
 		// Host: the client's controller
 		TWeakObjectPtr<APlayerController> Peer;
@@ -139,7 +158,7 @@ namespace
 		TSet<int32> Sent;
 		TMap<int32, int32> Shared;
 		// Most mod windows, tool indicators and action actors alive in this game at once (AA-040 point 2)
-		int32 MaxWindows = 0, MaxIndicators = 0, MaxActions = 0;
+		int32 MaxWindows = 0, MaxIndicators = 0, MaxActions = 0, MaxGhosts = 0;
 
 		double Now() const { return FPlatformTime::Seconds(); }
 		UWorld* GetWorld() const { return World.Get(); }
@@ -148,6 +167,8 @@ namespace
 		APlayerController* GetPlayer() const { return bMp && !bClient && bPeerActs ? Peer.Get() : GetLocalPlayer(); }
 		// This game runs the action's windows
 		bool Acts() const { return !bMp || bClient == bPeerActs; }
+		// Where the acting player stands, the same in both games (the crates of an action land next to it)
+		FVector ActingPlace() const { return bMp ? Origin : GetPlayer()->GetPawn()->GetActorLocation(); }
 	};
 
 	TUniquePtr<FRun> Run;
@@ -164,6 +185,10 @@ namespace
 	// Kinds 1 to 30 carry values (FRun::Shared)
 	constexpr int32 MsgSection = 0, MsgHello = 31;
 	constexpr int32 MsgOriginX = 1, MsgOriginY = 2, MsgOriginZ = 3;
+	// Host to client: the number of items the result must name; the largest crate's stacks, items, contents hash and place
+	constexpr int32 MsgExpected = 4, MsgCrateStacks = 5, MsgCrateItems = 6, MsgCrateHash = 7, MsgCrateX = 8, MsgCrateY = 9, MsgCrateZ = 10;
+	// Client to host: what the client saw in that crate after opening it
+	constexpr int32 MsgSeenStacks = 11, MsgSeenItems = 12, MsgSeenHash = 13;
 
 	void Send(FRun& R, int32 Kind, int32 Value)
 	{
@@ -233,7 +258,7 @@ namespace
 					Self.Sent.Add(Section);
 					Send(Self, MsgSection, Section);
 				}
-				return bOthers && Self.OtherDone < Section ? EStep::Wait : EStep::Next;
+				return bOthers && !Self.bPeerLeft && Self.OtherDone < Section ? EStep::Wait : EStep::Next;
 			});
 		}
 		R.Steps = MoveTemp(Out);
@@ -412,6 +437,20 @@ namespace
 		};
 	}
 
+	FStepFn WaitSeconds(double Seconds)
+	{
+		return [Seconds, Since = MakeShared<double>(0.0)](FRun& Self)
+		{
+			*Since = *Since > 0.0 ? *Since : Self.Now();
+			if (Self.Now() - *Since < Seconds)
+			{
+				return EStep::Wait;
+			}
+			*Since = 0.0;
+			return EStep::Next;
+		};
+	}
+
 	// Waits until the game has settled after a scene was built (streaming, first loads of meshes and materials): Frames frames in a row under
 	// 50 ms, at most 25 s (the step timeout is 30 s), so W5 measures the job and not the scene's own hitches
 	FStepFn WaitCalm(int32 Frames)
@@ -469,7 +508,53 @@ namespace
 	// The side whose player has the tool and runs the action
 	ESide ActSide(const FRun& R)
 	{
-		return R.bPeerActs ? ESide::Client : ESide::Host;
+		return R.bPeerActs && !R.bBuildAfterLeave ? ESide::Client : ESide::Host;
+	}
+
+	// One step of the host alone (the world's truth: building, inventories), or of both games; the steps after it are the acting player's again
+	void AddHost(FRun& R, FStepFn Fn)
+	{
+		Mark(R, ESide::Host);
+		R.Steps.Add(MoveTemp(Fn));
+		Mark(R, ActSide(R));
+	}
+
+	void AddBoth(FRun& R, FStepFn Fn)
+	{
+		Mark(R, ESide::Each);
+		R.Steps.Add(MoveTemp(Fn));
+		Mark(R, ActSide(R));
+	}
+
+	// A step of checks alone (no side effects, always Next). The client's game sees the world through replication, which takes a moment:
+	// there the checks are tried without counting until none fails, at most 15 s, and then count as they are
+	FStepFn Eventually(FStepFn Fn)
+	{
+		return [Fn = MoveTemp(Fn), Since = MakeShared<double>(0.0)](FRun& Self)
+		{
+			if (!Self.bClient)
+			{
+				return Fn(Self);
+			}
+			*Since = *Since > 0.0 ? *Since : Self.Now();
+			Self.bDry = true;
+			Self.DryFails = 0;
+			Fn(Self);
+			Self.bDry = false;
+			if (Self.DryFails > 0 && Self.Now() - *Since < 15.0)
+			{
+				return EStep::Wait;
+			}
+			Self.Step(FString::Printf(TEXT("replication waited for %.1f s"), Self.Now() - *Since));
+			*Since = 0.0;
+			return Fn(Self);
+		};
+	}
+
+	// The checks after an action, in both games: each checks what it knows (Self.Acts(): the result's message; !Self.bClient: inventories)
+	void AddChecks(FRun& R, FStepFn Fn)
+	{
+		AddBoth(R, Eventually(MoveTemp(Fn)));
 	}
 
 	// Two games: the host puts the acting player at the test place and the other one 40 m behind it (the scenes lie ahead, along +X),
@@ -921,10 +1006,31 @@ namespace
 		}
 	}
 
-	AFGBuildable* SpawnBuildable(const FRun& R, const TCHAR* Path, const FVector& At)
+	AFGBuildable* FindActor(UWorld* World, UClass* Class, const FVector& At, double Within = 1.0);
+	int32 LightweightCount(UWorld* World);
+	int32 ActorCount(UWorld* World);
+
+	// Client: the world is the host's. A scene's Build runs in the client's game as well, and there every spawn is a search for the
+	// building the host made at that place (5 cm: a replicated place is rounded); one not found counts in Missing
+	template <typename T>
+	T* FoundOnClient(FRun& R, T* Found, const TCHAR* What, const FVector& At)
+	{
+		if (!Found)
+		{
+			++R.Missing;
+			R.Step(FString::Printf(TEXT("not replicated here: %s at %s"), What, *At.ToCompactString()));
+		}
+		return Found;
+	}
+
+	AFGBuildable* SpawnBuildable(FRun& R, const TCHAR* Path, const FVector& At)
 	{
 		UClass* Class = LoadClass<AFGBuildable>(nullptr, Path);
 		AFGBuildableSubsystem* Buildables = AFGBuildableSubsystem::Get(R.GetWorld());
+		if (R.bClient)
+		{
+			return FoundOnClient(R, FindActor(R.GetWorld(), Class, At, 5.0), Path, At);
+		}
 		if (!Class || !Buildables)
 		{
 			return nullptr;
@@ -939,11 +1045,11 @@ namespace
 	}
 
 	// A machine with a recipe and its first ingredient in the input and first product in the output
-	AFGBuildableManufacturer* SpawnMachine(const FRun& R, const TCHAR* Path, const FVector& At, const TCHAR* RecipePath, int32 InItems, int32 OutItems)
+	AFGBuildableManufacturer* SpawnMachine(FRun& R, const TCHAR* Path, const FVector& At, const TCHAR* RecipePath, int32 InItems, int32 OutItems)
 	{
 		AFGBuildableManufacturer* Machine = Cast<AFGBuildableManufacturer>(SpawnBuildable(R, Path, At));
 		const TSubclassOf<UFGRecipe> With = Recipe(RecipePath);
-		if (!Machine || !With)
+		if (!Machine || !With || R.bClient)
 		{
 			return Machine;
 		}
@@ -969,7 +1075,7 @@ namespace
 	void MakeAvailable(const FRun& R, const TCHAR* Path)
 	{
 		AFGRecipeManager* Recipes = AFGRecipeManager::Get(R.GetWorld());
-		if (Recipes && !Recipes->IsRecipeAvailable(Recipe(Path)))
+		if (!R.bClient && Recipes && !Recipes->IsRecipeAvailable(Recipe(Path)))
 		{
 			Recipes->AddAvailableRecipe(Recipe(Path));
 			R.Step(FString::Printf(TEXT("recipe made available: %s"), Path));
@@ -1291,7 +1397,10 @@ namespace
 			{
 				return EStep::Wait;
 			}
-			Self.Step(FString::Printf(TEXT("recipe window laid out: %s after %.2f s"), bLaidOut ? TEXT("yes") : TEXT("no"), Self.Now() - *Since));
+			// A minimized game window is not laid out at all: said here, so such a run is told apart
+			const TSharedPtr<SWindow> GameWindow = GEngine && GEngine->GameViewport ? GEngine->GameViewport->GetWindow() : nullptr;
+			Self.Step(FString::Printf(TEXT("recipe window laid out: %s after %.2f s (game window minimized %d, visible %d)"), bLaidOut ? TEXT("yes") : TEXT("no"), Self.Now() - *Since,
+				GameWindow.IsValid() && GameWindow->IsWindowMinimized(), GameWindow.IsValid() && GameWindow->IsVisible()));
 			*Since = 0.0;
 			return EStep::Next;
 		});
@@ -1334,11 +1443,67 @@ namespace
 		});
 	}
 
+	// A crate with items standing at a place; the client finds the host's crate there (it settles on the ground: 5 m)
+	AFGCrate* SpawnCrate(FRun& R, const TArray<FInventoryStack>& Stacks, const FVector& At)
+	{
+		if (R.bClient)
+		{
+			AFGCrate* Nearest = nullptr;
+			for (TActorIterator<AFGCrate> It(R.GetWorld()); It; ++It)
+			{
+				if (IsValid(*It) && FVector::Dist(It->GetActorLocation(), At) < (Nearest ? FVector::Dist(Nearest->GetActorLocation(), At) : 500.0))
+				{
+					Nearest = *It;
+				}
+			}
+			return FoundOnClient(R, Nearest, TEXT("crate"), At);
+		}
+		FSpawnInventoryCrateParameters Parameters;
+		Parameters.bAllowCrateMerging = false;
+		return AFGItemPickup_Spawnable::SpawnInventoryCrate(R.GetWorld(), Stacks, At, Parameters);
+	}
+
+	// Client: waits until the host's scene has arrived: the numbers of buildings and crates here stand still for 2 s after they changed
+	// (5 s when they never change), at most 20 s
+	FStepFn WaitReplicated()
+	{
+		struct FState { double Start = 0.0, Changed = 0.0; int32 Last = -1; bool bMoved = false; };
+		return [State = MakeShared<FState>()](FRun& Self)
+		{
+			int32 Count = ActorCount(Self.GetWorld()) + LightweightCount(Self.GetWorld());
+			for (TActorIterator<AFGCrate> It(Self.GetWorld()); It; ++It)
+			{
+				++Count;
+			}
+			if (!Self.bClient)
+			{
+				return EStep::Next;
+			}
+			const double Now = Self.Now();
+			if (State->Start == 0.0)
+			{
+				*State = FState{ Now, Now, Count, false };
+			}
+			if (Count != State->Last)
+			{
+				*State = FState{ State->Start, Now, Count, true };
+			}
+			if (Now - State->Changed < (State->bMoved ? 2.0 : 5.0) && Now - State->Start < 20.0)
+			{
+				return EStep::Wait;
+			}
+			Self.Step(FString::Printf(TEXT("the host's scene arrived: %d buildings and crates here after %.1f s"), Count, Now - State->Start));
+			State->Start = 0.0;
+			return EStep::Next;
+		};
+	}
+
 	// Scene step: what Build puts in the area, then the tool's area, the crates before, the results listener
 	void AddScene(FRun& R, const FSceneRef& S, double HalfSize, TFunction<void(FRun&, FScene&)> Build, double Side = 0.0)
 	{
 		AddEquipTool(R);
-		// Two games: both know where the scene is, the host builds it, the acting player's game sets the tool
+		// Two games: both know where the scene is, the host builds it, the client finds the host's buildings in its own world (the same
+		// Build, see SpawnBuildable), the acting player's game sets the tool
 		Mark(R, ESide::Each);
 		R.Steps.Add([S, HalfSize, Side](FRun& Self)
 		{
@@ -1353,6 +1518,25 @@ namespace
 				FString::Printf(TEXT("scene: %d in the area, %d controls"), S->Inside.Num(), S->Controls.Num()));
 			SnapshotCrates(Self, *S);
 			S->RejectsBefore = UAreaActionsRCO::RejectCount;
+			return EStep::Next;
+		});
+		Mark(R, ESide::Client);
+		R.Steps.Add(WaitReplicated());
+		R.Steps.Add([S, Build](FRun& Self)
+		{
+			if (!Self.bClient)
+			{
+				// One game alone runs every step
+				return EStep::Next;
+			}
+			// The checks inside Build are the host's
+			Self.Missing = 0;
+			Self.bDry = true;
+			Build(Self, *S);
+			Self.bDry = false;
+			Self.Check(Self.Missing == 0 && S->Inside.Num() > 0 && AllValid(S->Inside) && S->Controls.Num() == 3 && AllValid(S->Controls),
+				FString::Printf(TEXT("the host's scene here: %d in the area, %d controls, %d not replicated"), S->Inside.Num(), S->Controls.Num(), Self.Missing));
+			SnapshotCrates(Self, *S);
 			return EStep::Next;
 		});
 		Mark(R, ActSide(R));
@@ -1376,12 +1560,13 @@ namespace
 		for (int32 Index = 0; Index < S.Controls.Num(); ++Index)
 		{
 			const AFGBuildableManufacturer* Control = Cast<AFGBuildableManufacturer>(S.Controls[Index].Get());
-			R.Check(Control && Control->GetCurrentRecipe() == Recipe(RecipePath) && MachineItems(Control) == Items,
-				FString::Printf(TEXT("control %d: recipe %s, items %d"), Index, Control ? *GetNameSafe(Control->GetCurrentRecipe()) : TEXT("-"), MachineItems(Control)));
+			// The client's game sees the recipe; what an inventory holds is the host's to check
+			R.Check(Control && Control->GetCurrentRecipe() == Recipe(RecipePath) && (R.bClient || MachineItems(Control) == Items),
+				FString::Printf(TEXT("control %d: recipe %s, items %d"), Index, Control ? *GetNameSafe(Control->GetCurrentRecipe()) : TEXT("-"), R.bClient ? -1 : MachineItems(Control)));
 		}
 	}
 
-	void AddControlMachines(const FRun& R, FScene& S, const TCHAR* RecipePath, int32 In, int32 Out)
+	void AddControlMachines(FRun& R, FScene& S, const TCHAR* RecipePath, int32 In, int32 Out)
 	{
 		for (const FVector& Place : S.ControlPlaces())
 		{
@@ -1407,25 +1592,36 @@ namespace
 		AddOpenAction(R, TEXT("SetRecipe"));
 		AddPickRecipe(R, Asset::IronRod);
 		AddResultWindow(R, S);
-		R.Steps.Add([S](FRun& Self)
+		AddChecks(R, [S](FRun& Self)
 		{
-			Self.Check(S->Message.Contains(TEXT("3 Constructor")), FString::Printf(TEXT("result names 3 Constructors: '%s'"), *S->Message));
+			if (Self.Acts())
+			{
+				Self.Check(S->Message.Contains(TEXT("3 Constructor")), FString::Printf(TEXT("result names 3 Constructors: '%s'"), *S->Message));
+			}
 			for (int32 Index = 0; Index < 3; ++Index)
 			{
 				const AFGBuildableManufacturer* Constructor = Machine(*S, Index);
-				Self.Check(Constructor && Constructor->GetCurrentRecipe() == Recipe(Asset::IronRod) && MachineItems(Constructor) == 0,
-					FString::Printf(TEXT("Constructor %d: recipe %s, items %d"), Index, Constructor ? *GetNameSafe(Constructor->GetCurrentRecipe()) : TEXT("-"), MachineItems(Constructor)));
+				Self.Check(Constructor && Constructor->GetCurrentRecipe() == Recipe(Asset::IronRod) && (Self.bClient || MachineItems(Constructor) == 0),
+					FString::Printf(TEXT("Constructor %d: recipe %s, items %d"), Index, Constructor ? *GetNameSafe(Constructor->GetCurrentRecipe()) : TEXT("-"),
+						Self.bClient ? -1 : MachineItems(Constructor)));
 			}
 			const AFGBuildableManufacturer* Assembler = Machine(*S, 3);
 			Self.Check(Assembler && Assembler->GetCurrentRecipe() == Recipe(Asset::ReinforcedPlate), TEXT("Assembler keeps its recipe"));
 			CheckControlMachines(Self, *S, Asset::IronPlate, 6);
 			// D8: one crate with exactly the machines' items, sorted (AA-093)
 			const TArray<AFGCrate*> Crates = NewCrates(Self, *S);
-			const FCratesSeen Seen = SeeCrates(Crates, Self.GetPlayer()->GetPawn()->GetActorLocation());
-			const int32 Ingots = Seen.Items.FindRef(Item(Asset::IronIngotItem));
-			const int32 Plates = Seen.Items.FindRef(Item(Asset::IronPlateItem));
-			Self.Check(Crates.Num() == 1 && Seen.bOneTypeEach && Ingots == 37 && Plates == 9 && Seen.All == 46,
-				FString::Printf(TEXT("new crates %d (%s); ingots %d of 37, plates %d of 9, all %d of 46"), Crates.Num(), *Seen.Text(), Ingots, Plates, Seen.All));
+			const FCratesSeen Seen = SeeCrates(Crates, Self.ActingPlace());
+			if (Self.bClient)
+			{
+				Self.Check(Crates.Num() == 1, FString::Printf(TEXT("new crates here %d (want 1)"), Crates.Num()));
+			}
+			else
+			{
+				const int32 Ingots = Seen.Items.FindRef(Item(Asset::IronIngotItem));
+				const int32 Plates = Seen.Items.FindRef(Item(Asset::IronPlateItem));
+				Self.Check(Crates.Num() == 1 && Seen.bOneTypeEach && Ingots == 37 && Plates == 9 && Seen.All == 46,
+					FString::Printf(TEXT("new crates %d (%s); ingots %d of 37, plates %d of 9, all %d of 46"), Crates.Num(), *Seen.Text(), Ingots, Plates, Seen.All));
+			}
 			Self.Check(!Crates.IsEmpty() && Seen.Far < 1500.0, FString::Printf(TEXT("crates next to the player: %.0f cm"), Seen.Far));
 			return EStep::Next;
 		});
@@ -1469,10 +1665,10 @@ namespace
 		return Storage ? const_cast<AFGBuildableStorage*>(Storage)->GetStorageInventory()->GetNumItems(nullptr) : -1;
 	}
 
-	AFGBuildableStorage* SpawnStorage(const FRun& R, const FVector& At, int32 Plates, int32 Ingots)
+	AFGBuildableStorage* SpawnStorage(FRun& R, const FVector& At, int32 Plates, int32 Ingots)
 	{
 		AFGBuildableStorage* Storage = Cast<AFGBuildableStorage>(SpawnBuildable(R, Asset::Storage, At));
-		if (Storage)
+		if (Storage && !R.bClient)
 		{
 			if (Plates > 0) Storage->GetStorageInventory()->AddStack(FInventoryStack(Plates, Item(Asset::IronPlateItem)), true);
 			if (Ingots > 0) Storage->GetStorageInventory()->AddStack(FInventoryStack(Ingots, Item(Asset::IronIngotItem)), true);
@@ -1492,7 +1688,7 @@ namespace
 			AFGBuildableManufacturer* Constructor = SpawnMachine(Self, Asset::Constructor, Scene.Slot(2), Asset::IronPlate, 0, 5);
 			Scene.Inside.Add(Constructor);
 			// AA-079: 2 m3 of water in the input (past its filters) is reported apart; an empty container and an empty splitter do not count
-			UFGInventoryComponent* Input = Constructor ? Constructor->GetInputInventory() : nullptr;
+			UFGInventoryComponent* Input = Constructor && !Self.bClient ? Constructor->GetInputInventory() : nullptr;
 			int32 Water = 0;
 			if (Input && Input->GetSizeLinear() > 0)
 			{
@@ -1513,7 +1709,7 @@ namespace
 			Scene.Inside.Add(SpawnBuildable(Self, Asset::Splitter, Scene.Slot(4)));
 			// D11: a power shard in the machine's upgrade slot stays
 			// The slot filter refuses shards until research unlocks the slots, which a new game lacks
-			UFGInventoryComponent* Upgrades = Constructor ? Constructor->GetPotentialInventory() : nullptr;
+			UFGInventoryComponent* Upgrades = Constructor && !Self.bClient ? Constructor->GetPotentialInventory() : nullptr;
 			int32 Shards = 0;
 			if (Upgrades && Upgrades->GetSizeLinear() > 0)
 			{
@@ -1523,9 +1719,7 @@ namespace
 				Upgrades->mItemFilter = Filter;
 			}
 			Self.Check(Shards == 1, FString::Printf(TEXT("power shard in the Constructor's upgrade slot: %d (slots %d)"), Shards, Upgrades ? Upgrades->GetSizeLinear() : -1));
-			FSpawnInventoryCrateParameters Parameters;
-			Parameters.bAllowCrateMerging = false;
-			*Crate = AFGItemPickup_Spawnable::SpawnInventoryCrate(Self.GetWorld(), { FInventoryStack(25, Item(Asset::IronRodItem)) }, Scene.Slot(5), Parameters);
+			*Crate = SpawnCrate(Self, { FInventoryStack(25, Item(Asset::IronRodItem)) }, Scene.Slot(5));
 			Self.Check(Crate->IsValid() && Scene.Area.Contains((*Crate)->GetActorLocation()),
 				FString::Printf(TEXT("crate in the area at %s"), Crate->IsValid() ? *(*Crate)->GetActorLocation().ToCompactString() : TEXT("-")));
 			for (const FVector& Place : Scene.ControlPlaces())
@@ -1537,11 +1731,22 @@ namespace
 		AddOpenAction(R, TEXT("ClearInventories"));
 		AddPress(R, TEXT("Widget_MessageYesNo"), bToCrate ? TEXT("NoButton") : TEXT("YesButton"));
 		AddResultWindow(R, S);
-		R.Steps.Add([S, Crate, bToCrate](FRun& Self)
+		AddChecks(R, [S, Crate, bToCrate](FRun& Self)
 		{
-			const FString Want = FString::Printf(TEXT("Cleared 4 buildings %s a total of %d items"), bToCrate ? TEXT("taking") : TEXT("deleting"), S->Expected);
-			Self.Check(S->Message.Contains(Want), FString::Printf(TEXT("result '%s' has '%s'"), *S->Message, *Want));
-			Self.Check(S->Message.Contains(TEXT("2 m³ of fluids were deleted")), FString::Printf(TEXT("result '%s' names 2 m³ of fluids"), *S->Message));
+			if (Self.Acts())
+			{
+				const FString Want = FString::Printf(TEXT("Cleared 4 buildings %s a total of %d items"), bToCrate ? TEXT("taking") : TEXT("deleting"), S->Expected);
+				Self.Check(S->Message.Contains(Want), FString::Printf(TEXT("result '%s' has '%s'"), *S->Message, *Want));
+				Self.Check(S->Message.Contains(TEXT("2 m³ of fluids were deleted")), FString::Printf(TEXT("result '%s' names 2 m³ of fluids"), *S->Message));
+			}
+			const TArray<AFGCrate*> Crates = NewCrates(Self, *S);
+			if (Self.bClient)
+			{
+				// What the inventories hold is the host's to check; the client's game sees the buildings and the crates
+				Self.Check(AllValid(S->Inside) && AllValid(S->Controls) && Crates.Num() == (bToCrate ? 1 : 0),
+					FString::Printf(TEXT("here: buildings and controls stand, new crates %d (want %d)"), Crates.Num(), bToCrate ? 1 : 0));
+				return EStep::Next;
+			}
 			Self.Check(StorageItems(S->Inside[0].Get()) == 0 && StorageItems(S->Inside[1].Get()) == 0,
 				FString::Printf(TEXT("containers empty: %d, %d"), StorageItems(S->Inside[0].Get()), StorageItems(S->Inside[1].Get())));
 			const AFGBuildableManufacturer* Constructor = Machine(*S, 2);
@@ -1554,14 +1759,13 @@ namespace
 			{
 				Self.Check(StorageItems(S->Controls[Index].Get()) == 15, FString::Printf(TEXT("control container %d: %d items"), Index, StorageItems(S->Controls[Index].Get())));
 			}
-			const TArray<AFGCrate*> Crates = NewCrates(Self, *S);
 			if (!bToCrate)
 			{
 				Self.Check(Crates.IsEmpty(), FString::Printf(TEXT("no new crate: %d"), Crates.Num()));
 				return EStep::Next;
 			}
 			// Plates 50 + 20 + 5, ingots 30, rods 25: every solid item of the area, no water, nothing more; one crate, sorted (AA-093)
-			const FCratesSeen Seen = SeeCrates(Crates, Self.GetPlayer()->GetPawn()->GetActorLocation());
+			const FCratesSeen Seen = SeeCrates(Crates, Self.ActingPlace());
 			const int32 Plates = Seen.Items.FindRef(Item(Asset::IronPlateItem));
 			const int32 Ingots = Seen.Items.FindRef(Item(Asset::IronIngotItem));
 			const int32 Rods = Seen.Items.FindRef(Item(Asset::IronRodItem));
@@ -1595,12 +1799,12 @@ namespace
 		}
 	}
 
-	void AddControlStations(const FRun& R, FScene& S)
+	void AddControlStations(FRun& R, FScene& S)
 	{
 		for (const FVector& Place : S.ControlPlaces())
 		{
 			AFGBuildable* Station = SpawnBuildable(R, Asset::TruckStation, Place);
-			SetLoadMode(Station, false);
+			SetLoadMode(R.bClient ? nullptr : Station, false);
 			S.Controls.Add(Station);
 		}
 	}
@@ -1620,11 +1824,14 @@ namespace
 		AddOpenAction(R, TEXT("SetStationLoadUnload"));
 		AddPress(R, TEXT("Widget_MessageYesNo"), bLoad ? TEXT("YesButton") : TEXT("NoButton"));
 		AddResultWindow(R, S);
-		R.Steps.Add([S, bLoad](FRun& Self)
+		AddChecks(R, [S, bLoad](FRun& Self)
 		{
 			// AA-081: one space after the comma
 			const FString Want = FString::Printf(TEXT("Set 1 Truck Stations, 1 Freight Platforms to %s"), bLoad ? TEXT("Load") : TEXT("Unload"));
-			Self.Check(S->Message.Equals(Want), FString::Printf(TEXT("result '%s' is '%s'"), *S->Message, *Want));
+			if (Self.Acts())
+			{
+				Self.Check(S->Message.Equals(Want), FString::Printf(TEXT("result '%s' is '%s'"), *S->Message, *Want));
+			}
 			for (int32 Index = 0; Index < S->Inside.Num(); ++Index)
 			{
 				const AFGBuildable* Station = S->Inside[Index].Get();
@@ -1635,7 +1842,7 @@ namespace
 		});
 	}
 
-	void AddSetStation(FRun& R)
+	void AddSetStation(FRun& R, double Side = 0.0)
 	{
 		FSceneRef S = MakeShared<FScene>();
 		AddScene(R, S, 4000.0, [](FRun& Self, FScene& Scene)
@@ -1644,10 +1851,10 @@ namespace
 			Scene.Inside.Add(SpawnBuildable(Self, Asset::FreightPlatform, Scene.Slot(6)));
 			for (const TWeakObjectPtr<AFGBuildable>& Station : Scene.Inside)
 			{
-				SetLoadMode(Station.Get(), true);
+				SetLoadMode(Self.bClient ? nullptr : Station.Get(), true);
 			}
 			AddControlStations(Self, Scene);
-		});
+		}, Side);
 		AddStationPass(R, S, false);
 		AddStationPass(R, S, true);
 	}
@@ -1729,8 +1936,8 @@ namespace
 			Rco->ServerSetRecipe(103, S->Area, AActor::StaticClass());
 			return EStep::Next;
 		});
-		// No tool in hand: the tool's item leaves the arms slot
-		R.Steps.Add([S](FRun& Self)
+		// No tool in hand: the tool's item leaves the arms slot (the inventory is the server's)
+		AddHost(R, [S](FRun& Self)
 		{
 			UFGInventoryComponentEquipment* Arms = GetCharacter(Self)->GetEquipmentSlot(EEquipmentSlot::ES_ARMS);
 			S->ArmsIndex = Arms->GetActiveIndex();
@@ -1747,7 +1954,7 @@ namespace
 			UAreaActionsRCO::Of(Self.GetPlayer())->ServerClearInventories(104, S->Area, false);
 			return EStep::Next;
 		});
-		R.Steps.Add([S](FRun& Self)
+		AddHost(R, [S](FRun& Self)
 		{
 			UFGInventoryComponentEquipment* Arms = GetCharacter(Self)->GetEquipmentSlot(EEquipmentSlot::ES_ARMS);
 			Arms->AddStackToIndex(S->ArmsIndex, FInventoryStack(1, LoadClass<UFGItemDescriptor>(nullptr, ToolItem)));
@@ -1781,10 +1988,18 @@ namespace
 			}
 			Self.Check(Code(105) == static_cast<int32>(EAreaActionsResultCode::NothingInArea), FString::Printf(TEXT("request 105 runs: code %d"), Code(105)));
 			Self.Check(Code(106) == static_cast<int32>(EAreaActionsResultCode::Busy), FString::Printf(TEXT("request 106: code %d (Busy)"), Code(106)));
-			const int32 Rejects = UAreaActionsRCO::RejectCount - S->RejectsBefore;
-			Self.Check(Rejects == 5, FString::Printf(TEXT("reject lines: %d of 5"), Rejects));
+			return EStep::Next;
+		});
+		AddChecks(R, [S](FRun& Self)
+		{
+			if (!Self.bClient)
+			{
+				// The reject lines are in the server's log
+				const int32 Rejects = UAreaActionsRCO::RejectCount - S->RejectsBefore;
+				Self.Check(Rejects == 5, FString::Printf(TEXT("reject lines: %d of 5"), Rejects));
+			}
 			const AFGBuildableManufacturer* Constructor = Machine(*S, 0);
-			Self.Check(Constructor && Constructor->GetCurrentRecipe() == Recipe(Asset::IronPlate) && MachineItems(Constructor) == 10, TEXT("Constructor in the area unchanged"));
+			Self.Check(Constructor && Constructor->GetCurrentRecipe() == Recipe(Asset::IronPlate) && (Self.bClient || MachineItems(Constructor) == 10), TEXT("Constructor in the area unchanged"));
 			CheckControlMachines(Self, *S, Asset::IronPlate, 6);
 			Self.Check(NewCrates(Self, *S).IsEmpty(), TEXT("no new crate"));
 			return EStep::Next;
@@ -1911,7 +2126,7 @@ namespace
 		return nullptr;
 	}
 
-	AFGBuildable* FindActor(UWorld* World, UClass* Class, const FVector& At)
+	AFGBuildable* FindActor(UWorld* World, UClass* Class, const FVector& At, double Within)
 	{
 		AFGBuildableSubsystem* Buildables = AFGBuildableSubsystem::Get(World);
 		if (!Buildables)
@@ -1920,7 +2135,7 @@ namespace
 		}
 		for (AFGBuildable* Actor : Buildables->GetAllBuildablesRef())
 		{
-			if (IsValid(Actor) && Actor->GetClass() == Class && FVector::Dist(Actor->GetActorLocation(), At) <= 1.0)
+			if (IsValid(Actor) && Actor->GetClass() == Class && FVector::Dist(Actor->GetActorLocation(), At) <= Within)
 			{
 				return Actor;
 			}
@@ -2101,6 +2316,8 @@ namespace
 		TWeakObjectPtr<AFGBuildableStorage> NearBox, FarBox;
 		FVector Base = FVector::ZeroVector;
 		int32 JobsBefore = 0;
+		// Two games: the items of the player who does not act (AA-040 point 3: the cost is the acting player's)
+		int32 OtherItems = -1;
 	};
 	using FCopyRef = TSharedRef<FCopyState>;
 
@@ -2143,11 +2360,18 @@ namespace
 		return GroundBelow(R.GetWorld(), At, Hit) ? Hit + FVector(0, 0, 50) : At;
 	}
 
-	void AddLightweight(const FRun& R, FCopyState& C, const TCHAR* ClassName, const TCHAR* RecipeName, const FTransform& Transform, float Length = -1.0f)
+	void AddLightweight(FRun& R, FCopyState& C, const TCHAR* ClassName, const TCHAR* RecipeName, const FTransform& Transform, float Length = -1.0f)
 	{
 		AreaActionsBuildings::FSnapshot Building;
 		Building.Class = GameClass(ClassName);
 		Building.BuiltWith = RecipeOfClass(R, Building.Class, RecipeName);
+		if (R.bClient)
+		{
+			// The host built it (see SpawnBuildable)
+			FoundOnClient(R, FindLightweight(R.GetWorld(), Building.Class, Transform.GetLocation()), ClassName, Transform.GetLocation());
+			C.Pattern.Add(MakePiece(Building.Class, Transform, true, Length, Building.BuiltWith));
+			return;
+		}
 		if (Length > 0.0f)
 		{
 			FBuildableBeamLightweightData Data;
@@ -2166,6 +2390,16 @@ namespace
 	{
 		UClass* Class = GameClass(ClassName);
 		AFGBuildableSubsystem* Buildables = AFGBuildableSubsystem::Get(R.GetWorld());
+		if (R.bClient)
+		{
+			// The host built it (see SpawnBuildable); nullptr for the caller, so nothing is set on it here
+			if (AFGBuildable* Found = FoundOnClient(R, FindActor(R.GetWorld(), Class, Transform.GetLocation(), 5.0), ClassName, Transform.GetLocation()))
+			{
+				S.Inside.Add(Found);
+			}
+			C.Pattern.Add(MakePiece(Class, Transform, false, -1.0f, RecipeOfClass(R, Class, RecipeName)));
+			return nullptr;
+		}
 		AFGBuildable* Actor = Class && Buildables ? Buildables->BeginSpawnBuildable(Class, Transform) : nullptr;
 		if (!Actor)
 		{
@@ -2373,7 +2607,7 @@ namespace
 		});
 	}
 
-	void AddFillWindow(FRun& R, const FVector& BorderMetres, const FIntVector& Amount, const FVector2D& RampMetres, bool bUseCost)
+	void AddFillWindow(FRun& R, const FVector& BorderMetres, const FIntVector& Amount, const FVector2D& RampMetres, bool bUseCost, const TCHAR* Button = TEXT("OkButton"))
 	{
 		AddOnWindow(R, TEXT("Widget_Fill"), [=](FRun& Self, UUserWidget* Window)
 		{
@@ -2386,7 +2620,7 @@ namespace
 			SetBox(Window, TEXT("XRamp"), RampMetres.X);
 			SetBox(Window, TEXT("YRamp"), RampMetres.Y);
 			SetCost(Window, bUseCost);
-			Self.Check(PressButton(Window, TEXT("OkButton")), FString::Printf(TEXT("Fill: OK with gap %s m, amount %s, ramp %s m, cost %d"), *BorderMetres.ToCompactString(), *Amount.ToString(),
+			Self.Check(PressButton(Window, Button), FString::Printf(TEXT("Fill: %s with gap %s m, amount %s, ramp %s m, cost %d"), Button, *BorderMetres.ToCompactString(), *Amount.ToString(),
 				*RampMetres.ToString(), bUseCost));
 		});
 	}
@@ -2468,6 +2702,14 @@ namespace
 		return Box.IsValid() ? Box->GetStorageInventory()->GetNumItems(ItemClass) : 0;
 	}
 
+	// Host of two games: all items of the player who does not act; -1 with one game
+	int32 OtherItems(const FRun& R)
+	{
+		const APlayerController* Other = R.bMp && !R.bClient ? (R.bPeerActs ? R.GetLocalPlayer() : R.Peer.Get()) : nullptr;
+		AFGCharacterPlayer* Character = Other ? Cast<AFGCharacterPlayer>(Other->GetPawn()) : nullptr;
+		return Character ? Character->GetInventory()->GetNumItems(nullptr) : -1;
+	}
+
 	// The cost's sources, per item: Own in the player's inventory (their own items of the kind go first), Near in a container 15 m behind
 	// the player, Far in one 600 m away, Depot in the depot; each a function of the item's cost
 	void SetCostSources(FRun& R, FCopyState& C, TFunction<int32(int32)> Own, TFunction<int32(int32)> Near, TFunction<int32(int32)> Far, TFunction<int32(int32)> Depot)
@@ -2507,6 +2749,7 @@ namespace
 			C.Far.Add(Entry.Key, StorageCount(C.FarBox, Entry.Key));
 			C.Depot.Add(Entry.Key, DepotCount(World, Entry.Key));
 		}
+		C.OtherItems = OtherItems(R);
 		// The containers are buildings too
 		CountWorld(R, C);
 		R.Step(FString::Printf(TEXT("cost %s; inventory %s; near %s; far %s; depot %s"), *ItemsText(C.Cost), *ItemsText(C.Inventory), *ItemsText(C.Near), *ItemsText(C.Far), *ItemsText(C.Depot)));
@@ -2534,6 +2777,10 @@ namespace
 				FString::Printf(TEXT("%s: %s inventory %d (want %d), near %d (want %d), far %d (want %d), depot %d (want %d)"), When, *GetNameSafe(Entry.Key), Own, WantOwn,
 					Near, WantNear, Far, C.Far.FindRef(Entry.Key), Depot, WantDepot));
 		}
+		if (R.bMp)
+		{
+			R.Check(OtherItems(R) == C.OtherItems, FString::Printf(TEXT("%s: the other player's inventory %d items (were %d)"), When, OtherItems(R), C.OtherItems));
+		}
 	}
 
 	void CheckNothingBuilt(FRun& R, const FCopyState& C, const TCHAR* When)
@@ -2552,7 +2799,7 @@ namespace
 			C->Pivot = PlacesCenter(*C);
 			Self.Step(FString::Printf(TEXT("pattern: %d pieces at %s, places centre %s"), C->Pattern.Num(), *C->Base.ToCompactString(), *C->Pivot.ToCompactString()));
 		});
-		R.Steps.Add([C](FRun& Self)
+		AddBoth(R, [C](FRun& Self)
 		{
 			CountWorld(Self, *C);
 			C->JobsBefore = AAreaActionsServerSubsystem::FinishedJobs;
@@ -2563,7 +2810,7 @@ namespace
 	// One Copy through the window and its result window
 	void AddCopy(FRun& R, const FSceneRef& S, const FCopyRef& C, const FVector& DeltaMetres, double Yaw, bool bUseCost)
 	{
-		R.Steps.Add([C, DeltaMetres, Yaw](FRun& Self)
+		AddBoth(R, [C, DeltaMetres, Yaw](FRun& Self)
 		{
 			C->Delta = DeltaMetres * 100.0;
 			C->Yaw = Yaw;
@@ -2581,11 +2828,14 @@ namespace
 		AddCopyScene(R, S, C, BuildBasic);
 		AddCopy(R, S, C, FVector(20, 0, 0), 0.0, false);
 		AddCheckMessage(R, S, TEXT("Copied 9 buildings."));
-		R.Steps.Add([S, C](FRun& Self)
+		AddChecks(R, [S, C](FRun& Self)
 		{
 			CheckCopies(Self, *C, true, TEXT("copied"));
 			CheckPattern(Self, *S, *C, TEXT("copied"));
-			Self.Check(AAreaActionsServerSubsystem::FinishedJobs - C->JobsBefore == 1, TEXT("one AAJOB line"));
+			if (!Self.bClient)
+			{
+				Self.Check(AAreaActionsServerSubsystem::FinishedJobs - C->JobsBefore == 1, TEXT("one AAJOB line"));
+			}
 			return EStep::Next;
 		});
 	}
@@ -2686,12 +2936,15 @@ namespace
 		FSceneRef S = MakeShared<FScene>();
 		FCopyRef C = MakeShared<FCopyState>();
 		AddCopyScene(R, S, C, BuildBasic);
-		R.Steps.Add([C](FRun& Self) { SetCostSources(Self, *C, CostOne, CostAllButOne, CostAll, CostNone); return EStep::Next; });
+		AddHost(R, [C](FRun& Self) { SetCostSources(Self, *C, CostOne, CostAllButOne, CostAll, CostNone); return EStep::Next; });
 		AddCopy(R, S, C, FVector(20, 0, 0), 0.0, true);
 		AddCheckMessage(R, S, TEXT("Copied 9 buildings."));
-		R.Steps.Add([C](FRun& Self)
+		AddChecks(R, [C](FRun& Self)
 		{
-			CheckSources(Self, *C, CostOne, CostAllButOne, CostNone, TEXT("paid"));
+			if (!Self.bClient)
+			{
+				CheckSources(Self, *C, CostOne, CostAllButOne, CostNone, TEXT("paid"));
+			}
 			CheckCopies(Self, *C, true, TEXT("paid"));
 			return EStep::Next;
 		});
@@ -2827,7 +3080,7 @@ namespace
 		AddFillWindow(R, FVector(1, 1, 0), bNegative ? FIntVector(-3, -2, 1) : FIntVector(3, 2, 1), FVector2D(Ramp, 0), false);
 		AddResultWindow(R, S);
 		AddCheckMessage(R, S, TEXT("Filled with 5 buildings."));
-		R.Steps.Add([C, bNegative, Ramp](FRun& Self)
+		AddChecks(R, [C, bNegative, Ramp](FRun& Self)
 		{
 			TArray<FIntPoint> Steps;
 			for (int32 X = 0; X < 3; ++X)
@@ -2859,7 +3112,7 @@ namespace
 
 	void AddCopyPreview(FRun& R, const FCopyRef& C)
 	{
-		R.Steps.Add([C](FRun& Self) { C->Delta = FVector(2000, 0, 0); C->Yaw = 0.0; return EStep::Next; });
+		AddBoth(R, [C](FRun& Self) { C->Delta = FVector(2000, 0, 0); C->Yaw = 0.0; return EStep::Next; });
 		AddOpenAction(R, TEXT("Copy"));
 		AddCopyWindow(R, FVector(20, 0, 0), 0.0, false, TEXT("PreviewButton"));
 		R.Steps.Add(WaitFrames(5));
@@ -3745,9 +3998,7 @@ namespace
 		const bool bWired = Pole && Wire && MachinePlug && Pole->GetPowerConnections().Num() > 0 && Wire->Connect(Pole->GetPowerConnection(0), MachinePlug);
 		R.Check(bWired, FString::Printf(TEXT("wire from the pole to the Constructor: pole %d, wire %d, plug %d, length %.0f"), Pole != nullptr, Wire != nullptr,
 			MachinePlug != nullptr, Wire ? Wire->GetLength() : -1.0f));
-		FSpawnInventoryCrateParameters Parameters;
-		Parameters.bAllowCrateMerging = false;
-		D.AreaCrate = AFGItemPickup_Spawnable::SpawnInventoryCrate(R.GetWorld(), { FInventoryStack(25, Item(Asset::IronRodItem)) }, C.Base + FVector(2500, 1500, 100), Parameters);
+		D.AreaCrate = SpawnCrate(R, { FInventoryStack(25, Item(Asset::IronRodItem)) }, C.Base + FVector(2500, 1500, 100));
 		R.Check(D.AreaCrate.IsValid() && S.Area.Contains(D.AreaCrate->GetActorLocation()), TEXT("crate with 25 rods in the area"));
 		for (const FVector& Place : S.ControlPlaces())
 		{
@@ -3843,9 +4094,14 @@ namespace
 	void AddDismantleScene(FRun& R, const FSceneRef& S, const FDismantleRef& D, double Side = 0.0)
 	{
 		AddScene(R, S, 4000.0, [D](FRun& Self, FScene& Scene) { BuildDismantleBasic(Self, Scene, *D); }, Side);
-		R.Steps.Add([S, D](FRun& Self)
+		AddBoth(R, [S, D](FRun& Self)
 		{
-			RecordRefund(Self, *S, *D);
+			if (!Self.bClient)
+			{
+				// The refunds are the server's to read; the client's result message must name their sum
+				RecordRefund(Self, *S, *D);
+				Send(Self, MsgExpected, Total(D->Expected));
+			}
 			CountWorld(Self, D->Pieces);
 			D->Pieces.JobsBefore = AAreaActionsServerSubsystem::FinishedJobs;
 			return EStep::Next;
@@ -3885,7 +4141,7 @@ namespace
 	void AddCheckGone(FRun& R, const FSceneRef& S, const FDismantleRef& D)
 	{
 		TSharedRef<double> Since = MakeShared<double>(0.0);
-		R.Steps.Add([S, D, Since](FRun& Self)
+		AddBoth(R, [S, D, Since](FRun& Self)
 		{
 			*Since = *Since > 0.0 ? *Since : Self.Now();
 			const int32 Left = Algo::CountIf(S->Inside, [](const TWeakObjectPtr<AFGBuildable>& Weak) { return IsValid(Weak.Get()); });
@@ -3903,7 +4159,9 @@ namespace
 			Self.Check(!D->AreaCrate.IsValid(), TEXT("the area's crate is gone"));
 			for (int32 Index = 0; Index < S->Controls.Num(); ++Index)
 			{
-				Self.Check(StorageItems(S->Controls[Index].Get()) == 15, FString::Printf(TEXT("control container %d (W4): %d items"), Index, StorageItems(S->Controls[Index].Get())));
+				// The client's game sees the container; what it holds is the host's to check
+				Self.Check(S->Controls[Index].IsValid() && (Self.bClient || StorageItems(S->Controls[Index].Get()) == 15),
+					FString::Printf(TEXT("control container %d (W4): %d items"), Index, Self.bClient ? -1 : StorageItems(S->Controls[Index].Get())));
 			}
 			return EStep::Next;
 		});
@@ -3912,13 +4170,16 @@ namespace
 	// New crates next to the player, packed (AA-093), with exactly the expected refund
 	void AddCheckRefundCrate(FRun& R, const FSceneRef& S, const FDismantleRef& D)
 	{
-		R.Steps.Add([S, D](FRun& Self)
+		AddChecks(R, [S, D](FRun& Self)
 		{
 			const TArray<AFGCrate*> Crates = NewCrates(Self, *S);
-			const FCratesSeen Seen = SeeCrates(Crates, Self.GetPlayer()->GetPawn()->GetActorLocation());
+			const FCratesSeen Seen = SeeCrates(Crates, Self.ActingPlace());
 			const FCounts& InCrate = Seen.Items;
-			Self.Check(Crates.Num() == PackedCrates(D->Expected) && Seen.bOneTypeEach && SameCounts(InCrate, D->Expected), FString::Printf(TEXT("new crates %d (%s); in them %s (%d), expected %s (%d)"),
-				Crates.Num(), *Seen.Text(), *ItemsText(InCrate), Total(InCrate), *ItemsText(D->Expected), Total(D->Expected)));
+			if (!Self.bClient)
+			{
+				Self.Check(Crates.Num() == PackedCrates(D->Expected) && Seen.bOneTypeEach && SameCounts(InCrate, D->Expected), FString::Printf(TEXT("new crates %d (%s); in them %s (%d), expected %s (%d)"),
+					Crates.Num(), *Seen.Text(), *ItemsText(InCrate), Total(InCrate), *ItemsText(D->Expected), Total(D->Expected)));
+			}
 			Self.Check(!Crates.IsEmpty() && Seen.Far < 1500.0, FString::Printf(TEXT("crates next to the player: %.0f cm"), Seen.Far));
 			D->CrateItems = Total(InCrate);
 			D->CratePlaces.Reset();
@@ -3926,9 +4187,17 @@ namespace
 			{
 				D->CratePlaces.Add(Crate->GetActorLocation());
 			}
-			const FString Want = FString::Printf(TEXT("Dismantled %d buildings. %d items were refunded. %s"), D->Buildings, Total(D->Expected), *CratesNextToYou(Crates.Num()));
-			Self.Check(S->Message.Contains(Want), FString::Printf(TEXT("result '%s' has '%s'"), *S->Message, *Want));
-			Self.Check(AAreaActionsServerSubsystem::FinishedJobs - D->Pieces.JobsBefore == 1, TEXT("one AAJOB line"));
+			if (Self.Acts())
+			{
+				// The client's game has the sum of the refunds from the host
+				const int32 Refunded = Self.bClient ? Self.Shared.FindRef(MsgExpected) : Total(D->Expected);
+				const FString Want = FString::Printf(TEXT("Dismantled %d buildings. %d items were refunded. %s"), D->Buildings, Refunded, *CratesNextToYou(Crates.Num()));
+				Self.Check(S->Message.Contains(Want), FString::Printf(TEXT("result '%s' has '%s'"), *S->Message, *Want));
+			}
+			if (!Self.bClient)
+			{
+				Self.Check(AAreaActionsServerSubsystem::FinishedJobs - D->Pieces.JobsBefore == 1, TEXT("one AAJOB line"));
+			}
 			return EStep::Next;
 		});
 	}
@@ -4438,6 +4707,164 @@ namespace
 		});
 	}
 
+	// The same number in both games for the same contents, whatever the order of the stacks
+	int32 ContentsHash(const TArray<FInventoryStack>& Stacks, int32& OutStacks, int32& OutItems)
+	{
+		uint32 Hash = 0;
+		OutStacks = OutItems = 0;
+		for (const FInventoryStack& Stack : Stacks)
+		{
+			if (Stack.HasItems())
+			{
+				++OutStacks;
+				OutItems += Stack.NumItems;
+				Hash += FCrc::StrCrc32(*Stack.Item.GetItemClass()->GetPathName()) * static_cast<uint32>(Stack.NumItems);
+			}
+		}
+		return static_cast<int32>(Hash & 0x7FFFFF);
+	}
+
+	// AA-085 point 3, two games: the client's player opens the largest of the new crates as a player does: stands by it, looks at it,
+	// presses the use key. A crate's contents go only to a player who has it open: they must arrive within 10 s without a frame over
+	// 200 ms, and the host compares what the client saw (stacks, items, a hash of kinds and amounts) with what the crate holds
+	void AddOpenLargestCrate(FRun& R, const FSceneRef& S)
+	{
+		struct FOpen
+		{
+			TWeakObjectPtr<AFGCrate> Crate;
+			int32 Stacks = 0, Items = 0, Hash = 0;
+			double Pressed = 0.0;
+		};
+		TSharedRef<FOpen> O = MakeShared<FOpen>();
+		Mark(R, ESide::Host);
+		R.Steps.Add([S, O](FRun& Self)
+		{
+			TArray<FInventoryStack> Stacks;
+			for (AFGCrate* Crate : NewCrates(Self, *S))
+			{
+				TArray<FInventoryStack> Each;
+				Crate->GetInventory()->GetInventoryStacks(Each);
+				if (Each.Num() > Stacks.Num())
+				{
+					Stacks = Each;
+					O->Crate = Crate;
+				}
+			}
+			AFGCharacterPlayer* Character = GetCharacter(Self);
+			if (!Self.Check(O->Crate.IsValid() && Character, TEXT("largest crate found")))
+			{
+				return EStep::Next;
+			}
+			O->Hash = ContentsHash(Stacks, O->Stacks, O->Items);
+			const FVector At = O->Crate->GetActorLocation();
+			// The player goes 2 m from the crate, on the side of the place it stood at
+			const FVector Spot = At + (Self.Origin - At).GetSafeNormal2D() * 200.0 + FVector(0, 0, Self.Origin.Z - At.Z);
+			Character->TeleportTo(Spot, (At - Spot).Rotation());
+			Self.Step(FString::Printf(TEXT("largest crate %s at %s: %d stacks, %d items, hash %d; the player goes to %s"), *O->Crate->GetName(), *At.ToCompactString(),
+				O->Stacks, O->Items, O->Hash, *Spot.ToCompactString()));
+			Send(Self, MsgCrateStacks, O->Stacks);
+			Send(Self, MsgCrateItems, O->Items);
+			Send(Self, MsgCrateHash, O->Hash);
+			Send(Self, MsgCrateX, FMath::RoundToInt32(At.X));
+			Send(Self, MsgCrateY, FMath::RoundToInt32(At.Y));
+			Send(Self, MsgCrateZ, FMath::RoundToInt32(At.Z));
+			return EStep::Next;
+		});
+		Mark(R, ESide::Client);
+		R.Steps.Add([O](FRun& Self)
+		{
+			const AFGCharacterPlayer* Character = GetCharacter(Self);
+			if (!Self.Shared.Contains(MsgCrateZ) || !Character)
+			{
+				return EStep::Wait;
+			}
+			const FVector At(Self.Shared.FindRef(MsgCrateX), Self.Shared.FindRef(MsgCrateY), Self.Shared.FindRef(MsgCrateZ));
+			if (!O->Crate.IsValid())
+			{
+				for (TActorIterator<AFGCrate> It(Self.GetWorld()); It; ++It)
+				{
+					if (IsValid(*It) && FVector::Dist(It->GetActorLocation(), At) < 100.0)
+					{
+						O->Crate = *It;
+					}
+				}
+			}
+			// Looking at the crate from where the host put the player, until the game offers the crate for use
+			if (!O->Crate.IsValid() || FVector::Dist(Character->GetActorLocation(), At) > 500.0)
+			{
+				return EStep::Wait;
+			}
+			LookAt(Self, O->Crate->GetActorLocation());
+			if (Character->GetBestUsableActor() != O->Crate.Get())
+			{
+				return EStep::Wait;
+			}
+			TArray<FInventoryStack> Before;
+			O->Crate->GetInventory()->GetInventoryStacks(Before);
+			int32 Stacks = 0, Items = 0;
+			ContentsHash(Before, Stacks, Items);
+			Self.Check(true, FString::Printf(TEXT("the crate %s is the one to use; closed, this game sees %d stacks of it; use key down"), *O->Crate->GetName(), Stacks));
+			Self.MaxFrameMs = 0.0;
+			Self.bMeasureFrames = true;
+			O->Pressed = Self.Now();
+			FViewport* Viewport = GEngine && GEngine->GameViewport ? GEngine->GameViewport->Viewport : nullptr;
+			Self.GetPlayer()->InputKey(FInputKeyEventArgs(Viewport, FInputDeviceId::CreateFromInternalId(0), EKeys::E, IE_Pressed));
+			return EStep::Next;
+		});
+		R.Steps.Add(WaitFrames(3));
+		R.Steps.Add([O](FRun& Self)
+		{
+			FViewport* Viewport = GEngine && GEngine->GameViewport ? GEngine->GameViewport->Viewport : nullptr;
+			Self.GetPlayer()->InputKey(FInputKeyEventArgs(Viewport, FInputDeviceId::CreateFromInternalId(0), EKeys::E, IE_Released));
+			return EStep::Next;
+		});
+		R.Steps.Add([O](FRun& Self)
+		{
+			TArray<FInventoryStack> Seen;
+			if (O->Crate.IsValid())
+			{
+				O->Crate->GetInventory()->GetInventoryStacks(Seen);
+			}
+			int32 Stacks = 0, Items = 0;
+			const int32 Hash = ContentsHash(Seen, Stacks, Items);
+			const double Waited = Self.Now() - O->Pressed;
+			// The game's interact window, wherever its HUD puts it
+			const UFGInteractWidget* Window = nullptr;
+			for (TObjectIterator<UFGInteractWidget> It; It; ++It)
+			{
+				if (IsValid(*It) && It->GetWorld() == Self.GetWorld() && It->GetCachedWidget().IsValid())
+				{
+					Window = *It;
+				}
+			}
+			if ((Stacks < Self.Shared.FindRef(MsgCrateStacks) || !Window) && Waited < 10.0)
+			{
+				return EStep::Wait;
+			}
+			Self.bMeasureFrames = false;
+			Self.Check(Window != nullptr, FString::Printf(TEXT("the crate's window is open: %s"), Window ? *Window->GetClass()->GetName() : TEXT("none")));
+			Self.Check(Stacks > 0 && Waited < 10.0, FString::Printf(TEXT("the crate's contents arrived %.2f s after the key: %d stacks, %d items"), Waited, Stacks, Items));
+			Self.Check(Self.MaxFrameMs <= 200.0, FString::Printf(TEXT("longest frame while the crate opened: %.1f ms (200)"), Self.MaxFrameMs));
+			Send(Self, MsgSeenStacks, Stacks);
+			Send(Self, MsgSeenItems, Items);
+			Send(Self, MsgSeenHash, Hash);
+			return EStep::Next;
+		});
+		Mark(R, ESide::Host);
+		R.Steps.Add([O](FRun& Self)
+		{
+			if (!Self.Shared.Contains(MsgSeenHash))
+			{
+				return EStep::Wait;
+			}
+			const int32 Stacks = Self.Shared.FindRef(MsgSeenStacks), Items = Self.Shared.FindRef(MsgSeenItems), Hash = Self.Shared.FindRef(MsgSeenHash);
+			Self.Check(Stacks == O->Stacks && Items == O->Items && Hash == O->Hash, FString::Printf(TEXT("the client saw %d stacks, %d items, hash %d; the crate holds %d stacks, %d items, hash %d"),
+				Stacks, Items, Hash, O->Stacks, O->Items, O->Hash));
+			return EStep::Next;
+		});
+		Mark(R, ActSide(R));
+	}
+
 	// AA-085 (1): more stacks than one crate takes: crates of 200 stacks, the last one partly filled, every item there
 	void AddCrateSplit(FRun& R, bool bDismantle, double Side)
 	{
@@ -4455,7 +4882,7 @@ namespace
 			for (int32 Index = 0; Index < Containers; ++Index)
 			{
 				AFGBuildableStorage* Storage = SpawnStorage(Self, Scene.Slot(Index), 0, 0);
-				if (Storage)
+				if (Storage && !Self.bClient)
 				{
 					UFGInventoryComponent* Inventory = Storage->GetStorageInventory();
 					P->Taken.FindOrAdd(Plate) += Inventory->AddStack(FInventoryStack(Inventory->GetSizeLinear() * PlateStack, Plate), true);
@@ -4489,9 +4916,16 @@ namespace
 			AddPress(R, TEXT("Widget_MessageYesNo"), TEXT("NoButton"));
 			AddResultWindow(R, S);
 		}
-		R.Steps.Add([S, P, bDismantle](FRun& Self)
+		AddChecks(R, [S, P, bDismantle](FRun& Self)
 		{
 			const TArray<AFGCrate*> Crates = NewCrates(Self, *S);
+			if (Self.bClient)
+			{
+				// What the crates hold the client's game learns when it opens one (AddOpenLargestCrate)
+				const FString Want = FString::Printf(TEXT("The items are in %d crates next to you."), Crates.Num());
+				Self.Check(Crates.Num() > 1 && (!Self.Acts() || S->Message.Contains(Want)), FString::Printf(TEXT("new crates here %d; result '%s' has '%s'"), Crates.Num(), *S->Message, *Want));
+				return EStep::Next;
+			}
 			FCounts InCrates;
 			int32 Full = 0;
 			int32 Stacks = 0;
@@ -4510,14 +4944,18 @@ namespace
 			}
 			// Packed (AA-093): as many crates as first-fit-decreasing needs, each type in one crate unless it has more than 200 stacks
 			const int32 WantCrates = PackedCrates(P->Taken);
-			const FCratesSeen Seen = SeeCrates(Crates, Self.GetPlayer()->GetPawn()->GetActorLocation());
+			const FCratesSeen Seen = SeeCrates(Crates, Self.ActingPlace());
 			Self.Check(Crates.Num() == WantCrates && Seen.bOneTypeEach && SameCounts(InCrates, P->Taken),
 				FString::Printf(TEXT("%s: %d crates (want %d, %d full, %s) for %d stacks; in them %s, taken %s"), bDismantle ? TEXT("MassDismantle") : TEXT("Move to crate"),
 					Crates.Num(), WantCrates, Full, *Seen.Text(), Stacks, *ItemsText(InCrates), *ItemsText(P->Taken)));
 			const FString Want = FString::Printf(TEXT("The items are in %d crates next to you."), Crates.Num());
-			Self.Check(S->Message.Contains(Want), FString::Printf(TEXT("result '%s' has '%s'"), *S->Message, *Want));
+			Self.Check(!Self.Acts() || S->Message.Contains(Want), FString::Printf(TEXT("result '%s' has '%s'"), *S->Message, *Want));
 			return EStep::Next;
 		});
+		if (R.bMp)
+		{
+			AddOpenLargestCrate(R, S);
+		}
 	}
 
 	// AA-085 (2): only fluids taken: no word of a crate; no room next to the player: the crate stands by the building and the message says
@@ -4594,6 +5032,240 @@ namespace
 		}
 	}
 
+	// A window of the tool closed with its X
+	void AddCloseWithX(FRun& R, const TCHAR* Name)
+	{
+		AddOnWindow(R, Name, [Name](FRun& Self, UUserWidget* Window)
+		{
+			UUserWidget* Frame = Cast<UUserWidget>(Window->GetWidgetFromName(TEXT("WindowDark")));
+			FMulticastDelegateProperty* Property = Frame ? FindFProperty<FMulticastDelegateProperty>(Frame->GetClass(), TEXT("OnClose")) : nullptr;
+			if (Property)
+			{
+				Property->ContainerPtrToValuePtr<FMulticastScriptDelegate>(Frame)->ProcessMulticastDelegate<UObject>(nullptr);
+			}
+			Self.Check(Property != nullptr, FString::Printf(TEXT("%s closed with X"), Name));
+		});
+	}
+
+	// AA-089 point 1, two games: a Copy preview of 9 buildings stays open for 5 s; the other game counts the holograms and preview actors
+	// it has all the time (Watch), which must be none
+	void AddPreviewHold(FRun& R)
+	{
+		FSceneRef S = MakeShared<FScene>();
+		FCopyRef C = MakeShared<FCopyState>();
+		AddCopyScene(R, S, C, BuildBasic);
+		AddCopyPreview(R, C);
+		R.Steps.Add(WaitSeconds(5.0));
+		R.Steps.Add([](FRun& Self)
+		{
+			Self.Check(AAreaActionsPreview::LiveGhosts == 9 && PreviewHolograms(Self) == 8, FString::Printf(TEXT("after 5 s: ghosts %d (want 9), holograms %d (want 8)"),
+				AAreaActionsPreview::LiveGhosts, PreviewHolograms(Self)));
+			return EStep::Next;
+		});
+		AddCloseWithX(R, TEXT("Widget_Copy"));
+		R.Steps.Add(WaitFrames(5));
+		R.Steps.Add([](FRun& Self)
+		{
+			Self.Check(AAreaActionsPreview::LiveGhosts == 0 && PreviewHolograms(Self) == 0 && !ActiveAction(Self), FString::Printf(TEXT("after Cancel: ghosts %d, holograms %d, action %s"),
+				AAreaActionsPreview::LiveGhosts, PreviewHolograms(Self), *GetNameSafe(ActiveAction(Self))));
+			return EStep::Next;
+		});
+	}
+
+	// AA-089 point 2: a Fill preview with 300 of the game's holograms (the most a preview makes): none of their sound components plays
+	void AddPreviewSound(FRun& R)
+	{
+		FSceneRef S = MakeShared<FScene>();
+		FCopyRef C = MakeShared<FCopyState>();
+		AddCopyScene(R, S, C, BuildSingle);
+		AddOpenAction(R, TEXT("Fill"));
+		AddFillWindow(R, FVector(1, 1, 0), FIntVector(31, 10, 1), FVector2D(0, 0), false, TEXT("PreviewButton"));
+		// The sounds get their time to start
+		R.Steps.Add(WaitSeconds(3.0));
+		R.Steps.Add([](FRun& Self)
+		{
+			int32 Holograms = 0, Sounds = 0, Playing = 0, Loops = 0;
+			for (TActorIterator<AFGHologram> It(Self.GetWorld()); It; ++It)
+			{
+				if (!It->GetOwner() || !It->GetOwner()->IsA<AAreaActionsPreview>())
+				{
+					continue;
+				}
+				++Holograms;
+				TInlineComponentArray<UAkComponent*> Components(*It);
+				for (const UAkComponent* Sound : Components)
+				{
+					++Sounds;
+					Playing += Sound->IsPlaying() ? 1 : 0;
+				}
+				const FObjectPropertyBase* Loop = FindFProperty<FObjectPropertyBase>(AFGHologram::StaticClass(), TEXT("mLoopSound"));
+				Loops += Loop && Loop->GetObjectPropertyValue_InContainer(*It) ? 1 : 0;
+			}
+			Self.Check(Holograms == 300 && AAreaActionsPreview::LiveGhosts == 309, FString::Printf(TEXT("preview: %d holograms (want 300), %d ghosts (want 309)"), Holograms, AAreaActionsPreview::LiveGhosts));
+			Self.Check(Playing == 0, FString::Printf(TEXT("sound components on the preview's holograms: %d, playing %d (want 0); holograms with a loop sound set %d"), Sounds, Playing, Loops));
+			return EStep::Next;
+		});
+		AddCloseWithX(R, TEXT("Widget_Fill"));
+		R.Steps.Add(WaitFrames(5));
+		R.Steps.Add([](FRun& Self)
+		{
+			Self.Check(AAreaActionsPreview::LiveGhosts == 0 && PreviewHolograms(Self) == 0, FString::Printf(TEXT("after Cancel: ghosts %d, holograms %d"), AAreaActionsPreview::LiveGhosts, PreviewHolograms(Self)));
+			return EStep::Next;
+		});
+	}
+
+	// AA-040 point 5: the client's game ends here: its result line, the report of this section to the host, then the game closes, which
+	// is the disconnect. The host waits until the client's player is gone and 2 s more; by then it must not have had a window, an indicator,
+	// an action actor or a ghost of the client's. From here on the host's own player is the one who acts.
+	void AddClientLeaves(FRun& R, const TCHAR* While)
+	{
+		Mark(R, ESide::Client);
+		R.Steps.Add([While](FRun& Self)
+		{
+			Self.Check(true, FString::Printf(TEXT("the client's game leaves %s"), While));
+			// This step and its section's report stay, the rest of the list goes
+			Self.Steps.SetNum(Self.Index + 2, EAllowShrinking::No);
+			return EStep::Next;
+		});
+		Mark(R, ESide::Host);
+		R.Steps.Add([](FRun& Self)
+		{
+			if (Self.Peer.IsValid())
+			{
+				return EStep::Wait;
+			}
+			Self.bPeerLeft = true;
+			Self.Step(TEXT("the client's player is gone"));
+			return EStep::Next;
+		});
+		R.Steps.Add(WaitSeconds(2.0));
+		R.Steps.Add([](FRun& Self)
+		{
+			Self.Check(Self.MaxWindows == 0 && Self.MaxIndicators == 0 && Self.MaxActions == 0 && Self.MaxGhosts == 0, FString::Printf(
+				TEXT("until 2 s after the client left: here at most mod windows %d, tool indicators %d, action actors %d, ghosts %d (want 0)"),
+				Self.MaxWindows, Self.MaxIndicators, Self.MaxActions, Self.MaxGhosts));
+			Self.bPeerActs = false;
+			return EStep::Next;
+		});
+		R.bBuildAfterLeave = true;
+	}
+
+	// The host goes on for 10 s and its own player runs an action: the server's jobs are alive
+	void AddHostGoesOn(FRun& R)
+	{
+		R.Steps.Add(WaitSeconds(10.0));
+		AddSetStation(R, 12000.0);
+	}
+
+	// The client asks for SetRecipe on 1000 machines that hold items, the server changes one a frame (budget 0), and the client leaves:
+	// the job ends without it, and the items of the machines it changed are in crates
+	void AddDisconnectJob(FRun& R)
+	{
+		constexpr int32 Columns = 50;
+		constexpr int32 Rows = 20;
+		constexpr double Spacing = 1000.0;
+		FSceneRef S = MakeShared<FScene>();
+		TSharedRef<int32> JobsBefore = MakeShared<int32>(0);
+		AddEquipTool(R);
+		AddBoth(R, [S](FRun& Self)
+		{
+			PlaceScene(Self, *S, Columns * Spacing / 2.0, 2000.0);
+			S->Center.Z += 2000.0;
+			S->Area.MinZ = S->Center.Z - 500.0;
+			S->Area.MaxZ = S->Center.Z + 500.0;
+			return EStep::Next;
+		});
+		Mark(R, ESide::Host);
+		R.Steps.Add([](FRun& Self)
+		{
+			MakeAvailable(Self, Asset::IronRod);
+			SetBudget(0.0f);
+			return EStep::Next;
+		});
+		for (int32 Batch = 0; Batch < Columns * Rows / 100; ++Batch)
+		{
+			R.Steps.Add([S, Batch](FRun& Self)
+			{
+				for (int32 Index = Batch * 100; Index < (Batch + 1) * 100; ++Index)
+				{
+					const FVector At = S->Center + FVector((Index % Columns - Columns / 2.0 + 0.5) * Spacing, (Index / Columns - Rows / 2.0 + 0.5) * Spacing, 0.0);
+					S->Inside.Add(SpawnMachine(Self, Asset::Constructor, At, Asset::IronPlate, 2, 1));
+				}
+				return EStep::Next;
+			});
+		}
+		R.Steps.Add(WaitFrames(30));
+		R.Steps.Add([S, JobsBefore](FRun& Self)
+		{
+			Self.Check(S->Inside.Num() == Columns * Rows && AllValid(S->Inside), FString::Printf(TEXT("%d machines built, 3 items in each"), S->Inside.Num()));
+			SnapshotCrates(Self, *S);
+			*JobsBefore = AAreaActionsServerSubsystem::FinishedJobs;
+			return EStep::Next;
+		});
+		Mark(R, ESide::Client);
+		R.Steps.Add([S](FRun& Self)
+		{
+			Self.Step(TEXT("request 401: SetRecipe for 1000 machines"));
+			UAreaActionsRCO::Of(Self.GetPlayer())->ServerSetRecipe(401, S->Area, Recipe(Asset::IronRod));
+			return EStep::Next;
+		});
+		R.Steps.Add(WaitFrames(30));
+		AddClientLeaves(R, TEXT("in the middle of its SetRecipe job"));
+		TSharedRef<int32> JobsAtLeave = MakeShared<int32>(-1);
+		R.Steps.Add([S, JobsBefore, JobsAtLeave](FRun& Self)
+		{
+			const AAreaActionsServerSubsystem* Server = AAreaActionsServerSubsystem::Get(Self.GetWorld());
+			if (*JobsAtLeave < 0)
+			{
+				*JobsAtLeave = Server ? Server->NumJobs() : 0;
+				Self.Check(*JobsAtLeave == 1, FString::Printf(TEXT("2 s after the client left its job still runs: jobs %d"), *JobsAtLeave));
+			}
+			if (Server && Server->NumJobs() > 0)
+			{
+				return EStep::Wait;
+			}
+			int32 Changed = 0, InChanged = 0, InMachines = 0;
+			for (const TWeakObjectPtr<AFGBuildable>& Built : S->Inside)
+			{
+				const AFGBuildableManufacturer* Constructor = Cast<AFGBuildableManufacturer>(Built.Get());
+				const bool bChanged = Constructor && Constructor->GetCurrentRecipe() == Recipe(Asset::IronRod);
+				Changed += bChanged ? 1 : 0;
+				InChanged += bChanged ? MachineItems(Constructor) : 0;
+				InMachines += Constructor ? MachineItems(Constructor) : 0;
+			}
+			const FCratesSeen Seen = SeeCrates(NewCrates(Self, *S), Self.Origin);
+			const int32 All = Columns * Rows;
+			// The job ends either way: cancelled between two machines (no AAJOB result line), or run to its end
+			const int32 Finished = AAreaActionsServerSubsystem::FinishedJobs - *JobsBefore;
+			Self.Check(Server && Changed > 0 && (Changed < All ? Finished == 0 : Finished == 1),
+				FString::Printf(TEXT("the job ended after the player left: %d of %d machines changed, %s, jobs left 0"), Changed, All,
+					Finished ? TEXT("run to its end") : TEXT("cancelled")));
+			Self.Check(InChanged == 0 && Seen.All == Changed * 3 && InMachines + Seen.All == All * 3,
+				FString::Printf(TEXT("the changed machines' items are in crates: %d in crates (want %d), %d left in changed machines, %d in all machines and crates (want %d)"),
+					Seen.All, Changed * 3, InChanged, InMachines + Seen.All, All * 3));
+			return EStep::Next;
+		});
+		AddHostGoesOn(R);
+	}
+
+	// The client leaves with its Copy preview open: nothing of it is at the host, nothing was built
+	void AddDisconnectPreview(FRun& R)
+	{
+		FSceneRef S = MakeShared<FScene>();
+		FCopyRef C = MakeShared<FCopyState>();
+		AddCopyScene(R, S, C, BuildBasic);
+		AddCopyPreview(R, C);
+		R.Steps.Add(WaitSeconds(2.0));
+		AddClientLeaves(R, TEXT("with its Copy preview open"));
+		R.Steps.Add([S, C](FRun& Self)
+		{
+			CheckCopies(Self, *C, false, TEXT("after the client left"));
+			CheckPattern(Self, *S, *C, TEXT("after the client left"));
+			return EStep::Next;
+		});
+		AddHostGoesOn(R);
+	}
+
 	bool BuildScenario(FRun& R)
 	{
 		if (R.Name == TEXT("MP_Smoke"))
@@ -4610,44 +5282,44 @@ namespace
 			R.Steps.Add(WaitFrames(60));
 			return true;
 		}
-		if (R.Name == TEXT("DismantleBasic"))
+		if (R.Scenario == TEXT("DismantleBasic"))
 		{
 			AddDismantleBasic(R);
 			return true;
 		}
-		if (R.Name == TEXT("DismantleSweep"))
+		if (R.Scenario == TEXT("DismantleSweep"))
 		{
 			AddDismantleSweep(R);
 			return true;
 		}
-		if (R.Name == TEXT("DismantleNoCrate"))
+		if (R.Scenario == TEXT("DismantleNoCrate"))
 		{
 			AddDismantleNoCrate(R);
 			return true;
 		}
-		if (R.Name == TEXT("DismantleNoCost"))
+		if (R.Scenario == TEXT("DismantleNoCost"))
 		{
 			AddDismantleNoCost(R);
 			return true;
 		}
-		if (R.Name == TEXT("DismantleProtected"))
+		if (R.Scenario == TEXT("DismantleProtected"))
 		{
 			AddDismantleProtected(R);
 			return true;
 		}
-		if (R.Name == TEXT("DismantleSaveLoad"))
+		if (R.Scenario == TEXT("DismantleSaveLoad"))
 		{
 			R.StepTimeoutSec = 60.0;
 			AddDismantleSaveLoad(R);
 			return true;
 		}
-		if (R.Name == TEXT("DismantleLarge"))
+		if (R.Scenario == TEXT("DismantleLarge"))
 		{
 			R.StepTimeoutSec = 60.0;
 			AddDismantleLarge(R);
 			return true;
 		}
-		if (R.Name == TEXT("SaveDuringJob"))
+		if (R.Scenario == TEXT("SaveDuringJob"))
 		{
 			R.StepTimeoutSec = 60.0;
 			AddSaveDuringJob(R, EJobKind::SetRecipe, 301);
@@ -4655,97 +5327,120 @@ namespace
 			AddSaveDuringJob(R, EJobKind::Dismantle, 303);
 			return true;
 		}
-		if (R.Name == TEXT("CrateItemState"))
+		if (R.Scenario == TEXT("CrateItemState"))
 		{
 			AddCrateItemState(R, false, 55.5f, 0.0);
 			AddCrateItemState(R, true, 66.5f, 12000.0);
 			return true;
 		}
-		if (R.Name == TEXT("CrateSplit"))
+		if (R.Scenario == TEXT("CrateSplit"))
 		{
 			AddCrateSplit(R, false, 0.0);
-			AddCrateSplit(R, true, 12000.0);
+			if (!R.bMp)
+			{
+				AddCrateSplit(R, true, 12000.0);
+			}
 			return true;
 		}
-		if (R.Name == TEXT("CrateMessages"))
+		if (R.Scenario == TEXT("PreviewHold"))
+		{
+			AddPreviewHold(R);
+			return true;
+		}
+		if (R.Scenario == TEXT("PreviewSound"))
+		{
+			AddPreviewSound(R);
+			return true;
+		}
+		if (R.Scenario == TEXT("DisconnectJob"))
+		{
+			AddDisconnectJob(R);
+			return true;
+		}
+		if (R.Scenario == TEXT("DisconnectPreview"))
+		{
+			AddDisconnectPreview(R);
+			return true;
+		}
+		if (R.Scenario == TEXT("CrateMessages"))
 		{
 			AddCrateMessages(R);
 			return true;
 		}
-		if (R.Name == TEXT("DismantleProbe"))
+		if (R.Scenario == TEXT("DismantleProbe"))
 		{
 			R.StepTimeoutSec = 60.0;
 			AddDismantleProbe(R);
 			return true;
 		}
-		if (R.Name == TEXT("CopyBasic"))
+		if (R.Scenario == TEXT("CopyBasic"))
 		{
 			AddCopyBasic(R);
 			return true;
 		}
-		if (R.Name == TEXT("CopyRotate"))
+		if (R.Scenario == TEXT("CopyRotate"))
 		{
 			AddCopyRotate(R);
 			return true;
 		}
-		if (R.Name == TEXT("CopyTwice"))
+		if (R.Scenario == TEXT("CopyTwice"))
 		{
 			AddCopyTwice(R);
 			return true;
 		}
-		if (R.Name == TEXT("CopySaveLoad"))
+		if (R.Scenario == TEXT("CopySaveLoad"))
 		{
 			R.StepTimeoutSec = 60.0;
 			AddCopySaveLoad(R);
 			return true;
 		}
-		if (R.Name == TEXT("CopyCost"))
+		if (R.Scenario == TEXT("CopyCost"))
 		{
 			AddCopyCost(R);
 			return true;
 		}
-		if (R.Name == TEXT("CopyCostMissing"))
+		if (R.Scenario == TEXT("CopyCostMissing"))
 		{
 			AddCopyCostMissing(R);
 			return true;
 		}
-		if (R.Name == TEXT("CopyNoCost"))
+		if (R.Scenario == TEXT("CopyNoCost"))
 		{
 			AddCopyNoCost(R);
 			return true;
 		}
-		if (R.Name == TEXT("CopyCostDepot"))
+		if (R.Scenario == TEXT("CopyCostDepot"))
 		{
 			AddCopyCostDepot(R);
 			return true;
 		}
-		if (R.Name == TEXT("FillGrid"))
+		if (R.Scenario == TEXT("FillGrid"))
 		{
 			AddFillGrid(R, false);
 			return true;
 		}
-		if (R.Name == TEXT("FillNegative"))
+		if (R.Scenario == TEXT("FillNegative"))
 		{
 			AddFillGrid(R, true);
 			return true;
 		}
-		if (R.Name == TEXT("Preview"))
+		if (R.Scenario == TEXT("Preview"))
 		{
 			R.StepTimeoutSec = 60.0;
 			AddPreview(R);
 			return true;
 		}
-		if (R.Name == TEXT("SelectLightweight"))
+		if (R.Scenario == TEXT("SelectLightweight"))
 		{
 			AddSelectLightweight(R);
 			return true;
 		}
-		if (R.Name == TEXT("FillLarge"))
+		if (R.Scenario == TEXT("FillLarge"))
 		{
 			AddFillLarge(R);
 			return true;
 		}
-		if (R.Name == TEXT("DoubleClick"))
+		if (R.Scenario == TEXT("DoubleClick"))
 		{
 			AddDoubleClick(R, true, 0, -27000.0);
 			AddDoubleClick(R, true, 3, -9000.0);
@@ -4753,94 +5448,94 @@ namespace
 			AddDoubleClick(R, false, 3, 27000.0);
 			return true;
 		}
-		if (R.Name == TEXT("SpawnProbe"))
+		if (R.Scenario == TEXT("SpawnProbe"))
 		{
 			R.StepTimeoutSec = 60.0;
 			AddSpawnProbe(R);
 			return true;
 		}
-		if (R.Name == TEXT("BindSignature"))
+		if (R.Scenario == TEXT("BindSignature"))
 		{
 			AddBindSignature(R);
 			return true;
 		}
-		if (R.Name == TEXT("ToolMenuClose"))
+		if (R.Scenario == TEXT("ToolMenuClose"))
 		{
 			AddToolMenuClose(R);
 			return true;
 		}
-		if (R.Name == TEXT("SetRecipe"))
+		if (R.Scenario == TEXT("SetRecipe"))
 		{
 			AddSetRecipe(R);
 			return true;
 		}
-		if (R.Name == TEXT("SetRecipeNoMatch"))
+		if (R.Scenario == TEXT("SetRecipeNoMatch"))
 		{
 			AddSetRecipeUnchanged(R, Asset::IronPlate, Asset::IngotIron, TEXT("No machine in the area accepts"));
 			return true;
 		}
-		if (R.Name == TEXT("SetRecipeAlready"))
+		if (R.Scenario == TEXT("SetRecipeAlready"))
 		{
 			AddSetRecipeUnchanged(R, Asset::IronRod, Asset::IronRod, TEXT("All machines in the area already use"));
 			return true;
 		}
-		if (R.Name == TEXT("ClearInventories"))
+		if (R.Scenario == TEXT("ClearInventories"))
 		{
 			AddClearInventories(R, false);
 			return true;
 		}
-		if (R.Name == TEXT("ClearInventoriesCrate"))
+		if (R.Scenario == TEXT("ClearInventoriesCrate"))
 		{
 			AddClearInventories(R, true);
 			return true;
 		}
-		if (R.Name == TEXT("SetStationCancel"))
+		if (R.Scenario == TEXT("SetStationCancel"))
 		{
 			AddSetStationCancel(R);
 			return true;
 		}
-		if (R.Name == TEXT("SetStation"))
+		if (R.Scenario == TEXT("SetStation"))
 		{
 			AddSetStation(R);
 			return true;
 		}
-		if (R.Name == TEXT("SetStationEmpty"))
+		if (R.Scenario == TEXT("SetStationEmpty"))
 		{
 			AddSetStationEmpty(R);
 			return true;
 		}
-		if (R.Name == TEXT("RejectBadRequests"))
+		if (R.Scenario == TEXT("RejectBadRequests"))
 		{
 			AddRejectBadRequests(R);
 			return true;
 		}
-		if (R.Name == TEXT("SetRecipeLarge"))
+		if (R.Scenario == TEXT("SetRecipeLarge"))
 		{
 			R.StepTimeoutSec = 120.0;
 			AddSetRecipeLarge(R);
 			return true;
 		}
-		if (R.Name == TEXT("ToolMenu"))
+		if (R.Scenario == TEXT("ToolMenu"))
 		{
 			AddToolMenu(R);
 			return true;
 		}
-		if (R.Name == TEXT("Corners"))
+		if (R.Scenario == TEXT("Corners"))
 		{
 			AddCorners(R);
 			return true;
 		}
-		if (R.Name == TEXT("SelectBuilding"))
+		if (R.Scenario == TEXT("SelectBuilding"))
 		{
 			AddSelectBuilding(R);
 			return true;
 		}
-		if (R.Name == TEXT("Smoke"))
+		if (R.Scenario == TEXT("Smoke"))
 		{
 			AddSmoke(R, false);
 			return true;
 		}
-		if (R.Name == TEXT("SmokeFail"))
+		if (R.Scenario == TEXT("SmokeFail"))
 		{
 			AddSmoke(R, true);
 			return true;
@@ -4954,10 +5649,21 @@ namespace
 			Markers += Class ? CountOf(Class) : 0;
 		}
 		const int32 Actions = CountOf(AAreaActionBase::StaticClass());
-		if (Windows > R.MaxWindows || Markers > R.MaxIndicators || Actions > R.MaxActions)
+		// AA-089: a preview's holograms and its own actor (the instanced meshes) are the previewing player's alone
+		const int32 Ghosts = CountOf(AFGHologram::StaticClass()) + CountOf(AAreaActionsPreview::StaticClass());
+		if (Windows > R.MaxWindows || Markers > R.MaxIndicators || Actions > R.MaxActions || Ghosts > R.MaxGhosts)
 		{
-			R.Step(FString::Printf(TEXT("here now: mod windows %d, tool indicators %d, action actors %d"), Windows, Markers, Actions));
+			R.Step(FString::Printf(TEXT("here now: mod windows %d, tool indicators %d, action actors %d, holograms and preview actors %d"), Windows, Markers, Actions, Ghosts));
 		}
+		if (Actions > R.MaxActions)
+		{
+			for (TActorIterator<AAreaActionBase> It(R.GetWorld()); It; ++It)
+			{
+				R.Step(FString::Printf(TEXT("action actor %s: role %d, remote role %d, replicates %d, owner %s"), *It->GetName(), static_cast<int32>(It->GetLocalRole()),
+					static_cast<int32>(It->GetRemoteRole()), It->GetIsReplicated(), *GetNameSafe(It->GetOwner())));
+			}
+		}
+		R.MaxGhosts = FMath::Max(R.MaxGhosts, Ghosts);
 		R.MaxWindows = FMath::Max(R.MaxWindows, Windows);
 		R.MaxIndicators = FMath::Max(R.MaxIndicators, Markers);
 		R.MaxActions = FMath::Max(R.MaxActions, Actions);
@@ -5153,7 +5859,12 @@ void FAreaActionsTests::StartFromCommandLine(UWorld* World)
 	// MP_<name>: two game instances; in MP_Host<name> the host's own player acts and the client watches
 	Run->bMp = Name.StartsWith(TEXT("MP_"));
 	Run->bClient = bClient;
-	Run->bPeerActs = !Name.StartsWith(TEXT("MP_Host"));
+		Run->bPeerActs = !Name.StartsWith(TEXT("MP_Host"));
+	Run->Scenario = Name;
+	if (Run->bMp && !Run->Scenario.RemoveFromStart(TEXT("MP_Host")))
+	{
+		Run->Scenario.RemoveFromStart(TEXT("MP_"));
+	}
 	UE_LOG(LogAreaActionsCpp, Display, TEXT("AATEST %s step scenario in %s, net mode %d%s"), *Name, *World->GetMapName(), static_cast<int32>(World->GetNetMode()),
 		Run->bMp ? (bClient ? TEXT(", the client of two games") : TEXT(", the host of two games")) : TEXT(""));
 	if (Run->bMp)
@@ -5176,16 +5887,27 @@ void FAreaActionsTests::StartFromCommandLine(UWorld* World)
 	{
 		// AA-040 point 2: the windows and indicators exist only in the game of the player who acts
 		Mark(*Run, ESide::Each);
-		Run->Steps.Add([](FRun& Self)
+			Run->Steps.Add([](FRun& Self)
 		{
-			const FString Seen = FString::Printf(TEXT("mod windows %d, tool indicators %d, action actors %d"), Self.MaxWindows, Self.MaxIndicators, Self.MaxActions);
+			const FString Seen = FString::Printf(TEXT("mod windows %d, tool indicators %d, action actors %d, holograms and preview actors %d"), Self.MaxWindows, Self.MaxIndicators,
+				Self.MaxActions, Self.MaxGhosts);
 			if (Self.Acts())
 			{
 				Self.Check(Self.MaxIndicators > 0, FString::Printf(TEXT("this game's player acted: here at most %s"), *Seen));
 			}
 			else
 			{
-				Self.Check(Self.MaxWindows == 0 && Self.MaxIndicators == 0 && Self.MaxActions == 0, FString::Printf(TEXT("the other game's player acted: here at most %s (want 0)"), *Seen));
+				Self.Check(Self.MaxWindows == 0 && Self.MaxIndicators == 0 && Self.MaxActions == 0 && Self.MaxGhosts == 0,
+					FString::Printf(TEXT("the other game's player acted: here at most %s (want 0)"), *Seen));
+			}
+			// AA-040 point 3: the players stand apart, so "next to the player" names one of them
+			const APawn* Own = Self.GetLocalPlayer() ? Self.GetLocalPlayer()->GetPawn() : nullptr;
+			const APawn* Theirs = Self.Peer.IsValid() ? Self.Peer->GetPawn() : nullptr;
+			if (!Self.bClient && Own && Theirs)
+			{
+				const double Apart = FVector::Dist(Own->GetActorLocation(), Theirs->GetActorLocation());
+				Self.Check(Apart >= 3000.0, FString::Printf(TEXT("the two players stand %.0f cm apart (at least 3000): host %s, client %s"), Apart,
+					*Own->GetActorLocation().ToCompactString(), *Theirs->GetActorLocation().ToCompactString()));
 			}
 			return EStep::Next;
 		});

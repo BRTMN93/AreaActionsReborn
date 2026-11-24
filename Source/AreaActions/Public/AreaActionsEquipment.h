@@ -18,7 +18,14 @@ class AREAACTIONS_API AAreaActionsEquipment : public AFGEquipment
 public:
 	// The Blueprint's WasEquipped and WasUnEquipped make and remove the tool's windows, indicators and input mode. The game calls both for
 	// every player's tool, also on the server and on the other clients: there only the game's own part runs, the Blueprint's is skipped.
+	// Their Tick runs only for a tool this game's own player holds. A WasEquipped that came before the character was the local one is
+	// made up for on the next tick.
 	virtual void ProcessEvent(UFunction* Function, void* Parameters) override;
+
+	// The Blueprint's InitOnServer(Action) is a "Run on Server" event that spawns the action's actor of the class it is given. The action
+	// with its windows belongs to the player's own game and the server takes no class from a client, so here the event runs where it is
+	// called and never goes over the network; one that still arrives from a client is dropped (ProcessEvent).
+	virtual int32 GetFunctionCallspace(UFunction* Function, FFrame* Stack) override;
 
 	// The 8 corners of the building's box in the world: its clearance box, or without one, the bounds of its class default and of its
 	// lightweight instance meshes. Empty for classes the copy skips that have no clearance (as the original did).
@@ -43,7 +50,13 @@ public:
 	// The selection as a request carries it, read from the Blueprint's CornerLocations, MinZ and MaxZ; false when they are missing
 	bool GetArea(FAreaActionsArea& Out) const;
 
+protected:
+	virtual void WasEquipped_Implementation() override;
+
 private:
 	// The Blueprint's WasEquipped ran here (the tool is this game's own player's), so its WasUnEquipped has to run as well
 	bool bEquippedLocally = false;
+	// The Blueprint's WasEquipped runs late: the game's own part of it has run already
+	bool bSkipNativeEquip = false;
+	bool bRejectLogged = false;
 };

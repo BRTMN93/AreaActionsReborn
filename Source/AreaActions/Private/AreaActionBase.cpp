@@ -26,6 +26,16 @@ AAreaActionBase* UAreaAction::GetActiveShell() const
 void AAreaActionBase::BeginPlay()
 {
 	Super::BeginPlay();
+	// An action is its player's own: the host's action must not appear in a client's game (Copy's did). The game's replication graph
+	// takes an actor in when it spawns, so turning replication off is not enough: the actor also leaves the network drivers' lists.
+	if (HasAuthority())
+	{
+		SetReplicates(false);
+		if (UWorld* World = GetWorld())
+		{
+			World->RemoveNetworkActor(this);
+		}
+	}
 	const APlayerController* OwnerPC = Cast<APlayerController>(GetOwner());
 	if (!NativeAction || !OwnerPC || !OwnerPC->IsLocalController())
 	{

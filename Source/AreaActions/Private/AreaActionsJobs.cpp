@@ -485,6 +485,9 @@ namespace
 			{
 				CastChecked<AFGBuildableTrainPlatformCargo>(Actor)->SetIsInLoadMode(bLoad);
 			}
+			// The game's own windows change the mode in the player's game as well; a change made here reaches the clients only when the
+			// building is woken up for the network (a Freight Platform kept its old mode in a client's game)
+			Actor->ForceNetUpdate();
 			++Result.Buildings;
 			Result.AddCount(Actor->GetClass());
 		}

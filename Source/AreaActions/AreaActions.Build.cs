@@ -40,5 +40,7 @@ public class AreaActions : ModuleRules
 
 		// Developer test mode (-AATest=<Scenario>). The release gate decides whether a release build keeps it.
 		PrivateDefinitions.Add("AA_WITH_TESTS=1");
+		// The preview stops its holograms' sound components (Wwise)
+		PrivateDependencyModuleNames.Add("AkAudio");
 	}
 }

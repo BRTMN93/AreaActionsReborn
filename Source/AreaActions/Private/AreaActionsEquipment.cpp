@@ -5,26 +5,86 @@
 #include "AreaActionsWorldModule.h"
 #include "Buildables/FGBuildable.h"
 #include "InstanceData.h"
+#include "Misc/CommandLine.h"
+#include "Net/Core/Misc/NetContext.h"
+
+static const FName InitOnServerName(TEXT("InitOnServer"));
+static const FName WasEquippedName(TEXT("WasEquipped"));
+
+int32 AAreaActionsEquipment::GetFunctionCallspace(UFunction* Function, FFrame* Stack)
+{
+	if (Function && Function->GetFName() == InitOnServerName)
+	{
+		// Only the tool's own player starts an action; a call for anybody else's tool does nothing
+		return IsLocalInstigator() ? FunctionCallspace::Local : FunctionCallspace::Absorbed;
+	}
+	return Super::GetFunctionCallspace(Function, Stack);
+}
+
+void AAreaActionsEquipment::WasEquipped_Implementation()
+{
+	if (!bSkipNativeEquip)
+	{
+		Super::WasEquipped_Implementation();
+	}
+}
 
 void AAreaActionsEquipment::ProcessEvent(UFunction* Function, void* Parameters)
 {
-	static const FName Equipped(TEXT("WasEquipped")), UnEquipped(TEXT("WasUnEquipped"));
+	static const FName UnEquippedName(TEXT("WasUnEquipped")), TickName(TEXT("ReceiveTick"));
 	const FName Name = Function ? Function->GetFName() : NAME_None;
-	if (Name != Equipped && Name != UnEquipped)
+	const int32 NetMode = GetWorld() ? static_cast<int32>(GetWorld()->GetNetMode()) : -1;
+	// The Blueprint's graph calls InitOnServer without ProcessEvent; one that came over the network is a client asking the server to
+	// spawn an actor of a class it names
+	if (Name == InitOnServerName && UE::Net::FNetContext::IsInsideNetRPC())
+	{
+		if (!bRejectLogged)
+		{
+			bRejectLogged = true;
+			UE_LOG(LogAreaActionsCpp, Warning, TEXT("reject InitOnServer sent over the network for the tool %s (said once per tool)"), *GetName());
+		}
+		return;
+	}
+	if (Name == TickName)
+	{
+		if (!bEquippedLocally && IsEquipped() && IsLocalInstigator())
+		{
+			// The game called WasEquipped before this player's character was the local one (it had no controller yet): the Blueprint's
+			// part runs now. The game's own part ran then, so the graph's call of it is skipped.
+			bEquippedLocally = true;
+			UE_LOG(LogAreaActionsCpp, Log, TEXT("Tool WasEquipped: this player's, late, net mode %d"), NetMode);
+			if (UFunction* Graph = FindFunction(WasEquippedName))
+			{
+				TGuardValue<bool> Guard(bSkipNativeEquip, true);
+				Super::ProcessEvent(Graph, nullptr);
+			}
+		}
+		// The Blueprint's Tick shows the mouse cursor for the tool's windows and switches the tool's input with photo mode, all for this
+		// game's own player: it must not run for a tool another player holds
+		if (bEquippedLocally)
+		{
+			Super::ProcessEvent(Function, Parameters);
+		}
+		return;
+	}
+	if (Name != WasEquippedName && Name != UnEquippedName)
 	{
 		Super::ProcessEvent(Function, Parameters);
 		return;
 	}
+	bool bLocal = Name == WasEquippedName ? IsLocalInstigator() : bEquippedLocally;
+#if AA_WITH_TESTS
+	// The test mode's stand-in for a WasEquipped that comes before the character is the local one
+	bLocal &= Name != WasEquippedName || !FParse::Param(FCommandLine::Get(), TEXT("AATestLateEquip"));
+#endif
 	// On taking the tool away the instigator may be gone already, so the answer of WasEquipped is kept
-	const bool bLocal = Name == Equipped ? IsLocalInstigator() : bEquippedLocally;
-	bEquippedLocally = Name == Equipped && bLocal;
-	UE_LOG(LogAreaActionsCpp, Display, TEXT("Tool %s: %s player's, net mode %d"), *Name.ToString(), bLocal ? TEXT("this") : TEXT("another"),
-		GetWorld() ? static_cast<int32>(GetWorld()->GetNetMode()) : -1);
+	bEquippedLocally = Name == WasEquippedName && bLocal;
+	UE_LOG(LogAreaActionsCpp, Log, TEXT("Tool %s: %s player's, net mode %d"), *Name.ToString(), bLocal ? TEXT("this") : TEXT("another"), NetMode);
 	if (bLocal)
 	{
 		Super::ProcessEvent(Function, Parameters);
 	}
-	else if (Name == Equipped)
+	else if (Name == WasEquippedName)
 	{
 		AFGEquipment::WasEquipped_Implementation();
 	}

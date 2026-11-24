@@ -1,4 +1,5 @@
 #include "AreaActionsCopy.h"
+#include "AkComponent.h"
 #include "AreaActionsEquipment.h"
 #include "AreaActionsJobs.h"
 #include "AreaActionsLog.h"
@@ -98,11 +99,18 @@ void AAreaActionsPreview::Show(const TArray<AreaActionsBuildings::FSnapshot>& Bu
 		{
 			// Only this player's: not sent to clients from a host, nothing hits it or overlaps it
 			Hologram->SetReplicates(false);
+			GetWorld()->RemoveNetworkActor(Hologram);
 			Hologram->SetActorEnableCollision(false);
 			Hologram->SetActorTransform(Copy.Transform);
 			// Nothing moves it: the build gun's updates and placement checks stay off
 			Hologram->SetActorTickEnabled(false);
 			FHologramAccess::SetState(Hologram, EHologramMaterialState::HMS_OK);
+			// The game gives a hologram the build gun's loop sound; a preview is silent
+			TInlineComponentArray<UAkComponent*> Sounds(Hologram);
+			for (UAkComponent* Sound : Sounds)
+			{
+				Sound->Stop();
+			}
 			Holograms.Add(Hologram);
 			++Ghosts;
 			continue;

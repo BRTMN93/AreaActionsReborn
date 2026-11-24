@@ -56,6 +56,8 @@ public:
 
 	bool HasJobFor(const UAreaActionsRCO* Rco) const;
 	void Enqueue(TUniquePtr<FAreaActionsJob> Job);
+	// Jobs waiting or running (the test mode waits for none)
+	int32 NumJobs() const { return Jobs.Num(); }
 
 	virtual void Tick(float DeltaSeconds) override;
 
