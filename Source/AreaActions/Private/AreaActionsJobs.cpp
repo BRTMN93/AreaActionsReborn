@@ -533,26 +533,40 @@ namespace
 
 		int32 Count(TSubclassOf<UFGItemDescriptor> Item) const
 		{
-			int64 Total = Depot ? Depot->GetNumItemsFromCentralStorage(Item) : 0;
-			for (const UFGInventoryComponent* Inventory : Inventories)
+			int64 Total = Depot.IsValid() ? Depot->GetNumItemsFromCentralStorage(Item) : 0;
+			for (const TWeakObjectPtr<UFGInventoryComponent>& Inventory : Inventories)
 			{
-				Total += Inventory->GetNumItems(Item);
+				Total += Inventory.IsValid() ? Inventory->GetNumItems(Item) : 0;
 			}
 			return static_cast<int32>(FMath::Min<int64>(Total, MAX_int32));
 		}
 
-		void Take(TSubclassOf<UFGItemDescriptor> Item, int32 Amount)
+		bool Has(const AreaActionsBuildings::FItemCounts& Cost) const
 		{
-			for (UFGInventoryComponent* Inventory : Inventories)
+			for (const TPair<TSubclassOf<UFGItemDescriptor>, int32>& Entry : Cost)
 			{
-				const int32 Here = FMath::Min(Amount, Inventory->GetNumItems(Item));
+				if (Count(Entry.Key) < Entry.Value)
+				{
+					return false;
+				}
+			}
+			return true;
+		}
+
+		// Returns what was taken
+		int32 Take(TSubclassOf<UFGItemDescriptor> Item, int32 Amount)
+		{
+			const int32 Want = Amount;
+			for (const TWeakObjectPtr<UFGInventoryComponent>& Inventory : Inventories)
+			{
+				const int32 Here = Inventory.IsValid() ? FMath::Min(Amount, Inventory->GetNumItems(Item)) : 0;
 				if (Here > 0)
 				{
 					Inventory->Remove(Item, Here);
 					Amount -= Here;
 				}
 			}
-			if (Amount > 0 && Depot)
+			if (Amount > 0 && Depot.IsValid())
 			{
 				Amount -= Depot->TryRemoveItemsFromCentralStorage(Item, Amount);
 			}
@@ -560,11 +574,13 @@ namespace
 			{
 				UE_LOG(LogAreaActionsCpp, Error, TEXT("PlaceCopies: %d %s counted but not found when taken"), Amount, *GetNameSafe(Item));
 			}
+			return Want - Amount;
 		}
 
 	private:
-		TArray<UFGInventoryComponent*> Inventories;
-		AFGCentralStorageSubsystem* Depot = nullptr;
+		// Weak: the sources live as long as the job, over many frames, and a player who leaves takes the character's inventory along
+		TArray<TWeakObjectPtr<UFGInventoryComponent>> Inventories;
+		TWeakObjectPtr<AFGCentralStorageSubsystem> Depot;
 	};
 
 	class FPlaceCopiesJob final : public FAreaActionsJob
@@ -594,20 +610,30 @@ namespace
 			{
 				const AreaActionsBuildings::FPlanned& Copy = Copies[Next++];
 				const AreaActionsBuildings::FSnapshot& Source = Buildings[Copy.Source];
-				// The test mode can have every Nth copy refused, as the game refuses a copy it cannot place
+				// D22 (AA-098): a copy is paid in the frame it is built, so a save made while the job runs holds as many copies as cost was
+				// taken. The whole cost was there at the start; what a player used meanwhile leaves its copy unbuilt
+				const AreaActionsBuildings::FItemCounts* Cost = Sources ? &SourceCosts[Copy.Source] : nullptr;
+				// The test mode can have every Nth copy refused, as the game refuses a copy it cannot place; a refused copy costs nothing
 				const bool bRefused = RefuseCopiesForTest > 0 && Next % RefuseCopiesForTest == 0;
-				if (!bRefused && AreaActionsBuildings::Spawn(World, Source, Copy.Transform))
+				if (Cost && !Sources->Has(*Cost))
+				{
+					++Unpaid;
+				}
+				else if (!bRefused && AreaActionsBuildings::Spawn(World, Source, Copy.Transform))
 				{
 					++Result.Buildings;
 					Result.AddCount(Source.Class);
+					if (Cost)
+					{
+						for (const TPair<TSubclassOf<UFGItemDescriptor>, int32>& Entry : *Cost)
+						{
+							Result.Items += Sources->Take(Entry.Key, Entry.Value);
+						}
+					}
 				}
 				else
 				{
 					++Failed;
-					if (bCostTaken)
-					{
-						AreaActionsBuildings::AddCost(World, Source, Refund);
-					}
 				}
 				if (FPlatformTime::Seconds() > EndTime)
 				{
@@ -626,9 +652,13 @@ namespace
 			}
 			if (Failed > 0)
 			{
-				UE_LOG(LogAreaActionsCpp, Warning, TEXT("%s: the game refused %d copies"), GetName(), Failed);
+				UE_LOG(LogAreaActionsCpp, Warning, TEXT("%s: the game refused %d copies, they cost nothing"), GetName(), Failed);
 			}
-			GiveBack(World);
+			// shortcut: the result says only how many were built, not that items went missing during the job; add a message when players ask
+			if (Unpaid > 0)
+			{
+				UE_LOG(LogAreaActionsCpp, Warning, TEXT("%s: %d copies not built, their cost was used up while the job ran"), GetName(), Unpaid);
+			}
 		}
 
 	private:
@@ -690,15 +720,26 @@ namespace
 			{
 				return !Copies.IsEmpty();
 			}
+			// Each source building's cost once; the copies are paid one by one as they are built (D22)
+			SourceCosts.SetNum(Buildings.Num());
+			TBitArray<> Priced(false, Buildings.Num());
 			AreaActionsBuildings::FItemCounts Cost;
 			for (const AreaActionsBuildings::FPlanned& Copy : Copies)
 			{
-				AreaActionsBuildings::AddCost(World, Buildings[Copy.Source], Cost);
+				if (!Priced[Copy.Source])
+				{
+					Priced[Copy.Source] = true;
+					AreaActionsBuildings::AddCost(World, Buildings[Copy.Source], SourceCosts[Copy.Source]);
+				}
+				for (const TPair<TSubclassOf<UFGItemDescriptor>, int32>& Entry : SourceCosts[Copy.Source])
+				{
+					Cost.FindOrAdd(Entry.Key) += Entry.Value;
+				}
 			}
-			FCostSources From(World, GetPresentCharacter(), ContainerDistance);
+			Sources = MakeUnique<FCostSources>(World, GetPresentCharacter(), ContainerDistance);
 			for (const TPair<TSubclassOf<UFGItemDescriptor>, int32>& Entry : Cost)
 			{
-				if (const int32 Have = From.Count(Entry.Key); Have < Entry.Value && Result.Missing.Num() < FAreaActionsResult::MaxCounts)
+				if (const int32 Have = Sources->Count(Entry.Key); Have < Entry.Value && Result.Missing.Num() < FAreaActionsResult::MaxCounts)
 				{
 					Result.Missing.Add({ Entry.Key.Get(), Entry.Value - Have });
 				}
@@ -709,38 +750,7 @@ namespace
 				Copies.Reset();
 				return false;
 			}
-			for (const TPair<TSubclassOf<UFGItemDescriptor>, int32>& Entry : Cost)
-			{
-				From.Take(Entry.Key, Entry.Value);
-				Result.Items += Entry.Value;
-			}
-			bCostTaken = true;
 			return true;
-		}
-
-		// The cost of the copies the game refused goes back to the player, what does not fit into a crate next to them. A player who
-		// has left gets it all in a crate by the first building of the pattern, a place that exists in the world (AA-095)
-		void GiveBack(UWorld* World)
-		{
-			if (Refund.IsEmpty())
-			{
-				return;
-			}
-			AFGCharacterPlayer* Player = GetPresentCharacter();
-			UFGInventoryComponent* Inventory = Player ? Player->GetInventory() : nullptr;
-			const FVector Fallback = !Buildings.IsEmpty() ? Buildings[0].Transform.GetLocation()
-				: Area.Polygon.IsEmpty() ? FVector::ZeroVector : FVector(Area.Polygon[0], 0.0);
-			FReturnCrates Crates(GetName());
-			for (const TPair<TSubclassOf<UFGItemDescriptor>, int32>& Entry : Refund)
-			{
-				Result.Items -= Entry.Value;
-				const int32 Added = Inventory ? Inventory->AddStack(FInventoryStack(Entry.Value, Entry.Key), true) : 0;
-				if (Entry.Value > Added)
-				{
-					Crates.Add(World, FInventoryStack(Entry.Value - Added, Entry.Key), Player, Fallback);
-				}
-			}
-			Crates.Finish(Result);
 		}
 
 		FAreaActionsPlacement Placement;
@@ -749,10 +759,12 @@ namespace
 		AreaActionsBuildings::FCollector Collector;
 		TArray<AreaActionsBuildings::FSnapshot> Buildings;
 		TArray<AreaActionsBuildings::FPlanned> Copies;
-		AreaActionsBuildings::FItemCounts Refund;
+		// With a cost: where it comes from and each source building's cost (by index in Buildings)
+		TUniquePtr<FCostSources> Sources;
+		TArray<AreaActionsBuildings::FItemCounts> SourceCosts;
 		int32 Next = 0;
 		int32 Failed = 0;
-		bool bCostTaken = false;
+		int32 Unpaid = 0;
 		bool bNoSource = false;
 	};
 

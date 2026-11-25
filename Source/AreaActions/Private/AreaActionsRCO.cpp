@@ -8,6 +8,7 @@
 #include "FGPlayerController.h"
 #include "FGRecipe.h"
 #include "FGRecipeManager.h"
+#include "GameFramework/CharacterMovementComponent.h"
 #include "GameFramework/PlayerState.h"
 #include "HAL/IConsoleManager.h"
 #include "Net/UnrealNetwork.h"
@@ -250,6 +251,7 @@ void UAreaActionsRCO::ServerSetFlying_Implementation(bool bFly)
 	{
 		UE_LOG(LogAreaActionsCpp, Warning, TEXT("reject %s SetFlying: no living character"), Name);
 		++RejectCount;
+		ClientSetFlying(false);
 		return;
 	}
 	// Landing needs no tool, taking off does
@@ -257,10 +259,23 @@ void UAreaActionsRCO::ServerSetFlying_Implementation(bool bFly)
 	{
 		UE_LOG(LogAreaActionsCpp, Warning, TEXT("reject %s SetFlying: the tool is not in hand"), Name);
 		++RejectCount;
+		ClientSetFlying(AAreaActionsEquipment::IsFlying(Character));
 		return;
 	}
 	AAreaActionsEquipment::ApplyFlying(Character, bFly);
 	UE_LOG(LogAreaActionsCpp, Display, TEXT("SetFlying %s: %s"), Name, bFly ? TEXT("on") : TEXT("off"));
+}
+
+void UAreaActionsRCO::ClientSetFlying_Implementation(bool bFly)
+{
+	ACharacter* Character = GetOwnerPlayerController() ? Cast<ACharacter>(GetOwnerPlayerController()->GetPawn()) : nullptr;
+	const UCharacterMovementComponent* Movement = Character ? Character->GetCharacterMovement() : nullptr;
+	// The host's own character is the server's: nothing to bring back. A client's is switched only when it differs
+	if (Movement && !Character->HasAuthority() && (AAreaActionsEquipment::IsFlying(Character) != bFly || Movement->bCheatFlying != bFly))
+	{
+		AAreaActionsEquipment::ApplyFlying(Character, bFly);
+		UE_LOG(LogAreaActionsCpp, Display, TEXT("Tool: flying %s, as the server has it"), bFly ? TEXT("on") : TEXT("off"));
+	}
 }
 
 void UAreaActionsRCO::ClientResult_Implementation(int32 RequestId, const FAreaActionsResult& Result)

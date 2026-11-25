@@ -51,6 +51,9 @@ public:
 	// the server's copy here, so the server takes the moves the client sends
 	UFUNCTION(Server, Reliable)
 	void ServerSetFlying(bool bFly);
+	// A refused ServerSetFlying sends the server's state back, so a client that switched itself already walks again (AA-101)
+	UFUNCTION(Client, Reliable)
+	void ClientSetFlying(bool bFly);
 
 	UFUNCTION(Client, Reliable)
 	void ClientResult(int32 RequestId, const FAreaActionsResult& Result);

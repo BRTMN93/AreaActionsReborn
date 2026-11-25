@@ -956,15 +956,24 @@ namespace
 				}
 				return EStep::Next;
 			});
-			R.Steps.Add(WaitFrames(3));
-			R.Steps.Add([Targets, Index](FRun& Self)
+			R.Steps.Add([Targets, Index, Since = MakeShared<double>(0.0)](FRun& Self)
 			{
+				// AA-100: the camera reaches the new direction some frames after LookAt, more under load: wait for a hit within 100 cm, at most 2 s.
 				// AA-077: a click that cannot land fails with its cause
+				if (*Since == 0.0)
+				{
+					*Since = Self.Now();
+				}
 				FHitResult Hit;
 				const bool bHit = AimHit(Self, Hit);
 				const double Off = bHit && Targets->IsValidIndex(Index) ? FVector::Dist(Hit.Location, (*Targets)[Index]) : -1.0;
-				Self.Check(bHit && Off <= 100.0, FString::Printf(TEXT("aim %d hits %s at %s, %.0f cm from the target"), Index + 1,
-					bHit ? *GetNameSafe(Hit.GetActor()) : TEXT("nothing within the tool's range"), bHit ? *Hit.Location.ToCompactString() : TEXT("-"), Off));
+				if (!(bHit && Off <= 100.0) && Self.Now() - *Since < 2.0)
+				{
+					return EStep::Wait;
+				}
+				Self.Check(bHit && Off <= 100.0, FString::Printf(TEXT("aim %d hits %s at %s, %.0f cm from the target after %.2f s"), Index + 1,
+					bHit ? *GetNameSafe(Hit.GetActor()) : TEXT("nothing within the tool's range"), bHit ? *Hit.Location.ToCompactString() : TEXT("-"), Off, Self.Now() - *Since));
+				*Since = 0.0;
 				Self.Step(FString::Printf(TEXT("left click %d at %s"), Index + 1, Targets->IsValidIndex(Index) ? *(*Targets)[Index].ToCompactString() : TEXT("-")));
 				PressKey(Self, EKeys::LeftMouseButton);
 				return EStep::Next;
@@ -4823,6 +4832,137 @@ namespace
 		AddDeleteSave(R, SaveName);
 	}
 
+	// Everything a Copy or Fill may take Item from: the player's inventory, every storage container (the job takes from those in range,
+	// scenes of earlier runs hold some too) and the depot
+	int32 SourcesHold(const FRun& R, TSubclassOf<UFGItemDescriptor> Item)
+	{
+		const UFGInventoryComponent* Inventory = PlayerInventory(R);
+		int32 Sum = Inventory ? Inventory->GetNumItems(Item) : 0;
+		TArray<AFGBuildableStorage*> Storages;
+		if (const AFGBuildableSubsystem* Buildables = AFGBuildableSubsystem::Get(R.GetWorld()))
+		{
+			Buildables->GetTypedBuildable<AFGBuildableStorage>(Storages);
+		}
+		for (AFGBuildableStorage* Storage : Storages)
+		{
+			Sum += IsValid(Storage) && Storage->GetStorageInventory() ? Storage->GetStorageInventory()->GetNumItems(Item) : 0;
+		}
+		return Sum + DepotCount(R.GetWorld(), Item);
+	}
+
+	// AA-098 (1): Copy (a pattern of 25 foundations) and Fill (one foundation, 29 copies) with build cost, one copy a frame, a save while
+	// the job is half done, the save loaded: the items in the cost's sources and the cost of the copies that stand add up to what the
+	// sources held before, to the item (D22: each copy is paid in the frame it is built)
+	void AddSaveDuringCopy(FRun& R, bool bFill)
+	{
+		struct FCopySave
+		{
+			int32 Copies = 0;
+			uint64 SentFrame = 0;
+			uint64 DoneFrame = 0;
+			int32 SaveResult = -1;
+			int32 BuiltAtSave = 0;
+			AreaActionsBuildings::FItemCounts Before;
+		};
+		const FString Name = bFill ? TEXT("Fill") : TEXT("Copy");
+		const FString SaveName = FString::Printf(TEXT("AATest_SaveDuringJob_%s"), *Name);
+		FSceneRef S = MakeShared<FScene>();
+		FCopyRef C = MakeShared<FCopyState>();
+		TSharedRef<FCopySave> J = MakeShared<FCopySave>();
+		J->Copies = bFill ? 6 * 5 - 1 : 25;
+		AddScene(R, S, 4000.0, [C, bFill](FRun& Self, FScene& Scene)
+		{
+			C->Base = Ground(Self, Scene.Center);
+			for (int32 Index = 0; Index < (bFill ? 1 : 25); ++Index)
+			{
+				AddLightweight(Self, *C, TEXT("Build_Foundation_8x1_01"), TEXT("Recipe_Foundation_8x1_01"),
+					FTransform(C->Base + FVector((Index % 5 - 2) * 800.0, (Index / 5 - 2) * 800.0, 0.0)));
+			}
+			AddControlStorages(Self, Scene);
+			Scene.Inside.Add(Scene.Controls[0]);
+			C->Pivot = PlacesCenter(*C);
+		}, bFill ? 45000.0 : 30000.0);
+		R.Steps.Add([C, J, Name](FRun& Self)
+		{
+			// Half of the cost in the inventory, the rest and 5 more of each item in the container in range
+			const int32 Pieces = C->Pattern.Num();
+			const int32 Copies = J->Copies;
+			SetCostSources(Self, *C, [Copies, Pieces](int32 Cost) { return Cost / Pieces * Copies / 2; },
+				[Copies, Pieces](int32 Cost) { return Cost / Pieces * Copies - Cost / Pieces * Copies / 2 + 5; }, CostNone, CostNone);
+			for (const TPair<TSubclassOf<UFGItemDescriptor>, int32>& Entry : C->Cost)
+			{
+				J->Before.Add(Entry.Key, SourcesHold(Self, Entry.Key));
+			}
+			Self.Step(FString::Printf(TEXT("%s: %d pattern pieces, %d copies wanted, sources before %s; budget 0 ms"), *Name, Pieces, Copies, *ItemsText(J->Before)));
+			SetBudget(0.0f);
+			return EStep::Next;
+		});
+		// AddOpenAction keeps the pointer: a literal, not the local FString's buffer
+		AddOpenAction(R, bFill ? TEXT("Fill") : TEXT("Copy"));
+		R.Steps.Add([J](FRun& Self)
+		{
+			J->SentFrame = GFrameCounter;
+			return EStep::Next;
+		});
+		if (bFill)
+		{
+			AddFillWindow(R, FVector(1, 1, 0), FIntVector(6, 5, 1), FVector2D(0, 0), true);
+		}
+		else
+		{
+			AddCopyWindow(R, FVector(100, 0, 0), 0.0, true);
+		}
+		R.Steps.Add([C, J, SaveName](FRun& Self)
+		{
+			const int32 Built = LightweightCount(Self.GetWorld()) - C->LightweightsBefore;
+			if (Built < J->Copies / 2)
+			{
+				return EStep::Wait;
+			}
+			J->BuiltAtSave = Built;
+			Self.Step(FString::Printf(TEXT("saving %s with %d of %d copies built, %llu frames after the request"), *SaveName, Built, J->Copies, GFrameCounter - J->SentFrame));
+			UFGSaveSession::Get(Self.GetWorld())->SaveGame(SaveName, FOnSaveGameComplete::CreateLambda([J](bool bOk, const FText&, void*) { J->SaveResult = bOk ? 1 : 0; }), nullptr);
+			return EStep::Next;
+		});
+		R.Steps.Add([J](FRun& Self)
+		{
+			const AAreaActionsServerSubsystem* Server = AAreaActionsServerSubsystem::Get(Self.GetWorld());
+			if (J->SaveResult < 0 || (Server && Server->NumJobs() > 0))
+			{
+				return EStep::Wait;
+			}
+			J->DoneFrame = GFrameCounter;
+			SetBudget(2.0f);
+			return EStep::Next;
+		});
+		AddResultWindow(R, S);
+		R.Steps.Add([S, J, bFill](FRun& Self)
+		{
+			Self.Check(J->SaveResult == 1, TEXT("saved during the job"));
+			Self.Check(J->BuiltAtSave > 0 && J->BuiltAtSave < J->Copies, FString::Printf(TEXT("the save came mid-job: %d of %d copies built"), J->BuiltAtSave, J->Copies));
+			const FString Want = bFill ? FString::Printf(TEXT("Filled with %d buildings."), J->Copies) : FString::Printf(TEXT("Copied %d buildings."), J->Copies);
+			Self.Check(S->Message.Contains(Want) && J->DoneFrame - J->SentFrame >= 10, FString::Printf(TEXT("job done: '%s' (want '%s'), %llu frames (at least 10)"), *S->Message, *Want,
+				J->DoneFrame - J->SentFrame));
+			return EStep::Next;
+		});
+		AddLoad(R, SaveName);
+		R.Steps.Add([C, J, Name](FRun& Self)
+		{
+			const int32 Standing = LightweightCount(Self.GetWorld()) - C->LightweightsBefore;
+			const int32 Pieces = FMath::Max(1, C->Pattern.Num());
+			Self.Check(Standing > 0 && Standing < J->Copies, FString::Printf(TEXT("%s loaded: %d of %d copies stand"), *Name, Standing, J->Copies));
+			for (const TPair<TSubclassOf<UFGItemDescriptor>, int32>& Entry : C->Cost)
+			{
+				const int32 Hold = SourcesHold(Self, Entry.Key);
+				const int32 Paid = Entry.Value / Pieces * Standing;
+				Self.Check(Hold + Paid == J->Before.FindRef(Entry.Key), FString::Printf(TEXT("%s loaded: %s in the sources %d + cost of %d standing copies %d = %d, want %d"), *Name,
+					*GetNameSafe(Entry.Key), Hold, Standing, Paid, Hold + Paid, J->Before.FindRef(Entry.Key)));
+			}
+			return EStep::Next;
+		});
+		AddDeleteSave(R, SaveName);
+	}
+
 	// AA-078 (2): a chainsaw with energy stored keeps it in the crate, through "Move to crate" and through MassDismantle
 	void AddCrateItemState(FRun& R, bool bDismantle, float Energy, double Side)
 	{
@@ -5444,7 +5584,7 @@ namespace
 
 	// AA-095: the client fills with build cost, paid from a container next to it; the server builds one copy a frame (budget 0) and the
 	// client leaves on the way. The server builds every copy and takes the cost once. With bRefuse every 10th copy counts as refused by
-	// the game: its cost goes into a crate by the pattern, because the player is gone
+	// the game: a copy is paid when it is built (D22), so a refused one costs nothing and no crate is made
 	void AddDisconnectCopy(FRun& R, bool bRefuse)
 	{
 		const int32 Side = 20;
@@ -5488,24 +5628,14 @@ namespace
 			for (const TPair<TSubclassOf<UFGItemDescriptor>, int32>& Entry : C->Cost)
 			{
 				const int32 Near = StorageCount(C->NearBox, Entry.Key);
-				const int32 WantNear = C->Near.FindRef(Entry.Key) - Entry.Value * Copies;
+				const int32 WantNear = C->Near.FindRef(Entry.Key) - Entry.Value * (Copies - Refused);
 				Self.Check(Near == WantNear && StorageCount(C->FarBox, Entry.Key) == C->Far.FindRef(Entry.Key) && DepotCount(Self.GetWorld(), Entry.Key) == C->Depot.FindRef(Entry.Key),
 					FString::Printf(TEXT("cost taken once: %s near container %d (want %d), far %d (want %d), depot %d (want %d)"), *GetNameSafe(Entry.Key), Near, WantNear,
 						StorageCount(C->FarBox, Entry.Key), C->Far.FindRef(Entry.Key), DepotCount(Self.GetWorld(), Entry.Key), C->Depot.FindRef(Entry.Key)));
 			}
-			// The refused copies' cost: in crates by the pattern's first building, as much as those copies cost
+			// D22: the refused copies were never paid, nothing goes back
 			const TArray<AFGCrate*> Crates = NewCrates(Self, *S);
-			const FCratesSeen Seen = SeeCrates(Crates, C->Pattern.IsEmpty() ? Self.Origin : C->Pattern[0].Transform.GetLocation());
-			int32 WantAll = 0;
-			bool bEach = true;
-			for (const TPair<TSubclassOf<UFGItemDescriptor>, int32>& Entry : C->Cost)
-			{
-				WantAll += Entry.Value * Refused;
-				bEach &= Seen.Items.FindRef(Entry.Key) == Entry.Value * Refused;
-			}
-			Self.Check(bEach && Seen.All == WantAll && (Refused == 0 ? Crates.IsEmpty() : Seen.Far < 1500.0),
-				FString::Printf(TEXT("refund of %d refused copies with the player gone: %d crates, %d items (want %d), farthest from the pattern %.0f cm"), Refused, Crates.Num(),
-					Seen.All, WantAll, Seen.Far));
+			Self.Check(Crates.IsEmpty(), FString::Printf(TEXT("%d refused copies cost nothing with the player gone: %d crates (want 0)"), Refused, Crates.Num()));
 			return EStep::Next;
 		});
 		AddHostGoesOn(R);
@@ -5878,6 +6008,53 @@ namespace
 		{
 			const AFGCharacterPlayer* Character = GetCharacter(Self);
 			Self.Check(UAreaActionsRCO::RejectCount - F->RejectsBefore == 1 && !AAreaActionsEquipment::IsFlying(Character), FString::Printf(TEXT("refused: reject lines %d (want 1), flying %d"),
+				UAreaActionsRCO::RejectCount - F->RejectsBefore, AAreaActionsEquipment::IsFlying(Character)));
+			return EStep::Next;
+		});
+	}
+
+	// AA-101: the client switches its own character before it asks the server (ToggleFlying); a server that sees the tool put away refuses
+	// and sends its state back, so the client walks again within 1 s
+	void AddFlyReject(FRun& R)
+	{
+		TSharedRef<FFly> F = MakeShared<FFly>();
+		AddEquipTool(R);
+		AddPutToolAway(R);
+		AddHost(R, [F](FRun& Self)
+		{
+			F->RejectsBefore = UAreaActionsRCO::RejectCount;
+			return EStep::Next;
+		});
+		R.Steps.Add([F](FRun& Self)
+		{
+			// What ToggleFlying does on a client whose tool the server has already put away
+			AFGCharacterPlayer* Character = GetCharacter(Self);
+			if (Character && !Character->HasAuthority())
+			{
+				AAreaActionsEquipment::ApplyFlying(Character, true);
+			}
+			Self.Step(TEXT("asking the server to fly with the tool put away on the server"));
+			UAreaActionsRCO::Of(Self.GetPlayer())->ServerSetFlying(true);
+			F->Since = Self.Now();
+			return EStep::Next;
+		});
+		R.Steps.Add([F](FRun& Self)
+		{
+			const AFGCharacterPlayer* Character = GetCharacter(Self);
+			const UCharacterMovementComponent* Movement = Character ? Character->GetCharacterMovement() : nullptr;
+			const bool bWalks = Movement && Movement->MovementMode != MOVE_Flying && !Movement->bCheatFlying;
+			if (!bWalks && Self.Now() - F->Since < 1.0)
+			{
+				return EStep::Wait;
+			}
+			Self.Check(bWalks, FString::Printf(TEXT("%s: walking again after %.2f s (mode %d, cheat flying %d; want not flying within 1 s)"),
+				Self.bClient ? TEXT("client") : TEXT("game"), Self.Now() - F->Since, Movement ? static_cast<int32>(Movement->MovementMode) : -1, Movement && Movement->bCheatFlying));
+			return EStep::Next;
+		});
+		AddHost(R, [F](FRun& Self)
+		{
+			const AFGCharacterPlayer* Character = GetCharacter(Self);
+			Self.Check(UAreaActionsRCO::RejectCount - F->RejectsBefore == 1 && !AAreaActionsEquipment::IsFlying(Character), FString::Printf(TEXT("refused: reject lines %d (want 1), server's copy flying %d"),
 				UAreaActionsRCO::RejectCount - F->RejectsBefore, AAreaActionsEquipment::IsFlying(Character)));
 			return EStep::Next;
 		});
@@ -6602,6 +6779,11 @@ namespace
 			AddFly(R);
 			return true;
 		}
+		if (R.Scenario == TEXT("FlyReject"))
+		{
+			AddFlyReject(R);
+			return true;
+		}
 		if (R.Scenario == TEXT("Tutorial"))
 		{
 			R.StepTimeoutSec = 60.0;
@@ -6692,6 +6874,8 @@ namespace
 			AddSaveDuringJob(R, EJobKind::SetRecipe, 301);
 			AddSaveDuringJob(R, EJobKind::Clear, 302);
 			AddSaveDuringJob(R, EJobKind::Dismantle, 303);
+			AddSaveDuringCopy(R, false);
+			AddSaveDuringCopy(R, true);
 			return true;
 		}
 		if (R.Scenario == TEXT("CrateItemState"))

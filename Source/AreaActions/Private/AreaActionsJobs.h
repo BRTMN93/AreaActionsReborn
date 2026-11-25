@@ -18,7 +18,7 @@ namespace AreaActionsJobs
 	TUniquePtr<FAreaActionsJob> MakeSetStationMode(bool bLoad);
 	// Copy and Fill: copies of the area's buildings where the placement puts them, except onto an equal building; with bUseCost the build
 	// cost comes from the player's inventory, then the storage containers within ContainerDistance cm of the player, then the dimensional
-	// depot (D17, D18), all or nothing
+	// depot (D17, D18): the whole cost must be there at the start (else nothing is built), each copy is paid in the frame it is built (D22)
 	TUniquePtr<FAreaActionsJob> MakePlaceCopies(const FAreaActionsPlacement& Placement, bool bUseCost, double ContainerDistance);
 	// MassDismantle: every building, lightweight and crate in the area the game lets anyone dismantle; the refund goes into return crates
 	// at the player, fluids are lost

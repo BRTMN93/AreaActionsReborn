@@ -58,8 +58,8 @@ void AAreaActionsServerSubsystem::Init()
 
 void AAreaActionsServerSubsystem::EndPlay(const EEndPlayReason::Type Reason)
 {
-	// Nothing carries over into the next load. shortcut: a Copy or Fill cut off here keeps the cost of its unbuilt copies; the world
-	// goes with it unless a save is made in the same moment. Finish the jobs here when a server's own shutdown save shows the gap.
+	// Nothing carries over into the next load. A job cut off here loses nothing: every job keeps the world whole after each building
+	// (items go into crates as they leave, AA-078; a copy is paid in the frame it is built, D22), so any save holds a consistent world
 	Jobs.Reset();
 	Super::EndPlay(Reason);
 }
