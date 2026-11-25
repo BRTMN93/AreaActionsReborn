@@ -14,6 +14,8 @@ class FAreaActionsTests
 public:
 	// Once per game process, in the first game world
 	static void StartFromCommandLine(UWorld* World);
+	// -AATestJoin=<host>[:<port>]: the client joins that dedicated server through the game's Server Manager, from the main menu
+	static void JoinFromCommandLine();
 };
 
 #endif

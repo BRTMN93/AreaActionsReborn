@@ -25,6 +25,8 @@ namespace AreaActionsJobs
 	TUniquePtr<FAreaActionsJob> MakeDismantle(bool bToCrate);
 	// The test mode: 1 = return crates find no room next to the player, 2 = no crate can be placed at all (the messages, AA-085); 0 = off
 	void SetCratesFailForTest(int32 Mode);
+	// The test mode: every Nth copy of a Copy or Fill counts as refused by the game (its cost goes back); 0 = off
+	void SetRefuseCopiesForTest(int32 EveryNth);
 	// Most copies one request may build (AreaActions.MaxSpawnPerRequest)
 	int32 GetMaxSpawn();
 }

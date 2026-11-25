@@ -70,6 +70,15 @@
 #include "Kismet/GameplayStatics.h"
 #include "Misc/CommandLine.h"
 #include "Misc/OutputDeviceRedirector.h"
+#include "Misc/FileHelper.h"
+#include "Misc/Paths.h"
+#if !UE_SERVER
+#include "FGServerManager.h"
+#include "FGServerObject.h"
+#endif
+#if UE_SERVER
+#include "FGServerSubsystem.h"
+#endif
 
 namespace
 {
@@ -132,6 +141,8 @@ namespace
 		// runs the action and the host builds and checks the world, unless bPeerActs is off (the host acts, the client watches).
 		bool bMp = false;
 		bool bClient = false;
+		// A dedicated server in the host's place (AA-050): it has no player of its own
+		bool bDedicated = false;
 		bool bPeerActs = true;
 		// The scenario's name without MP_ or MP_Host
 		FString Scenario;
@@ -162,7 +173,8 @@ namespace
 
 		double Now() const { return FPlatformTime::Seconds(); }
 		UWorld* GetWorld() const { return World.Get(); }
-		APlayerController* GetLocalPlayer() const { return World.IsValid() ? UGameplayStatics::GetPlayerController(World.Get(), 0) : nullptr; }
+		// This game's own player; a dedicated server has none (its first controller is a client's)
+		APlayerController* GetLocalPlayer() const { return World.IsValid() && !bDedicated ? UGameplayStatics::GetPlayerController(World.Get(), 0) : nullptr; }
 		// The player the scenario is about: the one who has the tool and runs the action
 		APlayerController* GetPlayer() const { return bMp && !bClient && bPeerActs ? Peer.Get() : GetLocalPlayer(); }
 		// This game runs the action's windows
@@ -565,9 +577,14 @@ namespace
 		R.Steps.Add([](FRun& Self)
 		{
 			AFGCharacterPlayer* Own = Self.GetLocalPlayer() ? Cast<AFGCharacterPlayer>(Self.GetLocalPlayer()->GetPawn()) : nullptr;
-			if (!Own || !Self.Peer.IsValid() || !Cast<AFGCharacterPlayer>(Self.Peer->GetPawn()))
+			if ((!Own && !Self.bDedicated) || !Self.Peer.IsValid() || !Cast<AFGCharacterPlayer>(Self.Peer->GetPawn()))
 			{
 				return EStep::Wait;
+			}
+			if (!Own)
+			{
+				// A dedicated server holds the whole map: the place is traced at once, the client's player goes there in the next step
+				return EStep::Next;
 			}
 			// The host's own character goes first: the ground there streams in around it
 			Self.Step(FString::Printf(TEXT("host to X=%.0f Y=%.0f from %s"), TestPlace.X, TestPlace.Y, *Own->GetActorLocation().ToCompactString()));
@@ -578,27 +595,33 @@ namespace
 		R.Steps.Add([](FRun& Self)
 		{
 			FHitResult Hit, BehindHit;
-			AFGCharacterPlayer* Own = Cast<AFGCharacterPlayer>(Self.GetLocalPlayer()->GetPawn());
+			AFGCharacterPlayer* Own = Self.GetLocalPlayer() ? Cast<AFGCharacterPlayer>(Self.GetLocalPlayer()->GetPawn()) : nullptr;
 			AFGCharacterPlayer* Theirs = Self.Peer.IsValid() ? Cast<AFGCharacterPlayer>(Self.Peer->GetPawn()) : nullptr;
 			const FVector2D Behind(TestPlace.X - 4000.0, TestPlace.Y);
-			if (!Own || !Theirs || !TraceGround(Self.GetWorld(), TestPlace, Hit) || !TraceGround(Self.GetWorld(), Behind, BehindHit))
+			if ((!Own && !Self.bDedicated) || !Theirs || !TraceGround(Self.GetWorld(), TestPlace, Hit) || !TraceGround(Self.GetWorld(), Behind, BehindHit))
 			{
 				return EStep::Wait;
 			}
-			const double Up = Own->GetSimpleCollisionHalfHeight() + 20.0;
+			const double Up = Theirs->GetSimpleCollisionHalfHeight() + 20.0;
 			// Whole centimetres: the place travels as three numbers
 			Self.Origin = FVector(TestPlace.X, TestPlace.Y, FMath::RoundToDouble(Hit.Location.Z + Up));
 			AFGCharacterPlayer* Acting = Self.bPeerActs ? Theirs : Own;
 			AFGCharacterPlayer* Watching = Self.bPeerActs ? Own : Theirs;
-			Own->GetCharacterMovement()->SetMovementMode(MOVE_Walking);
-			Watching->TeleportTo(BehindHit.Location + FVector(0, 0, Up), FRotator::ZeroRotator);
+			if (Own)
+			{
+				Own->GetCharacterMovement()->SetMovementMode(MOVE_Walking);
+				Self.GetLocalPlayer()->SetControlRotation(FRotator::ZeroRotator);
+			}
+			if (Watching)
+			{
+				Watching->TeleportTo(BehindHit.Location + FVector(0, 0, Up), FRotator::ZeroRotator);
+			}
 			Acting->TeleportTo(Self.Origin, FRotator::ZeroRotator);
-			Self.GetLocalPlayer()->SetControlRotation(FRotator::ZeroRotator);
 			Send(Self, MsgOriginX, FMath::RoundToInt32(Self.Origin.X));
 			Send(Self, MsgOriginY, FMath::RoundToInt32(Self.Origin.Y));
 			Send(Self, MsgOriginZ, FMath::RoundToInt32(Self.Origin.Z));
 			Self.Check(true, FString::Printf(TEXT("place %s for the %s's player, the other one at %s"), *Self.Origin.ToCompactString(), Self.bPeerActs ? TEXT("client") : TEXT("host"),
-				*Watching->GetActorLocation().ToCompactString()));
+				Watching ? *Watching->GetActorLocation().ToCompactString() : TEXT("none (dedicated server)")));
 			return EStep::Next;
 		});
 		Mark(R, ESide::Client);
@@ -5150,10 +5173,21 @@ namespace
 		R.bBuildAfterLeave = true;
 	}
 
-	// The host goes on for 10 s and its own player runs an action: the server's jobs are alive
+	// The host goes on for 10 s and its own player runs an action: the server's jobs are alive. A dedicated server has no player of
+	// its own: it goes on for 10 s with no job left
 	void AddHostGoesOn(FRun& R)
 	{
 		R.Steps.Add(WaitSeconds(10.0));
+		if (R.bDedicated)
+		{
+			R.Steps.Add([](FRun& Self)
+			{
+				const AAreaActionsServerSubsystem* Server = AAreaActionsServerSubsystem::Get(Self.GetWorld());
+				Self.Check(Server && Server->NumJobs() == 0, FString::Printf(TEXT("the dedicated server went on 10 s after the client left: jobs %d"), Server ? Server->NumJobs() : -1));
+				return EStep::Next;
+			});
+			return;
+		}
 		AddSetStation(R, 12000.0);
 	}
 
@@ -5166,6 +5200,7 @@ namespace
 		constexpr double Spacing = 1000.0;
 		FSceneRef S = MakeShared<FScene>();
 		TSharedRef<int32> JobsBefore = MakeShared<int32>(0);
+		TSharedRef<int32> UnsentBefore = MakeShared<int32>(0);
 		AddEquipTool(R);
 		AddBoth(R, [S](FRun& Self)
 		{
@@ -5195,11 +5230,12 @@ namespace
 			});
 		}
 		R.Steps.Add(WaitFrames(30));
-		R.Steps.Add([S, JobsBefore](FRun& Self)
+		R.Steps.Add([S, JobsBefore, UnsentBefore](FRun& Self)
 		{
 			Self.Check(S->Inside.Num() == Columns * Rows && AllValid(S->Inside), FString::Printf(TEXT("%d machines built, 3 items in each"), S->Inside.Num()));
 			SnapshotCrates(Self, *S);
 			*JobsBefore = AAreaActionsServerSubsystem::FinishedJobs;
+			*UnsentBefore = AAreaActionsServerSubsystem::ResultsWithoutPlayer;
 			return EStep::Next;
 		});
 		Mark(R, ESide::Client);
@@ -5212,7 +5248,7 @@ namespace
 		R.Steps.Add(WaitFrames(30));
 		AddClientLeaves(R, TEXT("in the middle of its SetRecipe job"));
 		TSharedRef<int32> JobsAtLeave = MakeShared<int32>(-1);
-		R.Steps.Add([S, JobsBefore, JobsAtLeave](FRun& Self)
+		R.Steps.Add([S, JobsBefore, JobsAtLeave, UnsentBefore](FRun& Self)
 		{
 			const AAreaActionsServerSubsystem* Server = AAreaActionsServerSubsystem::Get(Self.GetWorld());
 			if (*JobsAtLeave < 0)
@@ -5235,11 +5271,12 @@ namespace
 			}
 			const FCratesSeen Seen = SeeCrates(NewCrates(Self, *S), Self.Origin);
 			const int32 All = Columns * Rows;
-			// The job ends either way: cancelled between two machines (no AAJOB result line), or run to its end
+			// AA-095: the job runs to its end without the player, and its result goes to nobody
 			const int32 Finished = AAreaActionsServerSubsystem::FinishedJobs - *JobsBefore;
-			Self.Check(Server && Changed > 0 && (Changed < All ? Finished == 0 : Finished == 1),
-				FString::Printf(TEXT("the job ended after the player left: %d of %d machines changed, %s, jobs left 0"), Changed, All,
-					Finished ? TEXT("run to its end") : TEXT("cancelled")));
+			const int32 Unsent = AAreaActionsServerSubsystem::ResultsWithoutPlayer - *UnsentBefore;
+			Self.Check(Server && Changed == All && Finished == 1 && Unsent == 1,
+				FString::Printf(TEXT("the job ran to its end after the player left: %d of %d machines changed, AAJOB lines %d (want 1), results with no player to go to %d (want 1)"),
+					Changed, All, Finished, Unsent));
 			Self.Check(InChanged == 0 && Seen.All == Changed * 3 && InMachines + Seen.All == All * 3,
 				FString::Printf(TEXT("the changed machines' items are in crates: %d in crates (want %d), %d left in changed machines, %d in all machines and crates (want %d)"),
 					Seen.All, Changed * 3, InChanged, InMachines + Seen.All, All * 3));
@@ -5264,6 +5301,236 @@ namespace
 			return EStep::Next;
 		});
 		AddHostGoesOn(R);
+	}
+
+	// AA-095: the client fills with build cost, paid from a container next to it; the server builds one copy a frame (budget 0) and the
+	// client leaves on the way. The server builds every copy and takes the cost once. With bRefuse every 10th copy counts as refused by
+	// the game: its cost goes into a crate by the pattern, because the player is gone
+	void AddDisconnectCopy(FRun& R, bool bRefuse)
+	{
+		const int32 Side = 20;
+		const int32 Copies = Side * Side - 1;
+		const int32 EveryNth = 10;
+		const int32 Refused = bRefuse ? Copies / EveryNth : 0;
+		FSceneRef S = MakeShared<FScene>();
+		FCopyRef C = MakeShared<FCopyState>();
+		TSharedRef<int32> UnsentBefore = MakeShared<int32>(0);
+		AddCopyScene(R, S, C, BuildSingle);
+		AddHost(R, [S, C, UnsentBefore, Copies, EveryNth, bRefuse](FRun& Self)
+		{
+			// The whole cost and 7 more of each item in the container 15 m behind the player, none in the inventory
+			SetCostSources(Self, *C, CostNone, [Copies](int32 Cost) { return Cost * Copies + 7; }, CostNone, CostNone);
+			SnapshotCrates(Self, *S);
+			*UnsentBefore = AAreaActionsServerSubsystem::ResultsWithoutPlayer;
+			SetBudget(0.0f);
+			AreaActionsJobs::SetRefuseCopiesForTest(bRefuse ? EveryNth : 0);
+			return EStep::Next;
+		});
+		AddOpenAction(R, TEXT("Fill"));
+		AddFillWindow(R, FVector(1, 1, 0), FIntVector(Side, Side, 1), FVector2D(0, 0), true);
+		R.Steps.Add(WaitFrames(10));
+		AddClientLeaves(R, TEXT("in the middle of its Fill job with build cost"));
+		R.Steps.Add([S, C, UnsentBefore, Copies, Refused](FRun& Self)
+		{
+			const AAreaActionsServerSubsystem* Server = AAreaActionsServerSubsystem::Get(Self.GetWorld());
+			if (Server && Server->NumJobs() > 0)
+			{
+				return EStep::Wait;
+			}
+			SetBudget(2.0f);
+			AreaActionsJobs::SetRefuseCopiesForTest(0);
+			const int32 Lightweights = LightweightCount(Self.GetWorld());
+			const int32 Finished = AAreaActionsServerSubsystem::FinishedJobs - C->JobsBefore;
+			const int32 Unsent = AAreaActionsServerSubsystem::ResultsWithoutPlayer - *UnsentBefore;
+			Self.Check(Lightweights == C->LightweightsBefore + Copies - Refused && Finished == 1 && Unsent == 1,
+				FString::Printf(TEXT("the Fill ran to its end after the player left: lightweights %d (want %d), AAJOB lines %d (want 1), results with no player to go to %d (want 1)"),
+					Lightweights, C->LightweightsBefore + Copies - Refused, Finished, Unsent));
+			// The cost of every planned copy went once, from the container next to the player; the far one and the depot kept theirs
+			for (const TPair<TSubclassOf<UFGItemDescriptor>, int32>& Entry : C->Cost)
+			{
+				const int32 Near = StorageCount(C->NearBox, Entry.Key);
+				const int32 WantNear = C->Near.FindRef(Entry.Key) - Entry.Value * Copies;
+				Self.Check(Near == WantNear && StorageCount(C->FarBox, Entry.Key) == C->Far.FindRef(Entry.Key) && DepotCount(Self.GetWorld(), Entry.Key) == C->Depot.FindRef(Entry.Key),
+					FString::Printf(TEXT("cost taken once: %s near container %d (want %d), far %d (want %d), depot %d (want %d)"), *GetNameSafe(Entry.Key), Near, WantNear,
+						StorageCount(C->FarBox, Entry.Key), C->Far.FindRef(Entry.Key), DepotCount(Self.GetWorld(), Entry.Key), C->Depot.FindRef(Entry.Key)));
+			}
+			// The refused copies' cost: in crates by the pattern's first building, as much as those copies cost
+			const TArray<AFGCrate*> Crates = NewCrates(Self, *S);
+			const FCratesSeen Seen = SeeCrates(Crates, C->Pattern.IsEmpty() ? Self.Origin : C->Pattern[0].Transform.GetLocation());
+			int32 WantAll = 0;
+			bool bEach = true;
+			for (const TPair<TSubclassOf<UFGItemDescriptor>, int32>& Entry : C->Cost)
+			{
+				WantAll += Entry.Value * Refused;
+				bEach &= Seen.Items.FindRef(Entry.Key) == Entry.Value * Refused;
+			}
+			Self.Check(bEach && Seen.All == WantAll && (Refused == 0 ? Crates.IsEmpty() : Seen.Far < 1500.0),
+				FString::Printf(TEXT("refund of %d refused copies with the player gone: %d crates, %d items (want %d), farthest from the pattern %.0f cm"), Refused, Crates.Num(),
+					Seen.All, WantAll, Seen.Far));
+			return EStep::Next;
+		});
+		AddHostGoesOn(R);
+	}
+
+	// AA-050 point 4: the client copies, the server checks the copies, writes down what it expects and saves; ServerRestart checks it in
+	// the server's next process
+	const TCHAR* const RestartSave = TEXT("AATest_ServerRestart");
+
+	FString RestartFile()
+	{
+		return FPaths::ProjectSavedDir() / TEXT("AATest_ServerRestart.txt");
+	}
+
+	void AddServerSave(FRun& R)
+	{
+		FSceneRef S = MakeShared<FScene>();
+		FCopyRef C = MakeShared<FCopyState>();
+		TSharedRef<int32> Saved = MakeShared<int32>(-1);
+		AddCopyScene(R, S, C, BuildBasic);
+		AddCopy(R, S, C, FVector(20, 0, 0), 0.0, false);
+		AddCheckMessage(R, S, TEXT("Copied 9 buildings."));
+		AddChecks(R, [C](FRun& Self)
+		{
+			CheckCopies(Self, *C, true, TEXT("copied"));
+			return EStep::Next;
+		});
+		AddHost(R, [C, Saved](FRun& Self)
+		{
+			TArray<FString> Lines;
+			Lines.Add(FString::Printf(TEXT("Copy\t%s\t%s\t%s"), *C->Delta.ToString(), *FString::SanitizeFloat(C->Yaw), *C->Pivot.ToString()));
+			for (const FPiece& Piece : C->Pattern)
+			{
+				Lines.Add(FString::Printf(TEXT("Piece\t%d\t%s\t%s\t%s\t%s"), Piece.bLightweight ? 1 : 0, *FString::SanitizeFloat(Piece.BeamLength), *Piece.ClassPath,
+					Piece.RecipePath.IsEmpty() ? TEXT("-") : *Piece.RecipePath, *Piece.Transform.ToString()));
+			}
+			Self.Check(FFileHelper::SaveStringArrayToFile(Lines, *RestartFile()), FString::Printf(TEXT("expected copies written to %s: %d pieces"), *RestartFile(), C->Pattern.Num()));
+			Self.Step(FString::Printf(TEXT("saving %s"), RestartSave));
+			UFGSaveSession::Get(Self.GetWorld())->SaveGame(RestartSave, FOnSaveGameComplete::CreateLambda([Saved](bool bOk, const FText& Error, void*)
+			{
+				*Saved = bOk ? 1 : 0;
+				UE_LOG(LogAreaActionsCpp, Display, TEXT("AATEST save done: %d %s"), bOk, *Error.ToString());
+			}), nullptr);
+			return EStep::Next;
+		});
+		AddHost(R, [Saved](FRun& Self)
+		{
+			if (*Saved < 0)
+			{
+				return EStep::Wait;
+			}
+			Self.Check(*Saved == 1, FString::Printf(TEXT("the server saved %s"), RestartSave));
+			return EStep::Next;
+		});
+	}
+
+	// The mod's Error and Warning lines while it lives, both log categories (the C++ one and the Blueprints' one)
+	struct FModLogCounter : public FOutputDevice
+	{
+		int32 Errors = 0;
+		int32 Warnings = 0;
+		FModLogCounter() { GLog->AddOutputDevice(this); }
+		virtual ~FModLogCounter() override { GLog->RemoveOutputDevice(this); }
+		virtual void Serialize(const TCHAR* V, ELogVerbosity::Type Verbosity, const FName& Category) override
+		{
+			if (Category == LogAreaActionsCpp.GetCategoryName() || Category == FName(TEXT("LogAreaActions")))
+			{
+				Errors += Verbosity <= ELogVerbosity::Error ? 1 : 0;
+				Warnings += Verbosity == ELogVerbosity::Warning ? 1 : 0;
+			}
+		}
+	};
+
+	// AA-050 points 4 and 5, the dedicated server alone in its next process: ServerSave's copies stand with their data, then 5 minutes with
+	// no player and no mod error, the world not paused
+	void AddServerRestart(FRun& R)
+	{
+		FCopyRef C = MakeShared<FCopyState>();
+		R.StepTimeoutSec = 420.0;
+		R.Steps.Add(WaitCalm(30));
+		R.Steps.Add([C](FRun& Self)
+		{
+			TArray<FString> Lines;
+			if (!Self.Check(FFileHelper::LoadFileToStringArray(Lines, *RestartFile()) && !Lines.IsEmpty(), FString::Printf(TEXT("expected copies read from %s"), *RestartFile())))
+			{
+				return EStep::Next;
+			}
+			for (const FString& Line : Lines)
+			{
+				TArray<FString> Parts;
+				Line.ParseIntoArray(Parts, TEXT("\t"), false);
+				if (Parts.Num() == 4 && Parts[0] == TEXT("Copy"))
+				{
+					C->Delta.InitFromString(Parts[1]);
+					LexFromString(C->Yaw, *Parts[2]);
+					C->Pivot.InitFromString(Parts[3]);
+				}
+				else if (Parts.Num() == 6 && Parts[0] == TEXT("Piece"))
+				{
+					FPiece Piece;
+					Piece.bLightweight = Parts[1] == TEXT("1");
+					LexFromString(Piece.BeamLength, *Parts[2]);
+					Piece.ClassPath = Parts[3];
+					Piece.RecipePath = Parts[4] == TEXT("-") ? FString() : Parts[4];
+					Piece.Transform.InitFromString(Parts[5]);
+					Piece.Resolve();
+					Piece.bIgnored = Piece.Class && AreaActionsBuildings::ShouldIgnore(Piece.Class);
+					C->Pattern.Add(Piece);
+				}
+			}
+			Self.Step(FString::Printf(TEXT("loaded world %s: %d pieces expected, copy moved by %s"), *Self.GetWorld()->GetMapName(), C->Pattern.Num(), *C->Delta.ToCompactString()));
+			CheckCopies(Self, *C, true, TEXT("after the server restart"));
+			return EStep::Next;
+		});
+		struct FIdle { TSharedPtr<FModLogCounter> Log; double Start = 0.0; double GameStart = 0.0; double LastReport = 0.0; };
+		R.Steps.Add([Idle = MakeShared<FIdle>()](FRun& Self)
+		{
+			UWorld* World = Self.GetWorld();
+			if (!Idle->Log)
+			{
+				Idle->Log = MakeShared<FModLogCounter>();
+				Idle->Start = Idle->LastReport = Self.Now();
+				Idle->GameStart = World->GetTimeSeconds();
+				Self.Step(FString::Printf(TEXT("5 minutes with no player, net mode %d, players %d"), static_cast<int32>(World->GetNetMode()), World->GetNumPlayerControllers()));
+			}
+			if (Self.Now() - Idle->LastReport >= 60.0)
+			{
+				Idle->LastReport = Self.Now();
+				Self.Step(FString::Printf(TEXT("idle %.0f s: game time %.0f s, mod errors %d, warnings %d, paused %d"), Self.Now() - Idle->Start, World->GetTimeSeconds() - Idle->GameStart,
+					Idle->Log->Errors, Idle->Log->Warnings, World->IsPaused()));
+			}
+			if (Self.Now() - Idle->Start < 300.0)
+			{
+				return EStep::Wait;
+			}
+			const double Real = Self.Now() - Idle->Start;
+			const double Game = World->GetTimeSeconds() - Idle->GameStart;
+			Self.Check(Idle->Log->Errors == 0, FString::Printf(TEXT("%.0f s with no player: mod error lines %d (want 0), warnings %d"), Real, Idle->Log->Errors, Idle->Log->Warnings));
+			Self.Check(World->GetNumPlayerControllers() == 0 && Game >= Real * 0.9, FString::Printf(TEXT("the server ran, not paused: game time %.0f s of %.0f s, players %d"), Game, Real,
+				World->GetNumPlayerControllers()));
+			Idle->Log.Reset();
+			return EStep::Next;
+		});
+	}
+
+	// A save for the dedicated server's runs: a new game with the player at the test place
+	void AddServerBase(FRun& R)
+	{
+		TSharedRef<int32> Saved = MakeShared<int32>(-1);
+		R.Steps.Add(WaitCalm(30));
+		R.Steps.Add([Saved](FRun& Self)
+		{
+			UFGSaveSession::Get(Self.GetWorld())->SaveGame(TEXT("AATest_ServerBase"), FOnSaveGameComplete::CreateLambda([Saved](bool bOk, const FText&, void*) { *Saved = bOk ? 1 : 0; }), nullptr);
+			return EStep::Next;
+		});
+		R.Steps.Add([Saved](FRun& Self)
+		{
+			if (*Saved < 0)
+			{
+				return EStep::Wait;
+			}
+			Self.Check(*Saved == 1, TEXT("saved AATest_ServerBase"));
+			return EStep::Next;
+		});
 	}
 
 	bool BuildScenario(FRun& R)
@@ -5360,6 +5627,26 @@ namespace
 		if (R.Scenario == TEXT("DisconnectPreview"))
 		{
 			AddDisconnectPreview(R);
+			return true;
+		}
+		if (R.Scenario == TEXT("DisconnectCopy") || R.Scenario == TEXT("DisconnectCopyRefund"))
+		{
+			AddDisconnectCopy(R, R.Scenario == TEXT("DisconnectCopyRefund"));
+			return true;
+		}
+		if (R.Scenario == TEXT("ServerSave"))
+		{
+			AddServerSave(R);
+			return true;
+		}
+		if (R.Name == TEXT("ServerRestart"))
+		{
+			AddServerRestart(R);
+			return true;
+		}
+		if (R.Name == TEXT("ServerBase"))
+		{
+			AddServerBase(R);
 			return true;
 		}
 		if (R.Scenario == TEXT("CrateMessages"))
@@ -5608,7 +5895,8 @@ namespace
 				Send(R, MsgHello, 0);
 			}
 		}
-		return R.Now() - R.Created < 240.0;
+		// A dedicated server's world is up long before the client's game has started and joined
+		return R.Now() - R.Created < (R.bDedicated ? 420.0 : 240.0);
 	}
 
 	// AA-040 point 2: what this game holds of the mod's windows, the tool's indicators and action actors right now
@@ -5824,6 +6112,9 @@ static void WatchFramePhases()
 	});
 }
 
+// -AATestLoad: on until the test's own save load has been issued (JoinFromCommandLine)
+static bool bAwaitTestSave = false;
+
 void FAreaActionsTests::StartFromCommandLine(UWorld* World)
 {
 	FString Name;
@@ -5851,6 +6142,14 @@ void FAreaActionsTests::StartFromCommandLine(UWorld* World)
 	{
 		return;
 	}
+	// A dedicated server passes through its lobby map (or the session its settings name) before the test's save is loaded: the
+	// scenario starts in the game map that load makes
+	const bool bDedicated = World->GetNetMode() == NM_DedicatedServer;
+	if (bDedicated && (bAwaitTestSave || !World->GetMapName().Contains(TEXT("Persistent_Level"))))
+	{
+		UE_LOG(LogAreaActionsCpp, Display, TEXT("AATEST %s step dedicated server in %s, waiting for the game map"), *Name, *World->GetMapName());
+		return;
+	}
 	Run = MakeUnique<FRun>();
 	Run->Name = Name;
 	Run->World = World;
@@ -5859,6 +6158,7 @@ void FAreaActionsTests::StartFromCommandLine(UWorld* World)
 	// MP_<name>: two game instances; in MP_Host<name> the host's own player acts and the client watches
 	Run->bMp = Name.StartsWith(TEXT("MP_"));
 	Run->bClient = bClient;
+	Run->bDedicated = bDedicated;
 		Run->bPeerActs = !Name.StartsWith(TEXT("MP_Host"));
 	Run->Scenario = Name;
 	if (Run->bMp && !Run->Scenario.RemoveFromStart(TEXT("MP_Host")))
@@ -5866,7 +6166,7 @@ void FAreaActionsTests::StartFromCommandLine(UWorld* World)
 		Run->Scenario.RemoveFromStart(TEXT("MP_"));
 	}
 	UE_LOG(LogAreaActionsCpp, Display, TEXT("AATEST %s step scenario in %s, net mode %d%s"), *Name, *World->GetMapName(), static_cast<int32>(World->GetNetMode()),
-		Run->bMp ? (bClient ? TEXT(", the client of two games") : TEXT(", the host of two games")) : TEXT(""));
+		Run->bMp ? (bClient ? TEXT(", the client of two games") : bDedicated ? TEXT(", the dedicated server of two games") : TEXT(", the host of two games")) : TEXT(""));
 	if (Run->bMp)
 	{
 		Run->StepTimeoutSec = 120.0;
@@ -5876,7 +6176,20 @@ void FAreaActionsTests::StartFromCommandLine(UWorld* World)
 			PingHandle = UAreaActionsRCO::OnPing.AddStatic(&OnHostPing);
 		}
 	}
-	AddPlace(*Run);
+	// The dedicated server's own scenarios (ServerRestart) have no player to place; MP_Host<name> needs the host's own player
+	if (bDedicated && (!Run->bMp || !Run->bPeerActs))
+	{
+		if (Run->bMp)
+		{
+			Run->Check(false, TEXT("MP_Host scenarios need a host with a player, not a dedicated server"));
+			Finish(*Run);
+			return;
+		}
+	}
+	else
+	{
+		AddPlace(*Run);
+	}
 	if (!BuildScenario(*Run))
 	{
 		Run->Check(false, TEXT("unknown scenario"));
@@ -5891,7 +6204,8 @@ void FAreaActionsTests::StartFromCommandLine(UWorld* World)
 		{
 			const FString Seen = FString::Printf(TEXT("mod windows %d, tool indicators %d, action actors %d, holograms and preview actors %d"), Self.MaxWindows, Self.MaxIndicators,
 				Self.MaxActions, Self.MaxGhosts);
-			if (Self.Acts())
+			// A dedicated server has no player: after the client left nobody acted there either
+			if (Self.Acts() && !Self.bDedicated)
 			{
 				Self.Check(Self.MaxIndicators > 0, FString::Printf(TEXT("this game's player acted: here at most %s"), *Seen));
 			}
@@ -5915,6 +6229,170 @@ void FAreaActionsTests::StartFromCommandLine(UWorld* World)
 	}
 	WatchFramePhases();
 	FTSTicker::GetCoreTicker().AddTicker(FTickerDelegate::CreateStatic(&Tick));
+}
+
+#if !UE_SERVER
+namespace
+{
+	// The game asks a server in its list for its state only while something listens to that server, as the Server Manager's window does.
+	// A plain C++ listener (the server target has no client module to derive a UCLASS from); its object is the game instance, and it
+	// ignores what it hears.
+	class FJoinListener : public IFGServerStateListener
+	{
+	public:
+		TWeakObjectPtr<UObject> Owner;
+		virtual UObject* _getUObject() const override { return Owner.Get(); }
+		virtual void NativeOnServerStateChanged(UFGServerObject*, EServerState) override {}
+		virtual void NativeOnServerGameStateChanged(UFGServerObject*, const FServerGameState&) override {}
+		virtual void NativeOnServerAPIStateChanged(UFGServerObject*, EFGServerAPIState) override {}
+		virtual void NativeOnServerAuthenticationChanged(UFGServerObject*, const FServerAuthenticationToken&) override {}
+		virtual void NativeOnServerRenamed(UFGServerObject*, const FString&) override {}
+		virtual void NativeOnServerComplexStateChanged(UFGServerObject*, EServerComplexState) override {}
+		virtual void NativeOnNewServerConsoleOutput(UFGServerObject*, const FString&) override {}
+	};
+	FJoinListener JoinListener;
+}
+#endif
+
+void FAreaActionsTests::JoinFromCommandLine()
+{
+	// -AATestLoad=<save>: a dedicated server starts in its lobby map, or in the session its settings name; the test loads its own save
+	// once (a hard travel, as the server's API does), and the scenario starts only in that world
+	FString LoadSave;
+	if (IsRunningDedicatedServer() && FParse::Value(FCommandLine::Get(), TEXT("AATestLoad="), LoadSave))
+	{
+		bAwaitTestSave = true;
+		FTSTicker::GetCoreTicker().AddTicker(FTickerDelegate::CreateLambda([LoadSave, From = TWeakObjectPtr<UWorld>(), Keep = FString(), bIssued = false](float) mutable
+		{
+			if (!GEngine)
+			{
+				return true;
+			}
+			for (const FWorldContext& Context : GEngine->GetWorldContexts())
+			{
+				UWorld* World = Context.World();
+				if (Context.WorldType != EWorldType::Game || !World || !World->HasBegunPlay())
+				{
+					continue;
+				}
+				if (!bIssued)
+				{
+					bIssued = true;
+					From = World;
+#if UE_SERVER
+					// The load makes the test's session the one the server loads at its next start (its settings file); the session it
+					// had is written back once the test's world is up. -AATestAutoLoadSession=<name> writes that name instead.
+					if (const UFGServerSubsystem* Server = World->GetGameInstance() ? World->GetGameInstance()->GetSubsystem<UFGServerSubsystem>() : nullptr)
+					{
+						Keep = Server->GetAutoLoadSessionName();
+					}
+					FParse::Value(FCommandLine::Get(), TEXT("AATestAutoLoadSession="), Keep);
+#endif
+					UE_LOG(LogAreaActionsCpp, Display, TEXT("AATEST load: %s from %s"), *LoadSave, *World->GetMapName());
+					bAwaitTestSave = false;
+					UGameplayStatics::OpenLevel(World, FName(TEXT("/Game/FactoryGame/Map/GameLevel01/Persistent_Level")), true, FString::Printf(TEXT("?loadgame=%s"), *LoadSave));
+					return true;
+				}
+				if (World == From.Get() || !World->GetMapName().Contains(TEXT("Persistent_Level")))
+				{
+					return true;
+				}
+#if UE_SERVER
+				const UFGServerSubsystem* Settings = World->GetGameInstance() ? World->GetGameInstance()->GetSubsystem<UFGServerSubsystem>() : nullptr;
+				if (Settings && !Keep.IsEmpty())
+				{
+					Settings->SetAutoLoadSessionName(Keep);
+					UE_LOG(LogAreaActionsCpp, Display, TEXT("AATEST load: the server's auto-load session is %s again"), *Settings->GetAutoLoadSessionName());
+				}
+#endif
+				return false;
+			}
+			return true;
+		}), 2.f);
+	}
+#if !UE_SERVER
+	FString Address;
+	if (!FParse::Value(FCommandLine::Get(), TEXT("AATestJoin="), Address))
+	{
+		return;
+	}
+	FString Host = Address;
+	FString PortText;
+	int32 Port = 7777;
+	if (Address.Split(TEXT(":"), &Host, &PortText))
+	{
+		LexFromString(Port, *PortText);
+	}
+	// What a player does in the Server Manager: the server is activated (its state is polled), the client logs in without a password,
+	// then joins. One step every 5 s from the main menu, so a join under way is left alone; done once this game is in the server's world.
+	FTSTicker::GetCoreTicker().AddTicker(FTickerDelegate::CreateLambda([Host, Port, LastSec = 0.0, Activated = TWeakObjectPtr<UFGServerObject>()](float) mutable
+	{
+		if (!GEngine)
+		{
+			return true;
+		}
+		UWorld* Menu = nullptr;
+		for (const FWorldContext& Context : GEngine->GetWorldContexts())
+		{
+			UWorld* World = Context.World();
+			if (Context.WorldType != EWorldType::Game || !World || !World->HasBegunPlay())
+			{
+				continue;
+			}
+			// While joining, the menu world reports NM_Client too; its context holds the pending game
+			if (World->GetNetMode() == NM_Client && !Context.PendingNetGame)
+			{
+				UE_LOG(LogAreaActionsCpp, Display, TEXT("AATEST join %s:%d: in the server's world %s"), *Host, Port, *World->GetMapName());
+				return false;
+			}
+			Menu = World->GetNetMode() == NM_Standalone && !Context.PendingNetGame ? World : Menu;
+		}
+		const double Now = FPlatformTime::Seconds();
+		if (!Menu || Now - LastSec < 5.0)
+		{
+			return true;
+		}
+		LastSec = Now;
+		UFGServerManager* Manager = Menu->GetGameInstance() ? Menu->GetGameInstance()->GetSubsystem<UFGServerManager>() : nullptr;
+		UFGServerObject* Server = Manager ? Manager->GetServerByHostname(Host, Port) : nullptr;
+		if (!Server)
+		{
+			UE_LOG(LogAreaActionsCpp, Display, TEXT("AATEST join %s:%d is not in the game's Server Manager: add it there once and accept its certificate"), *Host, Port);
+			return true;
+		}
+		const FString StateName = UEnum::GetValueAsString(Server->GetComplexState());
+		if (Activated.Get() != Server)
+		{
+			Activated = Server;
+			JoinListener.Owner = Menu->GetGameInstance();
+			TScriptInterface<IFGServerStateListener> Listener;
+			Listener.SetObject(Menu->GetGameInstance());
+			Listener.SetInterface(&JoinListener);
+			Server->RegisterStateListener(Listener);
+			Server->OnServerActivated();
+			UE_LOG(LogAreaActionsCpp, Display, TEXT("AATEST join %s:%d: server activated, state %s"), *Host, Port, *StateName);
+			return true;
+		}
+		const EServerComplexState State = Server->GetComplexState();
+		const TCHAR* Did = TEXT("waiting");
+		if (State == EServerComplexState::GameRunning_Connected_Client || State == EServerComplexState::GameRunning_Connected_Admin)
+		{
+			Did = Server->Join() ? TEXT("joining") : TEXT("join refused");
+		}
+		else if (State == EServerComplexState::GameRunning_ConnectionFailed || State == EServerComplexState::NoGameRunning_ConnectionFailed)
+		{
+			Server->AttemptServerAPIConnection();
+			Did = TEXT("connecting to the server API again");
+		}
+		else if (State == EServerComplexState::GameRunning_Connected_NonAuthenticated || State == EServerComplexState::GameRunning_NotConnected_CompatibleVersion)
+		{
+			Server->Authenticate(EPrivilegeLevel::Client, true);
+			Did = TEXT("logging in as a client");
+		}
+		UE_LOG(LogAreaActionsCpp, Display, TEXT("AATEST join %s:%d: %s, server state %s"), *Host, Port, Did, *StateName);
+		return true;
+	}), 1.f);
+#endif
 }
 
 #endif

@@ -1,6 +1,7 @@
 #include "AreaActionsInstanceModule.h"
 #include "AreaActionsLog.h"
 #include "AreaActionsRCO.h"
+#include "AreaActionsTests.h"
 
 uint8 UAreaActionsInstanceModule::PhasesSeen = 0;
 
@@ -16,4 +17,10 @@ void UAreaActionsInstanceModule::DispatchLifecycleEvent(ELifecyclePhase Phase)
 	Super::DispatchLifecycleEvent(Phase);
 	PhasesSeen |= 1 << static_cast<uint8>(Phase);
 	UE_LOG(LogAreaActionsCpp, Display, TEXT("Instance module %s"), *LifecyclePhaseToString(Phase));
+#if AA_WITH_TESTS
+	if (Phase == ELifecyclePhase::POST_INITIALIZATION)
+	{
+		FAreaActionsTests::JoinFromCommandLine();
+	}
+#endif
 }

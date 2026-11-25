@@ -28,6 +28,10 @@ public:
 	virtual void Finish(UWorld* World);
 	// The count in the AAJOB line
 	virtual int32 GetItems() const { return Found.Num(); }
+	// The player who asked is still connected (the RCO lives on after a disconnect until garbage collection)
+	bool HasPlayer() const;
+	// The player's character while the player is connected, else nullptr: what a job gives back goes to a crate instead
+	AFGCharacterPlayer* GetPresentCharacter() const;
 
 	int32 RequestId = 0;
 	FAreaActionsArea Area;
@@ -63,6 +67,8 @@ public:
 
 	// Jobs finished in this process, one per AAJOB result line (the test mode counts them)
 	static int32 FinishedJobs;
+	// Of those, the ones whose player had left, so the result went to nobody (AA-095)
+	static int32 ResultsWithoutPlayer;
 
 protected:
 	virtual void Init() override;

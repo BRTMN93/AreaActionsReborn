@@ -39,7 +39,20 @@ public class AreaActions : ModuleRules
 		PublicDependencyModuleNames.AddRange(new string[] { "FactoryGame", "SML", "AbstractInstance" });
 
 		// Developer test mode (-AATest=<Scenario>). The release gate decides whether a release build keeps it.
-		PrivateDefinitions.Add("AA_WITH_TESTS=1");
+		bool bWithTests = true;
+		if (bWithTests) {
+			PrivateDefinitions.Add("AA_WITH_TESTS=1");
+			// The test mode's client joins a dedicated server through the game's Server Manager; the server target has no client module
+			if (Target.Type != TargetRules.TargetType.Server) {
+				PrivateDependencyModuleNames.Add("FactoryDedicatedClient");
+			}
+			// ... and the test mode's dedicated server keeps its own auto-load session after loading a test save
+			if (Target.Type == TargetRules.TargetType.Server) {
+				PrivateDependencyModuleNames.Add("FactoryDedicatedServer");
+			}
+		} else {
+			PrivateDefinitions.Add("AA_WITH_TESTS=0");
+		}
 		// The preview stops its holograms' sound components (Wwise)
 		PrivateDependencyModuleNames.Add("AkAudio");
 	}

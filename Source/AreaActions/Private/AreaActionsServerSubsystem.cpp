@@ -1,6 +1,8 @@
 #include "AreaActionsServerSubsystem.h"
 #include "AreaActionsLog.h"
 #include "AreaActionsRCO.h"
+#include "FGPlayerController.h"
+#include "Engine/NetConnection.h"
 #include "EngineUtils.h"
 #include "FGBuildableSubsystem.h"
 #include "FGCrate.h"
@@ -11,6 +13,7 @@ static TAutoConsoleVariable<float> CVarServerBudgetMs(TEXT("AreaActions.ServerBu
 	TEXT("Time per frame the server spends on area actions, for all players together (ms); 0 = one building per frame"));
 
 int32 AAreaActionsServerSubsystem::FinishedJobs = 0;
+int32 AAreaActionsServerSubsystem::ResultsWithoutPlayer = 0;
 
 void FAreaActionsJob::Finish(UWorld* World)
 {
@@ -18,6 +21,20 @@ void FAreaActionsJob::Finish(UWorld* World)
 	{
 		Result.Code = EAreaActionsResultCode::NothingInArea;
 	}
+}
+
+bool FAreaActionsJob::HasPlayer() const
+{
+	const UAreaActionsRCO* Owner = Rco.Get();
+	const APlayerController* Player = Owner ? Owner->GetOwnerPlayerController() : nullptr;
+	// A remote player whose connection is gone or closing has left; the host's own player has none and is always here
+	const UNetConnection* Connection = IsValid(Player) ? Player->GetNetConnection() : nullptr;
+	return IsValid(Player) && (Player->IsLocalController() || (Connection && Connection->GetConnectionState() == USOCK_Open));
+}
+
+AFGCharacterPlayer* FAreaActionsJob::GetPresentCharacter() const
+{
+	return HasPlayer() ? Character.Get() : nullptr;
 }
 
 AAreaActionsServerSubsystem::AAreaActionsServerSubsystem()
@@ -68,16 +85,9 @@ void AAreaActionsServerSubsystem::Tick(float DeltaSeconds)
 	const double Share = FMath::Max(0.0f, CVarServerBudgetMs.GetValueOnGameThread()) / 1000.0 / Jobs.Num();
 	for (int32 Index = 0; Index < Jobs.Num();)
 	{
+		// A job runs to its end even when its player has left (AA-095): stopping half way would leave half a copy, or items taken
+		// out of machines with no crate yet
 		FAreaActionsJob& Job = *Jobs[Index];
-		UAreaActionsRCO* Rco = Job.Rco.Get();
-		if (!Rco)
-		{
-			// The player left: the job ends between two buildings; Finish still hands over what was already taken (SetRecipe's crate)
-			Job.Finish(GetWorld());
-			UE_LOG(LogAreaActionsCpp, Display, TEXT("AAJOB %s cancelled, the player left, buildings=%d"), Job.GetName(), Job.Result.Buildings);
-			Jobs.RemoveAt(Index);
-			continue;
-		}
 		const double SliceStart = FPlatformTime::Seconds();
 		const bool bDone = Job.Step(GetWorld(), FMath::Max(SliceStart, Start) + Share);
 		++Job.Frames;
@@ -91,7 +101,16 @@ void AAreaActionsServerSubsystem::Tick(float DeltaSeconds)
 		UE_LOG(LogAreaActionsCpp, Display, TEXT("AAJOB %s items=%d frames=%d maxslice=%.2f code=%d buildings=%d"),
 			Job.GetName(), Job.GetItems(), Job.Frames, Job.MaxSliceMs, static_cast<int32>(Job.Result.Code), Job.Result.Buildings);
 		++FinishedJobs;
-		Rco->ClientResult(Job.RequestId, Job.Result);
+		if (Job.HasPlayer())
+		{
+			Job.Rco->ClientResult(Job.RequestId, Job.Result);
+		}
+		else
+		{
+			// The player left while the job ran: its RCO outlives the connection until garbage collection, so the result has nobody to go to
+			UE_LOG(LogAreaActionsCpp, Display, TEXT("AAJOB %s request %d: the player left, no result sent"), Job.GetName(), Job.RequestId);
+			++ResultsWithoutPlayer;
+		}
 		Jobs.RemoveAt(Index);
 	}
 }

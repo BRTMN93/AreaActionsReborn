@@ -334,6 +334,9 @@ namespace
 
 	int32 FReturnCrates::FailForTest = 0;
 
+	// AreaActionsJobs::SetRefuseCopiesForTest
+	int32 RefuseCopiesForTest = 0;
+
 	// Counts the inventory's contents and empties it; the solid stacks go into Crates when it is given (fluids cannot go into a crate)
 	FTaken TakeAll(UFGInventoryComponent* Inventory, FReturnCrates* Crates, AFGCharacterPlayer* Player, const AActor* From)
 	{
@@ -392,7 +395,7 @@ namespace
 			{
 				if (Inventory)
 				{
-					Result.Items += TakeAll(Inventory, &Crates, Character.Get(), Machine).Solids;
+					Result.Items += TakeAll(Inventory, &Crates, GetPresentCharacter(), Machine).Solids;
 				}
 			}
 			Machine->SetRecipe(Recipe);
@@ -437,7 +440,7 @@ namespace
 			{
 				if (Inventory && Inventory != Upgrades)
 				{
-					const FTaken One = TakeAll(Inventory, bToCrate ? &Crates : nullptr, Character.Get(), Actor);
+					const FTaken One = TakeAll(Inventory, bToCrate ? &Crates : nullptr, GetPresentCharacter(), Actor);
 					Taken.Solids += One.Solids;
 					Taken.Fluid += One.Fluid;
 				}
@@ -591,7 +594,9 @@ namespace
 			{
 				const AreaActionsBuildings::FPlanned& Copy = Copies[Next++];
 				const AreaActionsBuildings::FSnapshot& Source = Buildings[Copy.Source];
-				if (AreaActionsBuildings::Spawn(World, Source, Copy.Transform))
+				// The test mode can have every Nth copy refused, as the game refuses a copy it cannot place
+				const bool bRefused = RefuseCopiesForTest > 0 && Next % RefuseCopiesForTest == 0;
+				if (!bRefused && AreaActionsBuildings::Spawn(World, Source, Copy.Transform))
 				{
 					++Result.Buildings;
 					Result.AddCount(Source.Class);
@@ -622,15 +627,6 @@ namespace
 			if (Failed > 0)
 			{
 				UE_LOG(LogAreaActionsCpp, Warning, TEXT("%s: the game refused %d copies"), GetName(), Failed);
-			}
-			// A job ended early (the player left) gives back the cost of the copies it did not get to
-			if (bCostTaken && Next < Copies.Num())
-			{
-				UE_LOG(LogAreaActionsCpp, Display, TEXT("%s ended after %d of %d copies"), GetName(), Next, Copies.Num());
-				for (; Next < Copies.Num(); ++Next)
-				{
-					AreaActionsBuildings::AddCost(World, Buildings[Copies[Next].Source], Refund);
-				}
 			}
 			GiveBack(World);
 		}
@@ -699,7 +695,7 @@ namespace
 			{
 				AreaActionsBuildings::AddCost(World, Buildings[Copy.Source], Cost);
 			}
-			FCostSources From(World, Character.Get(), ContainerDistance);
+			FCostSources From(World, GetPresentCharacter(), ContainerDistance);
 			for (const TPair<TSubclassOf<UFGItemDescriptor>, int32>& Entry : Cost)
 			{
 				if (const int32 Have = From.Count(Entry.Key); Have < Entry.Value && Result.Missing.Num() < FAreaActionsResult::MaxCounts)
@@ -722,16 +718,18 @@ namespace
 			return true;
 		}
 
-		// The cost of the copies the game refused goes back to the player, what does not fit into a crate next to them
+		// The cost of the copies the game refused goes back to the player, what does not fit into a crate next to them. A player who
+		// has left gets it all in a crate by the first building of the pattern, a place that exists in the world (AA-095)
 		void GiveBack(UWorld* World)
 		{
 			if (Refund.IsEmpty())
 			{
 				return;
 			}
-			AFGCharacterPlayer* Player = Character.Get();
+			AFGCharacterPlayer* Player = GetPresentCharacter();
 			UFGInventoryComponent* Inventory = Player ? Player->GetInventory() : nullptr;
-			const FVector Fallback = Area.Polygon.IsEmpty() ? FVector::ZeroVector : FVector(Area.Polygon[0], 0.0);
+			const FVector Fallback = !Buildings.IsEmpty() ? Buildings[0].Transform.GetLocation()
+				: Area.Polygon.IsEmpty() ? FVector::ZeroVector : FVector(Area.Polygon[0], 0.0);
 			FReturnCrates Crates(GetName());
 			for (const TPair<TSubclassOf<UFGItemDescriptor>, int32>& Entry : Refund)
 			{
@@ -944,7 +942,7 @@ namespace
 					continue;
 				}
 				// Only what reached a crate was refunded; the rest is in the result's Lost
-				Result.Items += Crates.Add(World, Stack, Character.Get(), From);
+				Result.Items += Crates.Add(World, Stack, GetPresentCharacter(), From);
 			}
 		}
 
@@ -1093,6 +1091,11 @@ TUniquePtr<FAreaActionsJob> AreaActionsJobs::MakeDismantle(bool bToCrate)
 void AreaActionsJobs::SetCratesFailForTest(int32 Mode)
 {
 	FReturnCrates::FailForTest = Mode;
+}
+
+void AreaActionsJobs::SetRefuseCopiesForTest(int32 EveryNth)
+{
+	RefuseCopiesForTest = EveryNth;
 }
 
 TUniquePtr<FAreaActionsJob> AreaActionsJobs::MakeSetRecipe(TSubclassOf<UFGRecipe> Recipe)
