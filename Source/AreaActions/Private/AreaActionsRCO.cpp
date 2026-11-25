@@ -230,9 +230,10 @@ void UAreaActionsRCO::ServerDismantle_Implementation(int32 RequestId, const FAre
 	const AFGPlayerController* Player = GetOwnerPlayerController();
 	const AFGCharacterPlayer* Character = Player ? Cast<AFGCharacterPlayer>(Player->GetPawn()) : nullptr;
 	const UFGInventoryComponent* Inventory = Character ? Character->GetInventory() : nullptr;
-	if (Refund == EAreaActionsDismantleRefund::CostOnly && Inventory && Inventory->GetNoBuildCost())
+	// Without a character the flag cannot be read: a cost only refund is refused then too
+	if (Refund == EAreaActionsDismantleRefund::CostOnly && (!Inventory || Inventory->GetNoBuildCost()))
 	{
-		Reject(RequestId, TEXT("MassDismantle"), EAreaActionsResultCode::Rejected, TEXT("cost only refund with No Build Cost on"));
+		Reject(RequestId, TEXT("MassDismantle"), EAreaActionsResultCode::Rejected, Inventory ? TEXT("cost only refund with No Build Cost on") : TEXT("cost only refund without a character"));
 		return;
 	}
 	Start(RequestId, Area, AreaActionsJobs::MakeDismantle(Refund));

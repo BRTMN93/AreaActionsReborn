@@ -150,9 +150,11 @@ void AAreaActionsEquipment::ProcessEvent(UFunction* Function, void* Parameters)
 		}
 		return;
 	}
+	// The input events' names carry a generated suffix; the tick, every frame, skips making the string
+	const FString Text = Name == TickName ? FString() : Name.ToString();
 	// The Blueprint's InputKey MiddleMouseButton (an input binding calls it through here): the original only knew actors, the building under
 	// the mouse here is an actor or a lightweight
-	if (Name.ToString().StartsWith(TEXT("InpActEvt_MiddleMouseButton")))
+	if (Text.StartsWith(TEXT("InpActEvt_MiddleMouseButton")))
 	{
 		if (bEquippedLocally)
 		{
@@ -161,8 +163,8 @@ void AAreaActionsEquipment::ProcessEvent(UFunction* Function, void* Parameters)
 		return;
 	}
 	// The Blueprint's InputKey LeftMouseButton places or deletes a corner at the end of the list, and its walls join the corners in that
-	// order: corners placed out of order around the area crossed into an X (AA-074). The corners are put in order around their centre.
-	if (Name.ToString().StartsWith(TEXT("InpActEvt_LeftMouseButton")))
+	// order: corners placed out of order around the area crossed into an X (AA-074). Crossing walls are untangled.
+	if (Text.StartsWith(TEXT("InpActEvt_LeftMouseButton")))
 	{
 		Super::ProcessEvent(Function, Parameters);
 		if (bEquippedLocally)
@@ -399,6 +401,32 @@ bool AAreaActionsEquipment::OrderCorners()
 		// Three corners or fewer never cross
 		return false;
 	}
+	// Walls that do not cross stay as the player drew them (a concave L stays an L); only a crossing changes the order
+	auto Crosses = [](const TArray<FVector>& Points)
+	{
+		const int32 N = Points.Num();
+		for (int32 I = 0; I < N; ++I)
+		{
+			for (int32 J = I + 2; J < N; ++J)
+			{
+				if ((J + 1) % N == I)
+				{
+					continue;
+				}
+				FVector Point;
+				if (FMath::SegmentIntersection2D(FVector(FVector2D(Points[I]), 0.0), FVector(FVector2D(Points[(I + 1) % N]), 0.0),
+					FVector(FVector2D(Points[J]), 0.0), FVector(FVector2D(Points[(J + 1) % N]), 0.0), Point))
+				{
+					return true;
+				}
+			}
+		}
+		return false;
+	};
+	if (!Crosses(List))
+	{
+		return false;
+	}
 	// Sorted by angle around a point inside them the corners make a polygon whose edges never cross (a star-shaped one)
 	FVector2D Centre = FVector2D::ZeroVector;
 	for (const FVector& Corner : List)
@@ -411,22 +439,7 @@ bool AAreaActionsEquipment::OrderCorners()
 	{
 		return FMath::Atan2(A.Y - Centre.Y, A.X - Centre.X) < FMath::Atan2(B.Y - Centre.Y, B.X - Centre.X);
 	});
-	// The same cycle from another start or the other way round needs no change
 	const int32 Count = List.Num();
-	const int32 Start = Ordered.IndexOfByKey(List[0]);
-	bool bSame = Start != INDEX_NONE;
-	for (int32 Step : {1, -1})
-	{
-		bSame = Start != INDEX_NONE;
-		for (int32 I = 0; bSame && I < Count; ++I)
-		{
-			bSame = List[I] == Ordered[((Start + Step * I) % Count + Count) % Count];
-		}
-		if (bSame)
-		{
-			return false;
-		}
-	}
 	// As SelectBuilding: the Blueprint's Clear takes the indicators and the height limits away, UpdateIndicators draws them again
 	const double Low = MinZ->GetPropertyValue_InContainer(this), High = MaxZ->GetPropertyValue_InContainer(this);
 	ProcessEvent(Clear, nullptr);
