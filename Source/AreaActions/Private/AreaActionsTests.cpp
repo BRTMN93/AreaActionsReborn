@@ -63,6 +63,8 @@
 #include "AreaActionsServerSubsystem.h"
 #include "AreaActionsWorldModule.h"
 #include "AreaActionsSettings.h"
+#include "UnrealClient.h"
+#include "Components/LineBatchComponent.h"
 #include "Engine/SCS_Node.h"
 #include "Engine/SimpleConstructionScript.h"
 #include "Equipment/FGBuildGun.h"
@@ -744,10 +746,20 @@ namespace
 			{
 				return EStep::Next;
 			}
+			// A tool put away earlier is still in the slot, at the active index (setting it again does nothing): it moves to a free index
+			for (int32 Index = 0; Index < Arms->GetSizeLinear(); ++Index)
+			{
+				FInventoryStack Stack;
+				if (Arms->GetStackFromIndex(Index, Stack) && Stack.Item.GetItemClass() == Item)
+				{
+					Arms->RemoveAllFromIndex(Index);
+					Self.Step(FString::Printf(TEXT("tool item taken from arms slot index %d"), Index));
+				}
+			}
 			int32 Free = INDEX_NONE;
 			for (int32 Index = 0; Index < Arms->GetSizeLinear() && Free == INDEX_NONE; ++Index)
 			{
-				Free = Arms->IsSomethingOnIndex(Index) ? INDEX_NONE : Index;
+				Free = Arms->IsSomethingOnIndex(Index) || Index == Arms->GetActiveIndex() ? INDEX_NONE : Index;
 			}
 			const int32 Added = Free == INDEX_NONE ? 0 : Arms->AddStackToIndex(Free, FInventoryStack(1, Item));
 			Self.Step(FString::Printf(TEXT("tool item put in arms slot index %d: %d"), Free, Added));
@@ -5865,7 +5877,7 @@ namespace
 	}
 
 	// AA-060 point 5: the tool's schematic is given in every world without research, has its icon, and its recipe is made at the Crafting
-	// Bench (and the Equipment Workshop); checked by the server and by a client
+	// Bench or the Equipment Workshop; checked by the server and by a client
 	void AddCheckSchematic(FRun& R, const TCHAR* When)
 	{
 		AddChecks(R, [When](FRun& Self)
@@ -5884,7 +5896,8 @@ namespace
 				Producers.Add(GetNameSafe(Producer));
 			}
 			const FString Joined = FString::Join(Producers, TEXT(", "));
-			Self.Check(Joined.Contains(TEXT("WorkBench")), FString::Printf(TEXT("%s: the tool is made in %s"), When, *Joined));
+			// As in the original's recipe: the Equipment Workshop
+			Self.Check(Joined.Contains(TEXT("Workshop")) || Joined.Contains(TEXT("WorkBench")), FString::Printf(TEXT("%s: the tool is made in %s"), When, *Joined));
 			return EStep::Next;
 		});
 	}
@@ -6088,19 +6101,24 @@ namespace
 		R.Steps.Add([](FRun& Self)
 		{
 			TArray<FAssetData> Assets;
-			FModuleManager::LoadModuleChecked<FAssetRegistryModule>(TEXT("AssetRegistry")).Get().GetAssetsByPath(FName(TEXT("/Game/FactoryGame/Recipes")), Assets, true);
+			FModuleManager::LoadModuleChecked<FAssetRegistryModule>(TEXT("AssetRegistry")).Get().GetAssetsByPath(FName(TEXT("/Game/FactoryGame")), Assets, true);
 			TSet<UClass*> Seen;
+			int32 RecipeAssets = 0, BuildGunRecipes = 0;
 			TArray<FString> Boxed;
 			int32 Classes = 0;
 			for (const FAssetData& Asset : Assets)
 			{
 				const FString Name = Asset.AssetName.ToString();
-				UClass* RecipeClass = Name.StartsWith(TEXT("Recipe_")) ? LoadClass<UFGRecipe>(nullptr, *(Asset.PackageName.ToString() + TEXT(".") + Name + TEXT("_C"))) : nullptr;
+				FString Short = Name;
+				Short.RemoveFromEnd(TEXT("_C"));
+				UClass* RecipeClass = Short.StartsWith(TEXT("Recipe_")) ? LoadClass<UFGRecipe>(nullptr, *(Asset.PackageName.ToString() + TEXT(".") + Short + TEXT("_C"))) : nullptr;
 				if (!RecipeClass)
 				{
 					continue;
 				}
+				++RecipeAssets;
 				const bool bBuildGun = UFGRecipe::GetProducedIn(RecipeClass).ContainsByPredicate([](const TSubclassOf<UObject>& Producer) { return Producer && Producer->GetName().Contains(TEXT("BuildGun")); });
+				BuildGunRecipes += bBuildGun ? 1 : 0;
 				for (const FItemAmount& Product : bBuildGun ? UFGRecipe::GetProducts(RecipeClass) : TArray<FItemAmount>())
 				{
 					const TSubclassOf<UFGBuildingDescriptor> Descriptor(Product.ItemClass.Get());
@@ -6136,6 +6154,7 @@ namespace
 					}
 				}
 			}
+			Self.Step(FString::Printf(TEXT("recipe assets %d, of the Build Gun %d"), RecipeAssets, BuildGunRecipes));
 			Self.Step(FString::Printf(TEXT("Build Gun classes %d, without meshes the preview draws %d: %s"), Classes, Boxed.Num(), *FString::Join(Boxed, TEXT(", "))));
 			Self.Check(Classes > 100, FString::Printf(TEXT("classes looked at: %d"), Classes));
 			return EStep::Next;
@@ -6207,12 +6226,29 @@ namespace
 				{
 					continue;
 				}
+				// A new game has unlocked no shard or somersloop slot: the slots are opened here past the game's filters (as AddWater)
+				Self.Step(FString::Printf(TEXT("potential inventory of %s: %d slots"), *Machine->GetName(), Potential->GetSizeLinear()));
+				if (Potential->GetSizeLinear() < 2)
+				{
+					Potential->Resize(2);
+				}
+				const FItemFilter ItemFilter = Potential->mItemFilter;
+				const FFormFilter FormFilter = Potential->mFormFilter;
+				Potential->mItemFilter.Unbind();
+				Potential->mFormFilter.Unbind();
+				int32 Slot = 0;
 				for (const TCHAR* Name : { TEXT("Desc_CrystalShard"), TEXT("Desc_WAT1") })
 				{
 					const TSubclassOf<UFGItemDescriptor> Upgrade(GameClass(Name));
-					const int32 Added = Upgrade ? Potential->AddStack(FInventoryStack(1, Upgrade), true) : 0;
-					Self.Step(FString::Printf(TEXT("%s into %s: %d"), Name, *Machine->GetName(), Added));
+					const TSubclassOf<UFGItemDescriptor> Allowed = Potential->GetAllowedItemOnIndex(Slot);
+					Potential->SetAllowedItemOnIndex(Slot, nullptr);
+					const int32 Added = Upgrade ? Potential->AddStackToIndex(Slot, FInventoryStack(1, Upgrade), true) : 0;
+					Potential->SetAllowedItemOnIndex(Slot, Allowed);
+					Self.Step(FString::Printf(TEXT("%s into %s slot %d: %d"), Name, *Machine->GetName(), Slot, Added));
+					++Slot;
 				}
+				Potential->mItemFilter = ItemFilter;
+				Potential->mFormFilter = FormFilter;
 				TArray<FInventoryStack> Stacks;
 				Potential->GetInventoryStacks(Stacks);
 				AddSolids(*Upgrades, Stacks);
@@ -6252,6 +6288,202 @@ namespace
 		AddCheckRefundCrate(R, S, D);
 	}
 
+	// AA-074: a square of 4 corners clicked as the player does, seen from the player; screenshots as the tool draws it, with the walls
+	// made thin and with the corner cylinders hidden, to tell which indicator draws the "X" at the corners
+	void AddCornersView(FRun& R)
+	{
+		AddEquipTool(R);
+		TSharedRef<TArray<FVector>> Targets = MakeShared<TArray<FVector>>();
+		R.Steps.Add([Targets](FRun& Self)
+		{
+			APawn* Pawn = Self.GetPlayer()->GetPawn();
+			const FVector Center = Pawn->GetActorLocation() + Pawn->GetActorForwardVector() * 1500.0;
+			for (int32 Index = 0; Index < 4; ++Index)
+			{
+				const FVector Point = Center + FRotator(0, 45.0 + Index * 90.0, 0).RotateVector(FVector(700, 0, 0));
+				FVector Ground;
+				if (!GroundBelow(Self.GetWorld(), Point, Ground))
+				{
+					Self.Check(false, FString::Printf(TEXT("ground below %s"), *Point.ToCompactString()));
+					return EStep::Next;
+				}
+				Targets->Add(Ground);
+			}
+			Self.Check(SelectState(GetTool(Self), TEXT("NewEnumerator1")), TEXT("corner mode set"));
+			return EStep::Next;
+		});
+		for (int32 Index = 0; Index < 4; ++Index)
+		{
+			R.Steps.Add([Targets, Index](FRun& Self)
+			{
+				if (Targets->IsValidIndex(Index))
+				{
+					LookAt(Self, (*Targets)[Index]);
+				}
+				return EStep::Next;
+			});
+			R.Steps.Add(WaitFrames(3));
+			R.Steps.Add([](FRun& Self)
+			{
+				PressKey(Self, EKeys::LeftMouseButton);
+				return EStep::Next;
+			});
+			R.Steps.Add(WaitFrames(3));
+		}
+		R.Steps.Add([Targets](FRun& Self)
+		{
+			Self.Check(ArrayNum(GetTool(Self), TEXT("CornerLocations")) == 4, FString::Printf(TEXT("corners %d (want 4)"), ArrayNum(GetTool(Self), TEXT("CornerLocations"))));
+			FVector Middle = FVector::ZeroVector;
+			for (const FVector& Point : *Targets)
+			{
+				Middle += Point / Targets->Num();
+			}
+			LookAt(Self, Middle);
+			for (const TCHAR* Name : { TEXT("CornerIndicators"), TEXT("AreaWalls") })
+			{
+				if (FArrayProperty* Property = FindFProperty<FArrayProperty>(GetTool(Self)->GetClass(), Name))
+				{
+					FScriptArrayHelper Array(Property, Property->ContainerPtrToValuePtr<void>(GetTool(Self)));
+					for (int32 Index = 0; Index < Array.Num(); ++Index)
+					{
+						const AActor* Actor = Cast<AActor>(CastField<FObjectPropertyBase>(Property->Inner)->GetObjectPropertyValue(Array.GetRawPtr(Index)));
+						Self.Step(FString::Printf(TEXT("%s %d: %s at %s, scale %s"), Name, Index, *GetNameSafe(Actor), Actor ? *Actor->GetActorLocation().ToCompactString() : TEXT("-"),
+							Actor ? *Actor->GetActorScale3D().ToCompactString() : TEXT("-")));
+					}
+				}
+			}
+			return EStep::Next;
+		});
+		auto Shot = [](const FString& Name)
+		{
+			return [Name](FRun& Self)
+			{
+				const FString File = FPaths::Combine(FPaths::ProjectSavedDir(), TEXT("Screenshots"), FString::Printf(TEXT("AATest_%s.png"), *Name));
+				FScreenshotRequest::RequestScreenshot(File, false, false);
+				Self.Step(FString::Printf(TEXT("screenshot %s"), *File));
+				return EStep::Next;
+			};
+		};
+		auto ForEachIndicator = [](FRun& Self, const TCHAR* Name, TFunctionRef<void(AActor*)> Fn)
+		{
+			if (FArrayProperty* Property = FindFProperty<FArrayProperty>(GetTool(Self)->GetClass(), Name))
+			{
+				FScriptArrayHelper Array(Property, Property->ContainerPtrToValuePtr<void>(GetTool(Self)));
+				for (int32 Index = 0; Index < Array.Num(); ++Index)
+				{
+					if (AActor* Actor = Cast<AActor>(CastField<FObjectPropertyBase>(Property->Inner)->GetObjectPropertyValue(Array.GetRawPtr(Index))))
+					{
+						Fn(Actor);
+					}
+				}
+			}
+		};
+		auto SetWalls = [ForEachIndicator](FRun& Self, double Thickness)
+		{
+			ForEachIndicator(Self, TEXT("AreaWalls"), [Thickness](AActor* Wall) { FVector Scale = Wall->GetActorScale3D(); Scale.Y = Thickness; Wall->SetActorScale3D(Scale); });
+		};
+		auto ShowCorners = [ForEachIndicator](FRun& Self, bool bShow)
+		{
+			ForEachIndicator(Self, TEXT("CornerIndicators"), [bShow](AActor* Corner) { Corner->SetActorHiddenInGame(!bShow); });
+		};
+		// Two places: above the area's middle looking down at the first corner, and on the ground inside the area looking at it
+		for (int32 View = 0; View < 2; ++View)
+		{
+			R.Steps.Add([Targets, View](FRun& Self)
+			{
+				ACharacter* Character = GetCharacter(Self);
+				FVector Middle = FVector::ZeroVector;
+				for (const FVector& Point : *Targets)
+				{
+					Middle += Point / Targets->Num();
+				}
+				AAreaActionsEquipment::ApplyFlying(Character, true);
+				const FVector From = View == 0 ? Middle + FVector(0, 0, 1200) : Middle + ((*Targets)[2] - Middle) * 0.5 + FVector(0, 0, 150);
+				Character->SetActorLocation(From, false, nullptr, ETeleportType::TeleportPhysics);
+				Self.Step(FString::Printf(TEXT("view %d from %s"), View, *From.ToCompactString()));
+				return EStep::Next;
+			});
+			R.Steps.Add(WaitFrames(20));
+			R.Steps.Add([Targets](FRun& Self) { LookAt(Self, (*Targets)[0]); return EStep::Next; });
+			const FString Prefix = FString::Printf(TEXT("Corners_v%d_"), View);
+			R.Steps.Add(WaitFrames(30));
+			R.Steps.Add(Shot(Prefix + TEXT("1_asis")));
+			R.Steps.Add(WaitFrames(20));
+			R.Steps.Add([SetWalls](FRun& Self) { SetWalls(Self, 0.05); return EStep::Next; });
+			R.Steps.Add(WaitFrames(30));
+			R.Steps.Add(Shot(Prefix + TEXT("2_thinwalls")));
+			R.Steps.Add(WaitFrames(20));
+			R.Steps.Add([SetWalls, ShowCorners](FRun& Self) { SetWalls(Self, 1.0); ShowCorners(Self, false); return EStep::Next; });
+			R.Steps.Add(WaitFrames(30));
+			R.Steps.Add(Shot(Prefix + TEXT("3_nocorners")));
+			R.Steps.Add(WaitFrames(20));
+			R.Steps.Add([ShowCorners](FRun& Self) { ShowCorners(Self, true); return EStep::Next; });
+		}
+		R.Steps.Add([](FRun& Self) { AAreaActionsEquipment::ApplyFlying(GetCharacter(Self), false); return EStep::Next; });
+		R.Steps.Add(WaitFrames(30));
+	}
+
+	// AA-091 (1), (3): the classes PreviewBoxProbe found without meshes on their class default (a ladder and foundation passthroughs build
+	// their meshes when they are placed), placed for real; with AreaActions.PreviewHolograms 0 every copy is drawn by the preview itself:
+	// a copy whose building has no meshes is the box (12 lines)
+	void AddPreviewBox(FRun& R)
+	{
+		FSceneRef S = MakeShared<FScene>();
+		FCopyRef C = MakeShared<FCopyState>();
+		TSharedRef<int32> Boxed = MakeShared<int32>(0);
+		AddCopyScene(R, S, C, [Boxed](FRun& Self, FScene& Scene, FCopyState& Copy)
+		{
+			Copy.Base = Ground(Self, Scene.Center);
+			const TCHAR* Names[][2] = { { TEXT("Build_Ladder"), TEXT("Recipe_Ladder") }, { TEXT("Build_FoundationPassthrough_Lift"), TEXT("Recipe_FoundationPassthrough_Lift") },
+				{ TEXT("Build_FoundationPassthrough_Pipe"), TEXT("Recipe_FoundationPassthrough_Pipe") } };
+			double X = -1500.0;
+			for (const auto& Name : Names)
+			{
+				AFGBuildable* Actor = AddActor(Self, Scene, Copy, Name[0], Name[1], FTransform(Copy.Base + FVector(X, 0, 50)));
+				X += 1500.0;
+				if (!Actor)
+				{
+					continue;
+				}
+				AreaActionsBuildings::FSnapshot Snapshot;
+				Snapshot.Class = Actor->GetClass();
+				Snapshot.Actor = Actor;
+				Snapshot.Transform = Actor->GetActorTransform();
+				TArray<TPair<UStaticMesh*, FTransform>> Meshes;
+				AreaActionsBuildings::GetMeshes(Self.GetWorld(), Snapshot, Meshes);
+				Self.Step(FString::Printf(TEXT("%s placed: %d meshes the preview draws"), Name[0], Meshes.Num()));
+				*Boxed += Meshes.IsEmpty() ? 1 : 0;
+			}
+			AddControlStorages(Self, Scene);
+		});
+		R.Steps.Add([](FRun& Self)
+		{
+			IConsoleManager::Get().FindConsoleVariable(TEXT("AreaActions.PreviewHolograms"))->Set(0);
+			return EStep::Next;
+		});
+		AddOpenAction(R, TEXT("Copy"));
+		AddCopyWindow(R, FVector(0, 30, 0), 0.0, false, TEXT("PreviewButton"));
+		R.Steps.Add(WaitFrames(10));
+		R.Steps.Add([Boxed](FRun& Self)
+		{
+			int32 Lines = 0;
+			for (TActorIterator<AAreaActionsPreview> It(Self.GetWorld()); It; ++It)
+			{
+				const ULineBatchComponent* Batch = It->FindComponentByClass<ULineBatchComponent>();
+				Lines += Batch ? Batch->BatchedLines.Num() : 0;
+			}
+			Self.Step(FString::Printf(TEXT("copies of buildings without meshes %d, box lines %d"), *Boxed, Lines));
+			Self.Check(Lines == 12 * *Boxed, FString::Printf(TEXT("12 lines a box: %d lines for %d boxed copies"), Lines, *Boxed));
+			return EStep::Next;
+		});
+		AddCloseWithX(R, TEXT("Widget_Copy"));
+		R.Steps.Add([](FRun& Self)
+		{
+			IConsoleManager::Get().FindConsoleVariable(TEXT("AreaActions.PreviewHolograms"))->Set(300);
+			return EStep::Next;
+		});
+	}
+
 	bool BuildScenario(FRun& R)
 	{
 		if (R.Name == TEXT("MP_Smoke"))
@@ -6266,6 +6498,16 @@ namespace
 				return EStep::Next;
 			});
 			R.Steps.Add(WaitFrames(60));
+			return true;
+		}
+		if (R.Scenario == TEXT("CornersView"))
+		{
+			AddCornersView(R);
+			return true;
+		}
+		if (R.Scenario == TEXT("PreviewBox"))
+		{
+			AddPreviewBox(R);
 			return true;
 		}
 		if (R.Scenario == TEXT("Fly"))
