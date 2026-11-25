@@ -14,4 +14,11 @@ public:
 	// "Area Actions v<version from the .uplugin>"; the window's title is bound to it by name
 	UFUNCTION(BlueprintPure, Category = "Area Actions")
 	FText GetTitle() const;
+
+protected:
+	// The window's FlyButton flies natively (the Blueprint's call of the tool's ToggleFly does nothing, see AAreaActionsEquipment)
+	virtual void NativeConstruct() override;
+
+	UFUNCTION()
+	void FlyClicked();
 };

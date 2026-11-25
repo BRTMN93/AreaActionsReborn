@@ -62,6 +62,14 @@
 #include "AreaActionsRCO.h"
 #include "AreaActionsServerSubsystem.h"
 #include "AreaActionsWorldModule.h"
+#include "AreaActionsSettings.h"
+#include "Engine/SCS_Node.h"
+#include "Engine/SimpleConstructionScript.h"
+#include "Equipment/FGBuildGun.h"
+#include "Equipment/FGBuildGunBuild.h"
+#include "FGSchematic.h"
+#include "FGSchematicManager.h"
+#include "Resources/FGBuildingDescriptor.h"
 #include "Containers/Ticker.h"
 #include "Misc/CoreDelegates.h"
 #include "UObject/UObjectGlobals.h"
@@ -798,9 +806,38 @@ namespace
 	}
 
 	// Three corners around a point in front of the player, as the player clicks them
+	void AddThreeCorners(FRun& R);
+
 	void AddCorners(FRun& R)
 	{
 		AddEquipTool(R);
+		AddThreeCorners(R);
+		R.Steps.Add([](FRun& Self)
+		{
+			AAreaActionsEquipment* Tool = GetTool(Self);
+			const int32 Corners = ArrayNum(Tool, TEXT("CornerLocations"));
+			const int32 Walls = ArrayNum(Tool, TEXT("AreaWalls"));
+			Self.Check(Corners == 3, FString::Printf(TEXT("corners after 3 clicks: %d"), Corners));
+			Self.Check(Walls == 3, FString::Printf(TEXT("walls after 3 clicks: %d"), Walls));
+			Self.Check(SelectState(Tool, TEXT("NewEnumerator10")), TEXT("Clear"));
+			return EStep::Next;
+		});
+		R.Steps.Add(WaitFrames(3));
+		R.Steps.Add([](FRun& Self)
+		{
+			AAreaActionsEquipment* Tool = GetTool(Self);
+			const int32 Corners = ArrayNum(Tool, TEXT("CornerLocations"));
+			const int32 Indicators = ArrayNum(Tool, TEXT("CornerIndicators")) + ArrayNum(Tool, TEXT("AreaWalls"))
+				+ (ObjectValue(Tool, TEXT("MinZIndicator")) ? 1 : 0) + (ObjectValue(Tool, TEXT("MaxZIndicator")) ? 1 : 0);
+			Self.Check(Corners == 0, FString::Printf(TEXT("corners after Clear: %d"), Corners));
+			Self.Check(Indicators == 0, FString::Printf(TEXT("indicators after Clear: %d"), Indicators));
+			return EStep::Next;
+		});
+	}
+
+	// Three corners around a point in front of the player, clicked in the corner mode
+	void AddThreeCorners(FRun& R)
+	{
 		TSharedRef<TArray<FVector>> Targets = MakeShared<TArray<FVector>>();
 		R.Steps.Add([Targets](FRun& Self)
 		{
@@ -845,27 +882,6 @@ namespace
 			});
 			R.Steps.Add(WaitFrames(3));
 		}
-		R.Steps.Add([](FRun& Self)
-		{
-			AAreaActionsEquipment* Tool = GetTool(Self);
-			const int32 Corners = ArrayNum(Tool, TEXT("CornerLocations"));
-			const int32 Walls = ArrayNum(Tool, TEXT("AreaWalls"));
-			Self.Check(Corners == 3, FString::Printf(TEXT("corners after 3 clicks: %d"), Corners));
-			Self.Check(Walls == 3, FString::Printf(TEXT("walls after 3 clicks: %d"), Walls));
-			Self.Check(SelectState(Tool, TEXT("NewEnumerator10")), TEXT("Clear"));
-			return EStep::Next;
-		});
-		R.Steps.Add(WaitFrames(3));
-		R.Steps.Add([](FRun& Self)
-		{
-			AAreaActionsEquipment* Tool = GetTool(Self);
-			const int32 Corners = ArrayNum(Tool, TEXT("CornerLocations"));
-			const int32 Indicators = ArrayNum(Tool, TEXT("CornerIndicators")) + ArrayNum(Tool, TEXT("AreaWalls"))
-				+ (ObjectValue(Tool, TEXT("MinZIndicator")) ? 1 : 0) + (ObjectValue(Tool, TEXT("MaxZIndicator")) ? 1 : 0);
-			Self.Check(Corners == 0, FString::Printf(TEXT("corners after Clear: %d"), Corners));
-			Self.Check(Indicators == 0, FString::Printf(TEXT("indicators after Clear: %d"), Indicators));
-			return EStep::Next;
-		});
 	}
 
 	// A Constructor in front of the player, clicked in the building selection mode
@@ -2013,13 +2029,47 @@ namespace
 			Self.Check(Code(106) == static_cast<int32>(EAreaActionsResultCode::Busy), FString::Printf(TEXT("request 106: code %d (Busy)"), Code(106)));
 			return EStep::Next;
 		});
+		// AA-092 (3): "Cost only" with No Build Cost on; the flag is the server's, the request carries none
+		AddHost(R, [](FRun& Self)
+		{
+			if (AFGGameState* State = Self.GetWorld()->GetGameState<AFGGameState>())
+			{
+				State->SetCheatNoCost(true);
+			}
+			return EStep::Next;
+		});
+		R.Steps.Add(WaitFrames(30));
+		R.Steps.Add([S](FRun& Self)
+		{
+			Self.Step(TEXT("request 107: MassDismantle cost only with No Build Cost on"));
+			UAreaActionsRCO::Of(Self.GetPlayer())->ServerDismantle(107, S->Area, EAreaActionsDismantleRefund::CostOnly);
+			return EStep::Next;
+		});
+		R.Steps.Add([S](FRun& Self)
+		{
+			if (S->Results.Num() < 7)
+			{
+				return EStep::Wait;
+			}
+			const FAreaActionsResult* Result = S->Results.Find(107);
+			Self.Check(Result && Result->Code == EAreaActionsResultCode::Rejected, FString::Printf(TEXT("request 107: code %d (Rejected)"), Result ? static_cast<int32>(Result->Code) : -1));
+			return EStep::Next;
+		});
+		AddHost(R, [](FRun& Self)
+		{
+			if (AFGGameState* State = Self.GetWorld()->GetGameState<AFGGameState>())
+			{
+				State->SetCheatNoCost(false);
+			}
+			return EStep::Next;
+		});
 		AddChecks(R, [S](FRun& Self)
 		{
 			if (!Self.bClient)
 			{
 				// The reject lines are in the server's log
 				const int32 Rejects = UAreaActionsRCO::RejectCount - S->RejectsBefore;
-				Self.Check(Rejects == 5, FString::Printf(TEXT("reject lines: %d of 5"), Rejects));
+				Self.Check(Rejects == 6, FString::Printf(TEXT("reject lines: %d of 6"), Rejects));
 			}
 			const AFGBuildableManufacturer* Constructor = Machine(*S, 0);
 			Self.Check(Constructor && Constructor->GetCurrentRecipe() == Recipe(Asset::IronPlate) && (Self.bClient || MachineItems(Constructor) == 10), TEXT("Constructor in the area unchanged"));
@@ -4131,18 +4181,19 @@ namespace
 		});
 	}
 
-	// The menu, the question answered with its first (Refund to crate) or second (No refund) button, the result
-	void AddDismantle(FRun& R, const FSceneRef& S, bool bToCrate, bool bResult = true)
+	// The menu, the question answered with one of its buttons (YesButton: "Refund to crate", or "OK" with No Build Cost; NoButton: "No
+	// refund"; ChoiceButton2: "Cost only", AA-092), the result
+	void AddDismantle(FRun& R, const FSceneRef& S, const TCHAR* ButtonName, const TCHAR* Want, bool bResult = true)
 	{
 		AddOpenAction(R, TEXT("MassDismantle"));
-		AddOnWindow(R, TEXT("Widget_MessageYesNo"), [bToCrate](FRun& Self, UUserWidget* Window)
+		AddOnWindow(R, TEXT("Widget_MessageYesNo"), [ButtonName, Want](FRun& Self, UUserWidget* Window)
 		{
 			// The answers are named after what they do (D16)
-			const UButton* Button = Cast<UButton>(Window->GetWidgetFromName(bToCrate ? TEXT("YesButton") : TEXT("NoButton")));
+			UButton* Button = Cast<UButton>(Window->GetWidgetFromName(ButtonName));
 			FString Label;
 			if (Button)
 			{
-				UWidgetTree::ForWidgetAndChildren(const_cast<UButton*>(Button), [&Label](UWidget* Child)
+				UWidgetTree::ForWidgetAndChildren(Button, [&Label](UWidget* Child)
 				{
 					if (const UTextBlock* Text = Cast<UTextBlock>(Child))
 					{
@@ -4150,9 +4201,8 @@ namespace
 					}
 				});
 			}
-			const TCHAR* Want = bToCrate ? TEXT("Refund to crate") : TEXT("No refund");
-			Self.Check(Label == Want, FString::Printf(TEXT("button reads '%s' (want '%s')"), *Label, Want));
-			Self.Check(PressButton(Window, bToCrate ? TEXT("YesButton") : TEXT("NoButton")), FString::Printf(TEXT("'%s' pressed"), Want));
+			Self.Check(Label == Want, FString::Printf(TEXT("button %s reads '%s' (want '%s')"), ButtonName, *Label, Want));
+			Self.Check(PressButton(Window, ButtonName), FString::Printf(TEXT("'%s' pressed"), Want));
 		});
 		if (bResult)
 		{
@@ -4230,7 +4280,7 @@ namespace
 		FSceneRef S = MakeShared<FScene>();
 		FDismantleRef D = MakeShared<FDismantleState>();
 		AddDismantleScene(R, S, D);
-		AddDismantle(R, S, true);
+		AddDismantle(R, S, TEXT("YesButton"), TEXT("Refund to crate"));
 		AddCheckGone(R, S, D);
 		AddCheckRefundCrate(R, S, D);
 	}
@@ -4249,7 +4299,7 @@ namespace
 			return EStep::Next;
 		});
 		AddDismantleScene(R, S, D);
-		AddDismantle(R, S, true, false);
+		AddDismantle(R, S, TEXT("YesButton"), TEXT("Refund to crate"), false);
 		R.Steps.Add(WaitFrames(3));
 		R.Steps.Add([S, D, Late](FRun& Self)
 		{
@@ -4294,7 +4344,7 @@ namespace
 		FSceneRef S = MakeShared<FScene>();
 		FDismantleRef D = MakeShared<FDismantleState>();
 		AddDismantleScene(R, S, D);
-		AddDismantle(R, S, false);
+		AddDismantle(R, S, TEXT("NoButton"), TEXT("No refund"));
 		AddCheckGone(R, S, D);
 		R.Steps.Add([S, D](FRun& Self)
 		{
@@ -4326,7 +4376,7 @@ namespace
 			Self.Check(SameCounts(D->Expected, D->Contents), FString::Printf(TEXT("expected refund is the contents only: %d of %d"), Total(D->Expected), Total(D->Contents)));
 			return EStep::Next;
 		});
-		AddDismantle(R, S, true);
+		AddDismantle(R, S, TEXT("YesButton"), TEXT("OK"));
 		AddCheckGone(R, S, D);
 		AddCheckRefundCrate(R, S, D);
 		R.Steps.Add([](FRun& Self)
@@ -4398,7 +4448,7 @@ namespace
 			Self.Check(P->Refused > 0, FString::Printf(TEXT("the scene has %d buildings the game refuses to dismantle"), P->Refused));
 			return EStep::Next;
 		});
-		AddDismantle(R, S, true);
+		AddDismantle(R, S, TEXT("YesButton"), TEXT("Refund to crate"));
 		R.Steps.Add(WaitFrames(60));
 		R.Steps.Add([S, P](FRun& Self)
 		{
@@ -4424,7 +4474,7 @@ namespace
 		FDismantleRef D = MakeShared<FDismantleState>();
 		const FString SaveName = TEXT("AATest_DismantleSaveLoad");
 		AddDismantleScene(R, S, D);
-		AddDismantle(R, S, true);
+		AddDismantle(R, S, TEXT("YesButton"), TEXT("Refund to crate"));
 		AddCheckGone(R, S, D);
 		AddCheckRefundCrate(R, S, D);
 		AddSaveAndLoad(R, SaveName);
@@ -4525,7 +4575,7 @@ namespace
 			Self.StepTimeoutSec = 180.0;
 			return EStep::Next;
 		});
-		AddDismantle(R, S, true);
+		AddDismantle(R, S, TEXT("YesButton"), TEXT("Refund to crate"));
 		R.Steps.Add([S, Foundations](FRun& Self)
 		{
 			Self.bMeasureFrames = false;
@@ -4637,7 +4687,7 @@ namespace
 				Rco->ServerClearInventories(RequestId, S->Area, true);
 				break;
 			default:
-				Rco->ServerDismantle(RequestId, S->Area, true);
+				Rco->ServerDismantle(RequestId, S->Area, EAreaActionsDismantleRefund::All);
 				break;
 			}
 			return EStep::Next;
@@ -4703,7 +4753,7 @@ namespace
 		}, Side);
 		if (bDismantle)
 		{
-			AddDismantle(R, S, true);
+			AddDismantle(R, S, TEXT("YesButton"), TEXT("Refund to crate"));
 		}
 		else
 		{
@@ -4931,7 +4981,7 @@ namespace
 		}, Side);
 		if (bDismantle)
 		{
-			AddDismantle(R, S, true);
+			AddDismantle(R, S, TEXT("YesButton"), TEXT("Refund to crate"));
 		}
 		else
 		{
@@ -5533,6 +5583,675 @@ namespace
 		});
 	}
 
+	// ---- Chat 10: the extras (AA-060), the dismantle windows (AA-092), the tool's events (AA-096) ----
+
+	UAreaActionsPopupBase* GetPopup(const FRun& R)
+	{
+		return Cast<UAreaActionsPopupBase>(ObjectValue(GetTool(R), TEXT("PopupWidget")));
+	}
+
+	int32 IntValue(UObject* Object, const TCHAR* Name)
+	{
+		FIntProperty* Property = Object ? FindFProperty<FIntProperty>(Object->GetClass(), Name) : nullptr;
+		return Property ? Property->GetPropertyValue_InContainer(Object) : INDEX_NONE;
+	}
+
+	// A Blueprint function of the object without parameters that returns a text (the menu's bound texts)
+	FString CallText(UObject* Object, const TCHAR* Function)
+	{
+		UFunction* Fn = Object ? Object->FindFunction(Function) : nullptr;
+		FTextProperty* Return = Fn ? CastField<FTextProperty>(Fn->GetReturnProperty()) : nullptr;
+		if (!Return)
+		{
+			return TEXT("<none>");
+		}
+		uint8* Params = static_cast<uint8*>(FMemory_Alloca(Fn->ParmsSize));
+		FMemory::Memzero(Params, Fn->ParmsSize);
+		Return->InitializeValue_InContainer(Params);
+		Object->ProcessEvent(Fn, Params);
+		const FString Text = Return->GetPropertyValue_InContainer(Params).ToString();
+		Return->DestroyValue_InContainer(Params);
+		return Text;
+	}
+
+	void CallNoParams(UObject* Object, const TCHAR* Function)
+	{
+		if (UFunction* Fn = Object ? Object->FindFunction(Function) : nullptr; Fn && Fn->ParmsSize == 0)
+		{
+			Object->ProcessEvent(Fn, nullptr);
+		}
+	}
+
+	// The menu, opened with the right mouse button when it is not open
+	void AddOpenMenu(FRun& R)
+	{
+		R.Steps.Add([](FRun& Self)
+		{
+			if (!GetPopup(Self))
+			{
+				Self.Step(TEXT("right mouse button"));
+				PressKey(Self, EKeys::RightMouseButton);
+			}
+			return EStep::Next;
+		});
+		R.Steps.Add(WaitFrames(5));
+		R.Steps.Add([](FRun& Self)
+		{
+			UAreaActionsPopupBase* Popup = GetPopup(Self);
+			Self.Check(Popup && Popup->IsInViewport(), FString::Printf(TEXT("menu open: %s"), *GetNameSafe(Popup)));
+			return EStep::Next;
+		});
+	}
+
+	void AddCloseMenu(FRun& R)
+	{
+		R.Steps.Add([](FRun& Self)
+		{
+			CallNoParams(GetPopup(Self), TEXT("Close"));
+			return EStep::Next;
+		});
+		R.Steps.Add(WaitFrames(3));
+		R.Steps.Add([](FRun& Self)
+		{
+			Self.Check(!GetPopup(Self) || !GetPopup(Self)->IsInViewport(), TEXT("menu closed"));
+			return EStep::Next;
+		});
+	}
+
+	// The tool put away (the game's unequip); AddEquipTool takes it again
+	void AddPutToolAway(FRun& R)
+	{
+		R.Steps.Add([](FRun& Self)
+		{
+			AFGCharacterPlayer* Character = GetCharacter(Self);
+			if (AAreaActionsEquipment* Tool = GetTool(Self); Character && Tool)
+			{
+				Character->UnequipEquipment(Tool);
+			}
+			return EStep::Next;
+		});
+		R.Steps.Add(WaitFrames(10));
+		R.Steps.Add([](FRun& Self)
+		{
+			Self.Check(!GetTool(Self), TEXT("tool put away"));
+			return EStep::Next;
+		});
+	}
+
+	// AA-060 point 1: the menu's fly button. The acting game presses it and moves its character forward for 2 s by movement input (as the
+	// keys do); the character must stay in the air and never be put back. The server's copy (host or dedicated server) flies too and is
+	// where the client went. A second press walks again. Taking off without the tool in hand is refused by the server.
+	struct FFly
+	{
+		FVector Start = FVector::ZeroVector;
+		double Farthest = 0.0;
+		double LowestZ = 0.0;
+		double Since = 0.0;
+		FVector ServerStart = FVector::ZeroVector;
+		int32 RejectsBefore = 0;
+	};
+
+	void AddFly(FRun& R)
+	{
+		TSharedRef<FFly> F = MakeShared<FFly>();
+		AddToolMenu(R);
+		R.Steps.Add([](FRun& Self)
+		{
+			UAreaActionsPopupBase* Popup = GetPopup(Self);
+			Self.Check(CallText(Popup, TEXT("GetFlyText")) == TEXT("Enable flying"), FString::Printf(TEXT("fly button reads '%s'"), *CallText(Popup, TEXT("GetFlyText"))));
+			Self.Check(PressButton(Popup, TEXT("FlyButton")), TEXT("FlyButton pressed"));
+			return EStep::Next;
+		});
+		R.Steps.Add(WaitFrames(10));
+		AddChecks(R, [](FRun& Self)
+		{
+			const AFGCharacterPlayer* Character = GetCharacter(Self);
+			const UCharacterMovementComponent* Movement = Character ? Character->GetCharacterMovement() : nullptr;
+			Self.Check(Movement && Movement->MovementMode == MOVE_Flying && Movement->bCheatFlying, FString::Printf(TEXT("%s: the acting player's character flies (mode %d, cheat flying %d)"),
+				Self.bClient ? TEXT("client") : Self.bMp ? TEXT("server") : TEXT("game"), Movement ? static_cast<int32>(Movement->MovementMode) : -1, Movement && Movement->bCheatFlying));
+			return EStep::Next;
+		});
+		AddHost(R, [F](FRun& Self)
+		{
+			F->ServerStart = GetCharacter(Self)->GetActorLocation();
+			return EStep::Next;
+		});
+		R.Steps.Add([F](FRun& Self)
+		{
+			AFGCharacterPlayer* Character = GetCharacter(Self);
+			const FVector At = Character->GetActorLocation();
+			if (F->Since == 0.0)
+			{
+				F->Since = Self.Now();
+				F->Start = At;
+				F->LowestZ = At.Z;
+				// Up first, then along the camera's heading: a flying character goes where the input points
+			}
+			const double Elapsed = Self.Now() - F->Since;
+			const FVector Heading = FRotator(0.0, Character->GetControlRotation().Yaw, 0.0).Vector();
+			Character->AddMovementInput(Elapsed < 0.5 ? FVector::UpVector : Heading, 1.0f, true);
+			const double Along = FVector::DotProduct(At - F->Start, Heading);
+			F->Farthest = FMath::Max(F->Farthest, Along);
+			F->LowestZ = FMath::Min(F->LowestZ, At.Z);
+			if (Elapsed < 2.5)
+			{
+				return EStep::Wait;
+			}
+			Self.Step(FString::Printf(TEXT("flew from %s to %s"), *F->Start.ToCompactString(), *At.ToCompactString()));
+			Self.Check(F->Farthest >= 400.0, FString::Printf(TEXT("the character moved %.0f cm along its heading (at least 400)"), F->Farthest));
+			Self.Check(At.Z >= F->Start.Z - 30.0 && F->LowestZ >= F->Start.Z - 30.0, FString::Printf(TEXT("it did not fall: Z %.0f, lowest %.0f, start %.0f"), At.Z, F->LowestZ, F->Start.Z));
+			Self.Check(Along >= F->Farthest - 50.0, FString::Printf(TEXT("never put back: ends %.0f cm out, farthest %.0f"), Along, F->Farthest));
+			return EStep::Next;
+		});
+		R.Steps.Add(WaitFrames(30));
+		AddHost(R, [F](FRun& Self)
+		{
+			const AFGCharacterPlayer* Character = GetCharacter(Self);
+			const double Moved = FVector::Dist2D(Character->GetActorLocation(), F->ServerStart);
+			Self.Check(AAreaActionsEquipment::IsFlying(Character) && Moved >= 400.0, FString::Printf(TEXT("the server's copy of the character flies and moved %.0f cm (at least 400), at %s"),
+				Moved, *Character->GetActorLocation().ToCompactString()));
+			return EStep::Next;
+		});
+		AddOpenMenu(R);
+		R.Steps.Add([](FRun& Self)
+		{
+			UAreaActionsPopupBase* Popup = GetPopup(Self);
+			Self.Check(CallText(Popup, TEXT("GetFlyText")) == TEXT("Disable flying"), FString::Printf(TEXT("fly button reads '%s'"), *CallText(Popup, TEXT("GetFlyText"))));
+			Self.Check(PressButton(Popup, TEXT("FlyButton")), TEXT("FlyButton pressed again"));
+			return EStep::Next;
+		});
+		R.Steps.Add(WaitFrames(10));
+		AddChecks(R, [](FRun& Self)
+		{
+			const AFGCharacterPlayer* Character = GetCharacter(Self);
+			const UCharacterMovementComponent* Movement = Character ? Character->GetCharacterMovement() : nullptr;
+			Self.Check(Movement && Movement->MovementMode != MOVE_Flying && !Movement->bCheatFlying, FString::Printf(TEXT("%s: walking again (mode %d)"),
+				Self.bClient ? TEXT("client") : Self.bMp ? TEXT("server") : TEXT("game"), Movement ? static_cast<int32>(Movement->MovementMode) : -1));
+			return EStep::Next;
+		});
+		AddCloseMenu(R);
+		// Rule 4: the server takes nobody off the ground without the tool in hand
+		AddPutToolAway(R);
+		AddHost(R, [F](FRun& Self)
+		{
+			F->RejectsBefore = UAreaActionsRCO::RejectCount;
+			return EStep::Next;
+		});
+		R.Steps.Add([](FRun& Self)
+		{
+			Self.Step(TEXT("asking the server to fly with no tool in hand"));
+			UAreaActionsRCO::Of(Self.GetPlayer())->ServerSetFlying(true);
+			return EStep::Next;
+		});
+		R.Steps.Add(WaitFrames(30));
+		AddHost(R, [F](FRun& Self)
+		{
+			const AFGCharacterPlayer* Character = GetCharacter(Self);
+			Self.Check(UAreaActionsRCO::RejectCount - F->RejectsBefore == 1 && !AAreaActionsEquipment::IsFlying(Character), FString::Printf(TEXT("refused: reject lines %d (want 1), flying %d"),
+				UAreaActionsRCO::RejectCount - F->RejectsBefore, AAreaActionsEquipment::IsFlying(Character)));
+			return EStep::Next;
+		});
+	}
+
+	bool TutorialShown(const FRun& R)
+	{
+		const UUserWidget* Popup = GetPopup(R);
+		const UWidget* Steps = Popup ? Popup->GetWidgetFromName(TEXT("TutorialWidget")) : nullptr;
+		return Steps && Steps->GetVisibility() != ESlateVisibility::Collapsed && Steps->GetVisibility() != ESlateVisibility::Hidden;
+	}
+
+	FString SettingsText()
+	{
+		FString Text;
+		FFileHelper::LoadFileToString(Text, *AreaActionsSettings::GetPath());
+		return Text.Replace(TEXT("\r"), TEXT("")).Replace(TEXT("\n"), TEXT(" "));
+	}
+
+	// The menu opened after the tool was taken: the help shows by itself or not
+	void AddCheckHelpOnOpen(FRun& R, bool bWant, const TCHAR* When)
+	{
+		AddOpenMenu(R);
+		R.Steps.Add([bWant, When](FRun& Self)
+		{
+			Self.Check(TutorialShown(Self) == bWant, FString::Printf(TEXT("%s: the help %s by itself (want %s), step %d"), When, TutorialShown(Self) ? TEXT("shows") : TEXT("does not show"),
+				bWant ? TEXT("shown") : TEXT("not shown"), IntValue(GetPopup(Self), TEXT("HelpIdx"))));
+			return EStep::Next;
+		});
+	}
+
+	// AA-060 point 2: the help in the menu, its Next, Prev and Done buttons; after Done it does not come back by itself (another taking of
+	// the tool, a save and a load), the Help button shows it always. The player's settings file keeps Done (D21).
+	void AddTutorial(FRun& R)
+	{
+		AddEquipTool(R);
+		AddCheckHelpOnOpen(R, true, TEXT("first menu"));
+		R.Steps.Add([](FRun& Self)
+		{
+			UAreaActionsPopupBase* Popup = GetPopup(Self);
+			const int32 Count = ArrayNum(Popup, TEXT("HelpMessages"));
+			Self.Check(Count >= 2 && IntValue(Popup, TEXT("HelpIdx")) == 0, FString::Printf(TEXT("help steps %d, at step %d"), Count, IntValue(Popup, TEXT("HelpIdx"))));
+			PressButton(Popup, TEXT("TutorialNext"));
+			const int32 AfterNext = IntValue(Popup, TEXT("HelpIdx"));
+			PressButton(Popup, TEXT("TutorialPrev"));
+			const int32 AfterPrev = IntValue(Popup, TEXT("HelpIdx"));
+			Self.Check(AfterNext == 1 && AfterPrev == 0, FString::Printf(TEXT("Next goes to step %d (want 1), Prev back to %d (want 0)"), AfterNext, AfterPrev));
+			Self.Check(!SettingsText().Contains(TEXT("HelpDone=True")), FString::Printf(TEXT("before Done the settings file has no HelpDone: '%s'"), *SettingsText()));
+			for (int32 Step = 0; Step < Count && TutorialShown(Self); ++Step)
+			{
+				PressButton(Popup, TEXT("TutorialNext"));
+			}
+			Self.Check(!TutorialShown(Self), TEXT("Done on the last step closes the help"));
+			Self.Check(SettingsText().Contains(TEXT("HelpDone=True")), FString::Printf(TEXT("settings file %s: '%s'"), *AreaActionsSettings::GetPath(), *SettingsText()));
+			return EStep::Next;
+		});
+		AddCloseMenu(R);
+		AddPutToolAway(R);
+		AddEquipTool(R);
+		AddCheckHelpOnOpen(R, false, TEXT("tool taken again"));
+		R.Steps.Add([](FRun& Self)
+		{
+			Self.Check(PressButton(GetPopup(Self), TEXT("HelpButton")) && TutorialShown(Self) && IntValue(GetPopup(Self), TEXT("HelpIdx")) == 0, TEXT("Help shows the help from its first step"));
+			return EStep::Next;
+		});
+		AddCloseMenu(R);
+		if (!R.bMp)
+		{
+			AddSaveAndLoad(R, TEXT("AATest_Tutorial"));
+			AddEquipTool(R);
+			AddCheckHelpOnOpen(R, false, TEXT("after a save and a load"));
+			AddCloseMenu(R);
+			AddDeleteSave(R, TEXT("AATest_Tutorial"));
+		}
+	}
+
+	// AA-060 point 5: the tool's schematic is given in every world without research, has its icon, and its recipe is made at the Crafting
+	// Bench (and the Equipment Workshop); checked by the server and by a client
+	void AddCheckSchematic(FRun& R, const TCHAR* When)
+	{
+		AddChecks(R, [When](FRun& Self)
+		{
+			UClass* Schematic = LoadClass<UFGSchematic>(nullptr, TEXT("/AreaActions/Schematic_AreaActions.Schematic_AreaActions_C"));
+			TSubclassOf<UFGRecipe> ToolRecipe = LoadClass<UFGRecipe>(nullptr, TEXT("/AreaActions/Equipment/AreaActions/Recipe_AreaActions.Recipe_AreaActions_C"));
+			AFGSchematicManager* Schematics = AFGSchematicManager::Get(Self.GetWorld());
+			AFGRecipeManager* Recipes = AFGRecipeManager::Get(Self.GetWorld());
+			Self.Check(Schematic && Schematics && Schematics->IsSchematicPurchased(Schematic), FString::Printf(TEXT("%s: schematic %s given"), When, *GetNameSafe(Schematic)));
+			Self.Check(ToolRecipe && Recipes && Recipes->IsRecipeAvailable(ToolRecipe), FString::Printf(TEXT("%s: recipe %s available"), When, *GetNameSafe(ToolRecipe)));
+			const FSlateBrush Icon = Schematic ? UFGSchematic::GetItemIcon(Schematic) : FSlateBrush();
+			Self.Check(Icon.GetResourceObject() != nullptr, FString::Printf(TEXT("%s: schematic icon %s"), When, *GetNameSafe(Icon.GetResourceObject())));
+			TArray<FString> Producers;
+			for (const TSubclassOf<UObject> Producer : ToolRecipe ? UFGRecipe::GetProducedIn(ToolRecipe) : TArray<TSubclassOf<UObject>>())
+			{
+				Producers.Add(GetNameSafe(Producer));
+			}
+			const FString Joined = FString::Join(Producers, TEXT(", "));
+			Self.Check(Joined.Contains(TEXT("WorkBench")), FString::Printf(TEXT("%s: the tool is made in %s"), When, *Joined));
+			return EStep::Next;
+		});
+	}
+
+	void AddSchematic(FRun& R)
+	{
+		AddCheckSchematic(R, TEXT("new game"));
+		if (!R.bMp)
+		{
+			AddSaveAndLoad(R, TEXT("AATest_Schematic"));
+			AddCheckSchematic(R, TEXT("loaded save"));
+			AddDeleteSave(R, TEXT("AATest_Schematic"));
+		}
+	}
+
+	// AA-060 point 6: the middle mouse button on a building, an actor and a lightweight, puts the Build Gun in hand building that class
+	void AddMiddleMouseOn(FRun& R, TSharedRef<FVector> Target, const TCHAR* RecipeName, const TCHAR* What)
+	{
+		AddEquipTool(R);
+		R.Steps.Add([Target](FRun& Self)
+		{
+			LookAt(Self, *Target);
+			return EStep::Next;
+		});
+		R.Steps.Add(WaitFrames(3));
+		R.Steps.Add([What](FRun& Self)
+		{
+			Self.Step(FString::Printf(TEXT("middle mouse button on the %s"), What));
+			PressKey(Self, EKeys::MiddleMouseButton);
+			return EStep::Next;
+		});
+		R.Steps.Add(WaitFrames(15));
+		R.Steps.Add([RecipeName, What](FRun& Self)
+		{
+			AFGCharacterPlayer* Character = GetCharacter(Self);
+			AFGBuildGun* Gun = Character ? Character->GetBuildGun() : nullptr;
+			const UFGBuildGunStateBuild* Build = Gun ? Cast<UFGBuildGunStateBuild>(Gun->GetCurrentState()) : nullptr;
+			const TSubclassOf<UFGRecipe> Active = Build ? Build->GetActiveRecipe() : nullptr;
+			Self.Check(Gun && Gun->IsEquipped() && Active && Active->GetName().StartsWith(RecipeName), FString::Printf(TEXT("%s: Build Gun in hand %d, state %s, recipe %s (want %s)"), What,
+				Gun && Gun->IsEquipped(), Gun ? *GetNameSafe(Gun->GetCurrentState()) : TEXT("-"), *GetNameSafe(Active), RecipeName));
+			if (Gun && Gun->IsEquipped())
+			{
+				Character->ToggleBuildGun();
+			}
+			return EStep::Next;
+		});
+		R.Steps.Add(WaitFrames(10));
+	}
+
+	void AddMiddleMouse(FRun& R)
+	{
+		TSharedRef<FVector> Machine = MakeShared<FVector>(), Foundation = MakeShared<FVector>();
+		AddEquipTool(R);
+		R.Steps.Add([Machine, Foundation](FRun& Self)
+		{
+			APawn* Pawn = Self.GetPlayer()->GetPawn();
+			const FVector Forward = Pawn->GetActorForwardVector();
+			const FVector Right = FVector::CrossProduct(FVector::UpVector, Forward);
+			FVector At;
+			GroundBelow(Self.GetWorld(), Pawn->GetActorLocation() + Forward * 1500.0 - Right * 800.0, At);
+			AFGBuildable* Constructor = SpawnGameBuildable(Self, TEXT("Build_ConstructorMk1"), TEXT("Recipe_ConstructorMk1"), At + FVector(0, 0, 50));
+			*Machine = At + FVector(0, 0, 300);
+			GroundBelow(Self.GetWorld(), Pawn->GetActorLocation() + Forward * 1500.0 + Right * 800.0, At);
+			AreaActionsBuildings::FSnapshot Piece;
+			Piece.Class = GameClass(TEXT("Build_Foundation_8x1_01"));
+			Piece.BuiltWith = RecipeOfClass(Self, Piece.Class, TEXT("Recipe_Foundation_8x1_01"));
+			const bool bFoundation = Piece.Class && AreaActionsBuildings::Spawn(Self.GetWorld(), Piece, FTransform(At + FVector(0, 0, 50)));
+			*Foundation = At + FVector(0, 0, 100);
+			// A new game has neither recipe yet: the middle mouse button only offers what the player can build
+			if (AFGRecipeManager* Recipes = AFGRecipeManager::Get(Self.GetWorld()))
+			{
+				for (const TCHAR* Name : { TEXT("Recipe_ConstructorMk1"), TEXT("Recipe_Foundation_8x1_01") })
+				{
+					if (const TSubclassOf<UFGRecipe> Made(GameClass(Name)); Made && !Recipes->IsRecipeAvailable(Made))
+					{
+						Recipes->AddAvailableRecipe(Made);
+					}
+				}
+			}
+			Self.Check(Constructor && bFoundation, FString::Printf(TEXT("a Constructor and a foundation in front: %d, %d"), Constructor != nullptr, bFoundation));
+			return EStep::Next;
+		});
+		R.Steps.Add(WaitFrames(10));
+		AddMiddleMouseOn(R, Machine, TEXT("Recipe_ConstructorMk1"), TEXT("Constructor (actor)"));
+		AddMiddleMouseOn(R, Foundation, TEXT("Recipe_Foundation_8x1_01"), TEXT("foundation (lightweight)"));
+	}
+
+	// AA-060 point 7: the selection comes back after the tool was put away and taken again, twice
+	void AddSelectionBackup(FRun& R)
+	{
+		TSharedRef<TArray<FVector>> Before = MakeShared<TArray<FVector>>();
+		AddEquipTool(R);
+		AddThreeCorners(R);
+		R.Steps.Add([Before](FRun& Self)
+		{
+			*Before = VectorArray(GetTool(Self), TEXT("CornerLocations"));
+			Self.Check(Before->Num() == 3, FString::Printf(TEXT("corners before: %d"), Before->Num()));
+			return EStep::Next;
+		});
+		for (int32 Round = 1; Round <= 2; ++Round)
+		{
+			AddPutToolAway(R);
+			AddEquipTool(R);
+			R.Steps.Add([Before, Round](FRun& Self)
+			{
+				AAreaActionsEquipment* Tool = GetTool(Self);
+				const TArray<FVector> After = VectorArray(Tool, TEXT("CornerLocations"));
+				bool bSame = After.Num() == Before->Num();
+				for (int32 Index = 0; bSame && Index < After.Num(); ++Index)
+				{
+					bSame = After[Index].Equals((*Before)[Index], 1.0);
+				}
+				int32 Live = 0;
+				if (FArrayProperty* Property = FindFProperty<FArrayProperty>(Tool->GetClass(), TEXT("CornerIndicators")))
+				{
+					FScriptArrayHelper Array(Property, Property->ContainerPtrToValuePtr<void>(Tool));
+					for (int32 Index = 0; Index < Array.Num(); ++Index)
+					{
+						Live += IsValid(CastField<FObjectPropertyBase>(Property->Inner)->GetObjectPropertyValue(Array.GetRawPtr(Index))) ? 1 : 0;
+					}
+				}
+				int32 Backups = 0;
+				for (TActorIterator<AActor> It(Self.GetWorld()); It; ++It)
+				{
+					Backups += It->GetClass()->GetName().StartsWith(TEXT("AreaActionsBackup")) ? 1 : 0;
+				}
+				Self.Step(FString::Printf(TEXT("round %d: backup actors in the world %d"), Round, Backups));
+				Self.Check(bSame, FString::Printf(TEXT("round %d: corners back, %d of %d, same places %d"), Round, After.Num(), Before->Num(), bSame));
+				Self.Check(Live == 3 && ArrayNum(Tool, TEXT("AreaWalls")) == 3, FString::Printf(TEXT("round %d: corner indicators %d, walls %d (want 3, 3)"), Round, Live, ArrayNum(Tool, TEXT("AreaWalls"))));
+				return EStep::Next;
+			});
+		}
+	}
+
+	// AA-096 (3): the tool's Blueprint WasUnEquipped while the game still has the tool equipped; the ticks after it must not run the
+	// Blueprint's WasEquipped (no windows, no indicators of a tool put away)
+	void AddHolsterTick(FRun& R)
+	{
+		AddEquipTool(R);
+		R.Steps.Add([](FRun& Self)
+		{
+			AAreaActionsEquipment* Tool = GetTool(Self);
+			Self.Check(Cast<UUserWidget>(ObjectValue(Tool, TEXT("StatusWidget"))) != nullptr, TEXT("status window while the tool is in hand"));
+			CallNoParams(Tool, TEXT("WasUnEquipped"));
+			Self.Step(FString::Printf(TEXT("WasUnEquipped called; the tool still equipped %d, local instigator %d"), Tool->IsEquipped(), Tool->IsLocalInstigator()));
+			return EStep::Next;
+		});
+		R.Steps.Add(WaitFrames(30));
+		R.Steps.Add([](FRun& Self)
+		{
+			AAreaActionsEquipment* Tool = GetTool(Self);
+			const UUserWidget* Status = Cast<UUserWidget>(ObjectValue(Tool, TEXT("StatusWidget")));
+			Self.Check(!Status && !TopWindow(Self), FString::Printf(TEXT("30 ticks later: status window %s, windows %s (want none)"), *GetNameSafe(Status), *GetNameSafe(TopWindow(Self))));
+			return EStep::Next;
+		});
+		AddPutToolAway(R);
+		AddEquipTool(R);
+		R.Steps.Add([](FRun& Self)
+		{
+			Self.Check(Cast<UUserWidget>(ObjectValue(GetTool(Self), TEXT("StatusWidget"))) != nullptr, TEXT("taken again: status window back"));
+			return EStep::Next;
+		});
+	}
+
+	// AA-096 (2): opening and closing a Fill preview of 300 holograms (their sounds stopped one by one) within W5
+	void AddPreviewHolograms300(FRun& R)
+	{
+		FSceneRef S = MakeShared<FScene>();
+		FCopyRef C = MakeShared<FCopyState>();
+		AddCopyScene(R, S, C, BuildSingle);
+		AddOpenAction(R, TEXT("Fill"));
+		R.Steps.Add(WaitCalm(30));
+		R.Steps.Add([](FRun& Self)
+		{
+			Self.MaxFrameMs = 0.0;
+			Self.bMeasureFrames = true;
+			return EStep::Next;
+		});
+		AddFillWindow(R, FVector(1, 1, 0), FIntVector(31, 10, 1), FVector2D(0, 0), false, TEXT("PreviewButton"));
+		R.Steps.Add(WaitFrames(10));
+		R.Steps.Add([](FRun& Self)
+		{
+			Self.Check(PreviewHolograms(Self) == 300, FString::Printf(TEXT("preview holograms %d (want 300)"), PreviewHolograms(Self)));
+			return EStep::Next;
+		});
+		AddCloseWithX(R, TEXT("Widget_Fill"));
+		R.Steps.Add(WaitFrames(10));
+		R.Steps.Add([](FRun& Self)
+		{
+			Self.bMeasureFrames = false;
+			Self.Check(PreviewHolograms(Self) == 0, FString::Printf(TEXT("after Cancel: holograms %d"), PreviewHolograms(Self)));
+			Self.Check(Self.MaxFrameMs <= 200.0, FString::Printf(TEXT("longest frame while the preview opened and closed: %.1f ms (W5: at most 200)"), Self.MaxFrameMs));
+			return EStep::Next;
+		});
+	}
+
+	// AA-091 (3): which buildings of the Build Gun have no meshes the preview can draw (no static mesh component, no instance meshes), so
+	// their copies get the box. Lists them; nothing else.
+	void AddPreviewBoxProbe(FRun& R)
+	{
+		R.Steps.Add([](FRun& Self)
+		{
+			TArray<FAssetData> Assets;
+			FModuleManager::LoadModuleChecked<FAssetRegistryModule>(TEXT("AssetRegistry")).Get().GetAssetsByPath(FName(TEXT("/Game/FactoryGame/Recipes")), Assets, true);
+			TSet<UClass*> Seen;
+			TArray<FString> Boxed;
+			int32 Classes = 0;
+			for (const FAssetData& Asset : Assets)
+			{
+				const FString Name = Asset.AssetName.ToString();
+				UClass* RecipeClass = Name.StartsWith(TEXT("Recipe_")) ? LoadClass<UFGRecipe>(nullptr, *(Asset.PackageName.ToString() + TEXT(".") + Name + TEXT("_C"))) : nullptr;
+				if (!RecipeClass)
+				{
+					continue;
+				}
+				const bool bBuildGun = UFGRecipe::GetProducedIn(RecipeClass).ContainsByPredicate([](const TSubclassOf<UObject>& Producer) { return Producer && Producer->GetName().Contains(TEXT("BuildGun")); });
+				for (const FItemAmount& Product : bBuildGun ? UFGRecipe::GetProducts(RecipeClass) : TArray<FItemAmount>())
+				{
+					const TSubclassOf<UFGBuildingDescriptor> Descriptor(Product.ItemClass.Get());
+					UClass* Class = Descriptor ? UFGBuildingDescriptor::GetBuildableClass(Descriptor).Get() : nullptr;
+					if (!Class || Seen.Contains(Class) || AreaActionsBuildings::ShouldIgnore(Class))
+					{
+						continue;
+					}
+					Seen.Add(Class);
+					++Classes;
+					const AFGBuildable* Default = Class->GetDefaultObject<AFGBuildable>();
+					int32 Meshes = 0;
+					TInlineComponentArray<UStaticMeshComponent*> Native(Default);
+					for (const UStaticMeshComponent* Mesh : Native)
+					{
+						Meshes += Mesh->GetStaticMesh() && Mesh->IsVisible() && !Mesh->IsA<UInstancedStaticMeshComponent>() ? 1 : 0;
+					}
+					for (UBlueprintGeneratedClass* Generated = Cast<UBlueprintGeneratedClass>(Class); Generated; Generated = Cast<UBlueprintGeneratedClass>(Generated->GetSuperClass()))
+					{
+						for (const USCS_Node* Node : Generated->SimpleConstructionScript ? Generated->SimpleConstructionScript->GetAllNodes() : TArray<USCS_Node*>())
+						{
+							const UStaticMeshComponent* Mesh = Node ? Cast<UStaticMeshComponent>(Node->ComponentTemplate) : nullptr;
+							Meshes += Mesh && Mesh->GetStaticMesh() && Mesh->IsVisible() && !Mesh->IsA<UInstancedStaticMeshComponent>() ? 1 : 0;
+						}
+					}
+					if (const UAbstractInstanceDataObject* Data = Default->GetLightweightInstanceData())
+					{
+						Meshes += Algo::CountIf(Data->GetInstanceData(), [](const FInstanceData& Instance) { return Instance.StaticMesh != nullptr; });
+					}
+					if (Meshes == 0)
+					{
+						Boxed.Add(Class->GetName());
+					}
+				}
+			}
+			Self.Step(FString::Printf(TEXT("Build Gun classes %d, without meshes the preview draws %d: %s"), Classes, Boxed.Num(), *FString::Join(Boxed, TEXT(", "))));
+			Self.Check(Classes > 100, FString::Printf(TEXT("classes looked at: %d"), Classes));
+			return EStep::Next;
+		});
+	}
+
+	// AA-092 (1): "No Build Cost": the window says the cost does not come back and has OK and Cancel only; Cancel leaves the world, OK
+	// dismantles with the contents in the crates (as DismantleNoCost)
+	void AddDismantleNoCostWindow(FRun& R)
+	{
+		FSceneRef S = MakeShared<FScene>();
+		FDismantleRef D = MakeShared<FDismantleState>();
+		D->bNoCost = true;
+		AddHost(R, [](FRun& Self)
+		{
+			AFGGameState* State = Self.GetWorld()->GetGameState<AFGGameState>();
+			if (State)
+			{
+				State->SetCheatNoCost(true);
+			}
+			Self.Check(State && State->GetCheatNoCost(), TEXT("No Build Cost on"));
+			return EStep::Next;
+		});
+		AddDismantleScene(R, S, D);
+		AddOpenAction(R, TEXT("MassDismantle"));
+		AddOnWindow(R, TEXT("Widget_MessageYesNo"), [](FRun& Self, UUserWidget* Window)
+		{
+			FStrProperty* Message = FindFProperty<FStrProperty>(Window->GetClass(), TEXT("Message"));
+			const FString Text = Message ? Message->GetPropertyValue_InContainer(Window) : FString();
+			Self.Check(Text.Contains(TEXT("No Build Cost")) && Text.Contains(TEXT("does not come back")), FString::Printf(TEXT("the window says: %s"), *Text));
+			Self.Check(!Window->GetWidgetFromName(TEXT("ChoiceButton2")), TEXT("two buttons only"));
+			Self.Check(PressButton(Window, TEXT("NoButton")), TEXT("Cancel pressed"));
+		});
+		R.Steps.Add(WaitFrames(5));
+		AddChecks(R, [S, D](FRun& Self)
+		{
+			const int32 Left = Algo::CountIf(S->Inside, [](const TWeakObjectPtr<AFGBuildable>& Weak) { return IsValid(Weak.Get()); });
+			Self.Check(Left == S->Inside.Num() && !ActiveAction(Self) && NewCrates(Self, *S).IsEmpty(), FString::Printf(TEXT("Cancel: actors %d of %d stay, no crate, no action"), Left, S->Inside.Num()));
+			return EStep::Next;
+		});
+		AddDismantle(R, S, TEXT("YesButton"), TEXT("OK"));
+		AddCheckGone(R, S, D);
+		AddCheckRefundCrate(R, S, D);
+		AddHost(R, [](FRun& Self)
+		{
+			if (AFGGameState* State = Self.GetWorld()->GetGameState<AFGGameState>())
+			{
+				State->SetCheatNoCost(false);
+			}
+			return EStep::Next;
+		});
+	}
+
+	// AA-092 (2): "Cost only": the crates hold the build cost and the machines' power shards and somersloops, none of what machines,
+	// containers and crates held otherwise
+	void AddDismantleCostOnly(FRun& R)
+	{
+		FSceneRef S = MakeShared<FScene>();
+		FDismantleRef D = MakeShared<FDismantleState>();
+		TSharedRef<FCounts> Upgrades = MakeShared<FCounts>();
+		AddScene(R, S, 4000.0, [D, Upgrades](FRun& Self, FScene& Scene)
+		{
+			BuildDismantleBasic(Self, Scene, *D);
+			for (const TWeakObjectPtr<AFGBuildable>& Weak : Scene.Inside)
+			{
+				AFGBuildableManufacturer* Machine = Cast<AFGBuildableManufacturer>(Weak.Get());
+				UFGInventoryComponent* Potential = Machine ? Machine->GetPotentialInventory() : nullptr;
+				if (!Potential)
+				{
+					continue;
+				}
+				for (const TCHAR* Name : { TEXT("Desc_CrystalShard"), TEXT("Desc_WAT1") })
+				{
+					const TSubclassOf<UFGItemDescriptor> Upgrade(GameClass(Name));
+					const int32 Added = Upgrade ? Potential->AddStack(FInventoryStack(1, Upgrade), true) : 0;
+					Self.Step(FString::Printf(TEXT("%s into %s: %d"), Name, *Machine->GetName(), Added));
+				}
+				TArray<FInventoryStack> Stacks;
+				Potential->GetInventoryStacks(Stacks);
+				AddSolids(*Upgrades, Stacks);
+			}
+			Self.Check(Total(*Upgrades) == 2, FString::Printf(TEXT("upgrades in the Constructor: %s"), *ItemsText(*Upgrades)));
+		});
+		AddBoth(R, [S, D, Upgrades](FRun& Self)
+		{
+			if (!Self.bClient)
+			{
+				RecordRefund(Self, *S, *D);
+				// The refund less what the buildings hold, with the upgrades back
+				for (const TPair<TSubclassOf<UFGItemDescriptor>, int32>& Entry : D->Contents)
+				{
+					D->Expected.FindOrAdd(Entry.Key) -= Entry.Value;
+				}
+				for (const TPair<TSubclassOf<UFGItemDescriptor>, int32>& Entry : *Upgrades)
+				{
+					D->Expected.FindOrAdd(Entry.Key) += Entry.Value;
+				}
+				for (auto It = D->Expected.CreateIterator(); It; ++It)
+				{
+					if (It->Value == 0)
+					{
+						It.RemoveCurrent();
+					}
+				}
+				Self.Step(FString::Printf(TEXT("cost only: expected %s (%d)"), *ItemsText(D->Expected), Total(D->Expected)));
+				Send(Self, MsgExpected, Total(D->Expected));
+			}
+			CountWorld(Self, D->Pieces);
+			D->Pieces.JobsBefore = AAreaActionsServerSubsystem::FinishedJobs;
+			return EStep::Next;
+		});
+		AddDismantle(R, S, TEXT("ChoiceButton2"), TEXT("Cost only"));
+		AddCheckGone(R, S, D);
+		AddCheckRefundCrate(R, S, D);
+	}
+
 	bool BuildScenario(FRun& R)
 	{
 		if (R.Name == TEXT("MP_Smoke"))
@@ -5547,6 +6266,58 @@ namespace
 				return EStep::Next;
 			});
 			R.Steps.Add(WaitFrames(60));
+			return true;
+		}
+		if (R.Scenario == TEXT("Fly"))
+		{
+			AddFly(R);
+			return true;
+		}
+		if (R.Scenario == TEXT("Tutorial"))
+		{
+			R.StepTimeoutSec = 60.0;
+			AddTutorial(R);
+			return true;
+		}
+		if (R.Scenario == TEXT("Schematic"))
+		{
+			R.StepTimeoutSec = 60.0;
+			AddSchematic(R);
+			return true;
+		}
+		if (R.Scenario == TEXT("MiddleMouse"))
+		{
+			AddMiddleMouse(R);
+			return true;
+		}
+		if (R.Scenario == TEXT("SelectionBackup"))
+		{
+			AddSelectionBackup(R);
+			return true;
+		}
+		if (R.Scenario == TEXT("HolsterTick"))
+		{
+			AddHolsterTick(R);
+			return true;
+		}
+		if (R.Scenario == TEXT("PreviewHolograms300"))
+		{
+			AddPreviewHolograms300(R);
+			return true;
+		}
+		if (R.Scenario == TEXT("PreviewBoxProbe"))
+		{
+			AddPreviewBoxProbe(R);
+			return true;
+		}
+		if (R.Scenario == TEXT("DismantleNoCostWindow"))
+		{
+			AddDismantleNoCostWindow(R);
+			return true;
+		}
+		if (R.Scenario == TEXT("DismantleCostOnly"))
+		{
+			AddDismantleCostOnly(R);
 			return true;
 		}
 		if (R.Scenario == TEXT("DismantleBasic"))
@@ -6150,6 +6921,8 @@ void FAreaActionsTests::StartFromCommandLine(UWorld* World)
 		UE_LOG(LogAreaActionsCpp, Display, TEXT("AATEST %s step dedicated server in %s, waiting for the game map"), *Name, *World->GetMapName());
 		return;
 	}
+	// Every scenario starts as a player who never used the tool (D21: the settings file of the test mode)
+	AreaActionsSettings::ResetForTest();
 	Run = MakeUnique<FRun>();
 	Run->Name = Name;
 	Run->World = World;

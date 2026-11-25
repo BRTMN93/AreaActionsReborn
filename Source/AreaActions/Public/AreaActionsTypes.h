@@ -41,6 +41,19 @@ enum class EAreaActionsResultCode : uint8
 	TooMany,
 };
 
+// What MassDismantle gives back (AA-092)
+UENUM(BlueprintType)
+enum class EAreaActionsDismantleRefund : uint8
+{
+	// Nothing
+	None,
+	// The game's refund: the build cost (none with "No Build Cost") and what the buildings hold
+	All,
+	// The build cost and the buildings' upgrades (power shards, somersloops), without what machines and containers hold; refused with
+	// "No Build Cost", where there is no build cost
+	CostOnly,
+};
+
 USTRUCT(BlueprintType)
 struct AREAACTIONS_API FAreaActionsClassCount
 {

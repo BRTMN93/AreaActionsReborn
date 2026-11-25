@@ -82,6 +82,8 @@ protected:
 	bool CallWindow(FName Function, TFunctionRef<bool(UFunction*, uint8*)> SetParams, TFunctionRef<void(UFunction*, const uint8*)> ReadParams);
 	// The tool's ActionsSettings subsystem actor, which keeps "Use build cost" and the container distance between actions
 	AActor* GetSettings() const;
+	// The player's settings file into that actor (Send writes them back)
+	void LoadSettings() const;
 
 	TArray<AreaActionsBuildings::FSnapshot> Buildings;
 	AreaActionsBuildings::FFrame Frame;

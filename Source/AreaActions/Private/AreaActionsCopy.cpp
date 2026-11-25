@@ -3,6 +3,10 @@
 #include "AreaActionsEquipment.h"
 #include "AreaActionsJobs.h"
 #include "AreaActionsLog.h"
+#include "AreaActionsSettings.h"
+
+static const TCHAR* UseBuildCostKey = TEXT("UseBuildCost");
+static const TCHAR* ContainerDistanceKey = TEXT("ContainerDistance");
 #include "AreaActionsRCO.h"
 #include "Blueprint/UserWidget.h"
 #include "Blueprint/WidgetBlueprintLibrary.h"
@@ -200,6 +204,8 @@ void UAreaActionPlaceCopies::Start()
 	Frame = AreaActionsBuildings::ComputeFrame(Buildings);
 	// The action shows the area's axes above its buildings (Fill's ramp arrows), as the original's InitLocationAndRotation
 	Shell->SetActorLocationAndRotation(FVector(Frame.Position.X, Frame.Position.Y, Frame.MaxZ + 200.0), FRotator(0.0, Frame.Yaw, 0.0));
+	// The window reads the settings actor when it is made: the player's own settings go into it first (D21)
+	LoadSettings();
 	Window = Shell->OpenWindow(Shell->ParamsWidgetClass);
 	if (!Window || !BindWindow() || !AAreaActionBase::BindWindowEvent(Window, TEXT("WidgetCanceled"), this, GET_FUNCTION_NAME_CHECKED(UAreaActionPlaceCopies, Canceled)))
 	{
@@ -292,7 +298,27 @@ void UAreaActionPlaceCopies::Send(const FAreaActionsPlacement& Placement, bool b
 			Distance = static_cast<float>(Property->GetPropertyValue_InContainer(Settings));
 		}
 	}
+	AreaActionsSettings::SetBool(UseBuildCostKey, bUseCost);
+	AreaActionsSettings::SetDouble(ContainerDistanceKey, Distance);
 	Rco->ServerPlaceCopies(Id, Shell->GetArea(), Placement, bUseCost, Distance);
+}
+
+void UAreaActionPlaceCopies::LoadSettings() const
+{
+	AActor* Settings = GetSettings();
+	if (!Settings)
+	{
+		return;
+	}
+	// Without a file the settings actor's own defaults stay (the original's)
+	if (const FBoolProperty* UseCost = FindFProperty<FBoolProperty>(Settings->GetClass(), TEXT("UseBuildCost")))
+	{
+		UseCost->SetPropertyValue_InContainer(Settings, AreaActionsSettings::GetBool(UseBuildCostKey, UseCost->GetPropertyValue_InContainer(Settings)));
+	}
+	if (const FDoubleProperty* Property = FindFProperty<FDoubleProperty>(Settings->GetClass(), TEXT("ContainerDistance")))
+	{
+		Property->SetPropertyValue_InContainer(Settings, FMath::Max(0.0, AreaActionsSettings::GetDouble(ContainerDistanceKey, Property->GetPropertyValue_InContainer(Settings))));
+	}
 }
 
 void UAreaActionPlaceCopies::Canceled()

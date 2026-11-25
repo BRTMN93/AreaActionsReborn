@@ -759,11 +759,13 @@ namespace
 	// MassDismantle (AA-030) by the game's own rules (P5): every building, lightweight and crate in the area; CanDismantle decides for
 	// actors (a lightweight has no actor to ask), an
 	// actor's refund is its GetDismantleRefund (build cost and contents, the contents only with No Build Cost), a lightweight's comes from
-	// its class. With bToCrate the refund goes into the return crates as each building goes; fluids are lost.
+	// its class. With a refund it goes into the return crates as each building goes; fluids are lost. CostOnly (AA-092): the build cost and
+	// the upgrades in the buildings' potential inventories (power shards, somersloops), without the rest of what they and crates hold.
 	class FDismantleJob final : public FAreaActionsJob
 	{
 	public:
-		explicit FDismantleJob(bool bInToCrate) : bToCrate(bInToCrate) {}
+		explicit FDismantleJob(EAreaActionsDismantleRefund InRefund)
+			: bToCrate(InRefund != EAreaActionsDismantleRefund::None), bCostOnly(InRefund == EAreaActionsDismantleRefund::CostOnly) {}
 
 		virtual const TCHAR* GetName() const override { return TEXT("MassDismantle"); }
 		virtual int32 GetItems() const override { return FoundCrates.Num() + Buildings.Num(); }
@@ -952,7 +954,7 @@ namespace
 			{
 				return;
 			}
-			if (bToCrate && Crate->GetInventory())
+			if (bToCrate && !bCostOnly && Crate->GetInventory())
 			{
 				TArray<FInventoryStack> Stacks;
 				Crate->GetInventory()->GetInventoryStacks(Stacks);
@@ -1026,7 +1028,32 @@ namespace
 				IFGDismantleInterface::Execute_GetDismantleRefund(Actor, Contents, true);
 				Tally(RefundCost, Stacks);
 				Tally(RefundCost, Contents, -1);
-				Tally(RefundContents, Contents);
+				if (bCostOnly)
+				{
+					// The refund less the contents, and the upgrades back, as stacks of their own (they carry no state)
+					AreaActionsBuildings::FItemCounts Cost;
+					Tally(Cost, Stacks);
+					Tally(Cost, Contents, -1);
+					TArray<FInventoryStack> Upgrades;
+					if (const AFGBuildableFactory* Factory = Cast<AFGBuildableFactory>(Actor); Factory && Factory->GetPotentialInventory())
+					{
+						Factory->GetPotentialInventory()->GetInventoryStacks(Upgrades);
+					}
+					Tally(RefundContents, Upgrades);
+					Stacks.Reset();
+					for (const TPair<TSubclassOf<UFGItemDescriptor>, int32>& Item : Cost)
+					{
+						if (Item.Value > 0)
+						{
+							Stacks.Emplace(Item.Value, Item.Key);
+						}
+					}
+					Stacks.Append(Upgrades);
+				}
+				else
+				{
+					Tally(RefundContents, Contents);
+				}
 				Refund(World, Stacks, Actor->GetActorLocation());
 			}
 			Classes.FindOrAdd(Actor->GetClass())++;
@@ -1058,6 +1085,7 @@ namespace
 		}
 
 		bool bToCrate;
+		bool bCostOnly;
 		bool bNoCost = false;
 		bool bStarted = false;
 		AreaActionsBuildings::FCollector Collector;
@@ -1083,9 +1111,9 @@ namespace
 	};
 }
 
-TUniquePtr<FAreaActionsJob> AreaActionsJobs::MakeDismantle(bool bToCrate)
+TUniquePtr<FAreaActionsJob> AreaActionsJobs::MakeDismantle(EAreaActionsDismantleRefund Refund)
 {
-	return MakeUnique<FDismantleJob>(bToCrate);
+	return MakeUnique<FDismantleJob>(Refund);
 }
 
 void AreaActionsJobs::SetCratesFailForTest(int32 Mode)

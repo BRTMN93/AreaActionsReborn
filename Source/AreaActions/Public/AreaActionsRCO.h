@@ -42,9 +42,15 @@ public:
 	UFUNCTION(Server, Reliable)
 	void ServerPlaceCopies(int32 RequestId, const FAreaActionsArea& Area, const FAreaActionsPlacement& Placement, bool bUseBuildCost, float ContainerDistance);
 
-	// MassDismantle; with bRefundToCrate the game's refund goes into return crates at the player
+	// MassDismantle; a refund goes into return crates at the player. Refund is any byte the client sends; the server checks it and reads
+	// "No Build Cost" itself
 	UFUNCTION(Server, Reliable)
-	void ServerDismantle(int32 RequestId, const FAreaActionsArea& Area, bool bRefundToCrate);
+	void ServerDismantle(int32 RequestId, const FAreaActionsArea& Area, EAreaActionsDismantleRefund Refund);
+
+	// Flying on or off for the player's character (AA-060); on only with the tool in hand. The client switches its own character at once,
+	// the server's copy here, so the server takes the moves the client sends
+	UFUNCTION(Server, Reliable)
+	void ServerSetFlying(bool bFly);
 
 	UFUNCTION(Client, Reliable)
 	void ClientResult(int32 RequestId, const FAreaActionsResult& Result);

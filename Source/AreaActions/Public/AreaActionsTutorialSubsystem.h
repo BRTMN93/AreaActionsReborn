@@ -6,7 +6,8 @@
 #include "AreaActionsTutorialSubsystem.generated.h"
 
 // Parent of AreaActionsTutorialSubsystem: whether the tool's help shows by itself. The original's ADA-style messages are gone from the
-// game's API and are not ported (AA-060). The flags stay in the save, as the original's did.
+// game's API and are not ported (AA-060). Whether the player saw the help to its end is kept in the player's settings file
+// (AreaActionsSettings, decision D21), so a client keeps it too; the flags here only stay for saves made before.
 UCLASS(Abstract)
 class AREAACTIONS_API AAreaActionsTutorialSubsystem : public AActor, public IFGSaveInterface
 {

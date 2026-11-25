@@ -1,6 +1,9 @@
 #include "AreaActionsSimpleActions.h"
 #include "AreaActionsLog.h"
 #include "AreaActionsRCO.h"
+#include "AreaActionsEquipment.h"
+#include "FGCharacterPlayer.h"
+#include "FGInventoryComponent.h"
 #include "Buildables/FGBuildable.h"
 #include "FGRecipe.h"
 
@@ -178,10 +181,27 @@ void UAreaActionClearInventories::OnResult(const FAreaActionsResult& Result)
 void UAreaActionMassDismantle::Start()
 {
 	AAreaActionBase* Shell = GetShell();
-	if (!Shell->OpenChoice(LOCTEXT("DismantleConfirmTitle", "Confirm Mass Dismantle"),
-		LOCTEXT("DismantleAsk", "Dismantle everything in the selected area? The refund can go to crates next to you, or be left out."),
-		LOCTEXT("DismantleToCrate", "Refund to crate"), LOCTEXT("DismantleNoRefund", "No refund"),
-		this, GET_FUNCTION_NAME_CHECKED(UAreaActionMassDismantle, ToCrate), GET_FUNCTION_NAME_CHECKED(UAreaActionMassDismantle, NoRefund)))
+	// "No Build Cost" as the game reads it for this player; the server reads it again for itself
+	const AFGCharacterPlayer* Character = Cast<AFGCharacterPlayer>(Shell->GetEquipment() ? Shell->GetEquipment()->GetInstigator() : nullptr);
+	const UFGInventoryComponent* Inventory = Character ? Character->GetInventory() : nullptr;
+	bool bOpened;
+	if (Inventory && Inventory->GetNoBuildCost())
+	{
+		// AA-092: with "No Build Cost" the game gives back no build cost, only what the buildings hold
+		bOpened = Shell->OpenChoice(LOCTEXT("DismantleConfirmTitle", "Confirm Mass Dismantle"),
+			LOCTEXT("DismantleAskNoCost", "Dismantle everything in the selected area? \"No Build Cost\" is on, so the buildings' cost does not come back: only what they hold goes to crates next to you."),
+			{ { LOCTEXT("DismantleOk", "OK"), GET_FUNCTION_NAME_CHECKED(UAreaActionMassDismantle, ToCrate) },
+				{ LOCTEXT("DismantleCancel", "Cancel"), GET_FUNCTION_NAME_CHECKED(UAreaActionMassDismantle, Cancel) } }, this);
+	}
+	else
+	{
+		bOpened = Shell->OpenChoice(LOCTEXT("DismantleConfirmTitle", "Confirm Mass Dismantle"),
+			LOCTEXT("DismantleAsk3", "Dismantle everything in the selected area? The refund goes to crates next to you: all of it, the build cost only (with power shards and somersloops, without what machines and containers hold), or none."),
+			{ { LOCTEXT("DismantleToCrate", "Refund to crate"), GET_FUNCTION_NAME_CHECKED(UAreaActionMassDismantle, ToCrate) },
+				{ LOCTEXT("DismantleNoRefund", "No refund"), GET_FUNCTION_NAME_CHECKED(UAreaActionMassDismantle, NoRefund) },
+				{ LOCTEXT("DismantleCostOnly", "Cost only"), GET_FUNCTION_NAME_CHECKED(UAreaActionMassDismantle, CostOnly) } }, this);
+	}
+	if (!bOpened)
 	{
 		Shell->Finish();
 	}
@@ -189,23 +209,33 @@ void UAreaActionMassDismantle::Start()
 
 void UAreaActionMassDismantle::ToCrate()
 {
-	Send(true);
+	Send(EAreaActionsDismantleRefund::All);
 }
 
 void UAreaActionMassDismantle::NoRefund()
 {
-	Send(false);
+	Send(EAreaActionsDismantleRefund::None);
 }
 
-void UAreaActionMassDismantle::Send(bool bInToCrate)
+void UAreaActionMassDismantle::CostOnly()
+{
+	Send(EAreaActionsDismantleRefund::CostOnly);
+}
+
+void UAreaActionMassDismantle::Cancel()
+{
+	// The window closes and its NoClicked ends the action
+}
+
+void UAreaActionMassDismantle::Send(EAreaActionsDismantleRefund InRefund)
 {
 	AAreaActionBase* Shell = GetActiveShell();
 	if (UAreaActionsRCO* Rco = Shell ? Shell->GetRco() : nullptr)
 	{
 		if (const int32 Id = Shell->BeginRequest(); Id != INDEX_NONE)
 		{
-			bToCrate = bInToCrate;
-			Rco->ServerDismantle(Id, Shell->GetArea(), bInToCrate);
+			bToCrate = InRefund != EAreaActionsDismantleRefund::None;
+			Rco->ServerDismantle(Id, Shell->GetArea(), InRefund);
 		}
 	}
 }

@@ -48,7 +48,7 @@ private:
 	bool bToCrate = false;
 };
 
-// "Refund to crate" or "No refund", then the request; closing the window cancels. The result names the buildings, the refund, the crates
+// "Refund to crate", "No refund" or "Cost only" (with "No Build Cost": OK or Cancel, AA-092), then the request; closing the window cancels. The result names the buildings, the refund, the crates
 // and what the game did not let anyone dismantle
 UCLASS()
 class AREAACTIONS_API UAreaActionMassDismantle : public UAreaAction
@@ -63,9 +63,13 @@ public:
 	void ToCrate();
 	UFUNCTION()
 	void NoRefund();
+	UFUNCTION()
+	void CostOnly();
+	UFUNCTION()
+	void Cancel();
 
 private:
-	void Send(bool bInToCrate);
+	void Send(EAreaActionsDismantleRefund InRefund);
 	bool bToCrate = false;
 };
 

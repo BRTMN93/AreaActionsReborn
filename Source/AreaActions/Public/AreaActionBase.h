@@ -60,6 +60,9 @@ public:
 	// A question with two named answers: the yes/no window with its buttons renamed, each button calls a function of Target by name.
 	// Closing the window (X, or the tool put away) without an answer ends the action. False (and an error) when the window cannot open.
 	bool OpenChoice(const FText& Title, const FText& Message, const FText& First, const FText& Second, UObject* Target, FName OnFirst, FName OnSecond);
+	// The same with two or more answers; past the window's two buttons, more are made like its first
+	struct FChoiceAnswer { FText Label; FName Function; };
+	bool OpenChoice(const FText& Title, const FText& Message, const TArray<FChoiceAnswer>& Answers, UObject* Target);
 	// A message with OK; OK ends the action
 	void ShowMessage(const FText& Title, const FText& Message);
 	// A message for a result code that is not Ok; false when Code is Ok
@@ -90,6 +93,10 @@ public:
 	UFUNCTION()
 	void ChoiceClosed();
 
+	// A button the choice window got from OpenChoice closes the window
+	UFUNCTION()
+	void CloseChoice();
+
 protected:
 	virtual void BeginPlay() override;
 	virtual void EndPlay(const EEndPlayReason::Type Reason) override;
@@ -106,6 +113,7 @@ private:
 	// Requests begun so far, and that count when the open choice window appeared
 	int32 RequestCount = 0;
 	int32 RequestCountAtChoice = 0;
+	TWeakObjectPtr<UUserWidget> ChoiceWindow;
 	FDelegateHandle ResultHandle;
 	bool bFinished = false;
 };

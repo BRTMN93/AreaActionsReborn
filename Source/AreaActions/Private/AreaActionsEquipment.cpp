@@ -7,18 +7,122 @@
 #include "InstanceData.h"
 #include "Misc/CommandLine.h"
 #include "Net/Core/Misc/NetContext.h"
+#include "AreaActionsRCO.h"
+#include "Equipment/FGBuildGun.h"
+#include "FGCharacterPlayer.h"
+#include "FGRecipe.h"
+#include "FGRecipeManager.h"
+#include "GameFramework/CharacterMovementComponent.h"
+#include "Resources/FGBuildingDescriptor.h"
 
 static const FName InitOnServerName(TEXT("InitOnServer"));
+static const FName ToggleFlyName(TEXT("ToggleFly"));
 static const FName WasEquippedName(TEXT("WasEquipped"));
 
 int32 AAreaActionsEquipment::GetFunctionCallspace(UFunction* Function, FFrame* Stack)
 {
 	if (Function && Function->GetFName() == InitOnServerName)
 	{
-		// Only the tool's own player starts an action; a call for anybody else's tool does nothing
-		return IsLocalInstigator() ? FunctionCallspace::Local : FunctionCallspace::Absorbed;
+		// Only the tool's own player starts an action, and only while the tool's Blueprint side runs for that player (AA-096 NEW-2: the
+		// answer of WasEquipped, not who the instigator is at the moment of the click); a call for anybody else's tool does nothing
+		return bEquippedLocally ? FunctionCallspace::Local : FunctionCallspace::Absorbed;
+	}
+	if (Function && Function->GetFName() == ToggleFlyName)
+	{
+		// The Blueprint's ToggleFly ("Run on Server") spawned the original's FlyHandler on the server; the menu's button flies natively
+		// (ToggleFlying), so the Blueprint's event never runs
+		return FunctionCallspace::Absorbed;
 	}
 	return Super::GetFunctionCallspace(Function, Stack);
+}
+
+void AAreaActionsEquipment::ApplyFlying(ACharacter* Character, bool bFly)
+{
+	UCharacterMovementComponent* Movement = Character ? Character->GetCharacterMovement() : nullptr;
+	if (!Movement)
+	{
+		return;
+	}
+	// The engine's cheat flying: the character stays in the air when it touches the ground; the game's movement flies with the usual keys
+	Movement->bCheatFlying = bFly;
+	Movement->SetMovementMode(bFly ? MOVE_Flying : MOVE_Falling);
+}
+
+bool AAreaActionsEquipment::IsFlying(const ACharacter* Character)
+{
+	const UCharacterMovementComponent* Movement = Character ? Character->GetCharacterMovement() : nullptr;
+	return Movement && Movement->MovementMode == MOVE_Flying;
+}
+
+void AAreaActionsEquipment::ToggleFlying()
+{
+	ACharacter* Character = Cast<ACharacter>(GetInstigator());
+	UAreaActionsRCO* Rco = UAreaActionsRCO::Of(Character ? Cast<APlayerController>(Character->GetController()) : nullptr);
+	if (!bEquippedLocally || !Rco)
+	{
+		return;
+	}
+	const bool bFly = !IsFlying(Character);
+	UE_LOG(LogAreaActionsCpp, Display, TEXT("Tool: flying %s"), bFly ? TEXT("on") : TEXT("off"));
+	// A client moves its character itself and the server takes its moves once the server's copy flies as well
+	if (!Character->HasAuthority())
+	{
+		ApplyFlying(Character, bFly);
+	}
+	Rco->ServerSetFlying(bFly);
+}
+
+TSubclassOf<UFGRecipe> AAreaActionsEquipment::FindBuildRecipe(UWorld* World, const AreaActionsBuildings::FSnapshot& Building, TSubclassOf<UObject> BuildGun)
+{
+	AFGRecipeManager* Recipes = AFGRecipeManager::Get(World);
+	if (!Recipes || !Building.Class)
+	{
+		return nullptr;
+	}
+	auto Builds = [&Building](TSubclassOf<UFGRecipe> Recipe)
+	{
+		for (const FItemAmount& Product : Recipe ? UFGRecipe::GetProducts(Recipe) : TArray<FItemAmount>())
+		{
+			const TSubclassOf<UFGBuildingDescriptor> Descriptor(Product.ItemClass.Get());
+			if (Descriptor && UFGBuildingDescriptor::GetBuildableClass(Descriptor) == Building.Class)
+			{
+				return true;
+			}
+		}
+		return false;
+	};
+	// The recipe it was built with first (a foundation's material), then any the Build Gun has that builds the class
+	const TSubclassOf<UFGRecipe> BuiltWith = AreaActionsBuildings::GetRecipe(World, Building);
+	if (BuiltWith && Recipes->IsRecipeAvailable(BuiltWith) && Builds(BuiltWith))
+	{
+		return BuiltWith;
+	}
+	TArray<TSubclassOf<UFGRecipe>> Available;
+	Recipes->GetAvailableRecipesForProducer(BuildGun, Available);
+	const TSubclassOf<UFGRecipe>* Found = Available.FindByPredicate(Builds);
+	return Found ? *Found : nullptr;
+}
+
+void AAreaActionsEquipment::SampleBuilding()
+{
+	FHitResult Hit;
+	AreaActionsBuildings::FSnapshot Building;
+	AFGCharacterPlayer* Character = Cast<AFGCharacterPlayer>(GetInstigator());
+	AFGBuildGun* BuildGun = Character ? Character->GetBuildGun() : nullptr;
+	if (!BuildGun || !RaycastMouse(Hit) || !AreaActionsBuildings::FromHit(GetWorld(), Hit, Building))
+	{
+		UE_LOG(LogAreaActionsCpp, Display, TEXT("Tool: middle mouse button, no building under the mouse"));
+		return;
+	}
+	const TSubclassOf<UFGRecipe> Recipe = FindBuildRecipe(GetWorld(), Building, BuildGun->GetClass());
+	UE_LOG(LogAreaActionsCpp, Display, TEXT("Tool: middle mouse button on %s (%s): recipe %s"), *GetNameSafe(Building.Class), Building.Actor.IsValid() ? TEXT("actor") : TEXT("lightweight"),
+		*GetNameSafe(Recipe));
+	if (Recipe)
+	{
+		// As the original: the Build Gun gets the recipe, then goes into the hand
+		BuildGun->GotoBuildState(Recipe);
+		Character->ToggleBuildGun();
+	}
 }
 
 void AAreaActionsEquipment::WasEquipped_Implementation()
@@ -33,7 +137,8 @@ void AAreaActionsEquipment::ProcessEvent(UFunction* Function, void* Parameters)
 {
 	static const FName UnEquippedName(TEXT("WasUnEquipped")), TickName(TEXT("ReceiveTick"));
 	const FName Name = Function ? Function->GetFName() : NAME_None;
-	const int32 NetMode = GetWorld() ? static_cast<int32>(GetWorld()->GetNetMode()) : -1;
+	// Only for the log lines (AA-096 NEW-3)
+	auto NetMode = [this]() { return GetWorld() ? static_cast<int32>(GetWorld()->GetNetMode()) : -1; };
 	// The Blueprint's graph calls InitOnServer without ProcessEvent; one that came over the network is a client asking the server to
 	// spawn an actor of a class it names
 	if (Name == InitOnServerName && UE::Net::FNetContext::IsInsideNetRPC())
@@ -45,14 +150,26 @@ void AAreaActionsEquipment::ProcessEvent(UFunction* Function, void* Parameters)
 		}
 		return;
 	}
+	// The Blueprint's InputKey MiddleMouseButton (an input binding calls it through here): the original only knew actors, the building under
+	// the mouse here is an actor or a lightweight
+	if (Name.ToString().StartsWith(TEXT("InpActEvt_MiddleMouseButton")))
+	{
+		if (bEquippedLocally)
+		{
+			SampleBuilding();
+		}
+		return;
+	}
 	if (Name == TickName)
 	{
-		if (!bEquippedLocally && IsEquipped() && IsLocalInstigator())
+		if (!bEquippedLocally && bEquipPending && IsEquipped() && IsLocalInstigator())
 		{
 			// The game called WasEquipped before this player's character was the local one (it had no controller yet): the Blueprint's
-			// part runs now. The game's own part ran then, so the graph's call of it is skipped.
+			// part runs now. The game's own part ran then, so the graph's call of it is skipped. Only for a WasEquipped with no
+			// WasUnEquipped after it (AA-096 NEW-1): a tool put away must not open its windows again.
 			bEquippedLocally = true;
-			UE_LOG(LogAreaActionsCpp, Log, TEXT("Tool WasEquipped: this player's, late, net mode %d"), NetMode);
+			bEquipPending = false;
+			UE_LOG(LogAreaActionsCpp, Log, TEXT("Tool WasEquipped: this player's, late, net mode %d"), NetMode());
 			if (UFunction* Graph = FindFunction(WasEquippedName))
 			{
 				TGuardValue<bool> Guard(bSkipNativeEquip, true);
@@ -79,7 +196,9 @@ void AAreaActionsEquipment::ProcessEvent(UFunction* Function, void* Parameters)
 #endif
 	// On taking the tool away the instigator may be gone already, so the answer of WasEquipped is kept
 	bEquippedLocally = Name == WasEquippedName && bLocal;
-	UE_LOG(LogAreaActionsCpp, Log, TEXT("Tool %s: %s player's, net mode %d"), *Name.ToString(), bLocal ? TEXT("this") : TEXT("another"), NetMode);
+	// A WasEquipped for a character not yet the local one may turn out to be this player's on a later tick
+	bEquipPending = Name == WasEquippedName && !bLocal;
+	UE_LOG(LogAreaActionsCpp, Log, TEXT("Tool %s: %s player's, net mode %d"), *Name.ToString(), bLocal ? TEXT("this") : TEXT("another"), NetMode());
 	if (bLocal)
 	{
 		Super::ProcessEvent(Function, Parameters);

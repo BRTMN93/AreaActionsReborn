@@ -7,6 +7,8 @@
 
 class AAreaActionBase;
 class AFGBuildable;
+class UFGRecipe;
+namespace AreaActionsBuildings { struct FSnapshot; }
 
 // Parent of the tool Blueprint Equip_AreaActions. Functions here keep the name and the pins of the Blueprint functions they replace, so
 // the Blueprint's call nodes bind to them once the Blueprint's own version is removed.
@@ -50,12 +52,25 @@ public:
 	// The selection as a request carries it, read from the Blueprint's CornerLocations, MinZ and MaxZ; false when they are missing
 	bool GetArea(FAreaActionsArea& Out) const;
 
+	// The menu's "Enable flying" / "Disable flying" (AA-060): the local player's character flies or walks, the server's copy too
+	void ToggleFlying();
+	// Flying on or off for one character, where it is called (the client for its own moves, the server for the moves it takes)
+	static void ApplyFlying(ACharacter* Character, bool bFly);
+	static bool IsFlying(const ACharacter* Character);
+
+	// The middle mouse button: the Build Gun takes the recipe of the building under the mouse (actor or lightweight) and goes into the hand
+	void SampleBuilding();
+	// The recipe that builds the building's class: the one it was built with when the player has it, otherwise one of the Build Gun's
+	static TSubclassOf<UFGRecipe> FindBuildRecipe(UWorld* World, const AreaActionsBuildings::FSnapshot& Building, TSubclassOf<UObject> BuildGun);
+
 protected:
 	virtual void WasEquipped_Implementation() override;
 
 private:
 	// The Blueprint's WasEquipped ran here (the tool is this game's own player's), so its WasUnEquipped has to run as well
 	bool bEquippedLocally = false;
+	// A WasEquipped came while the character was not yet the local one, and no WasUnEquipped after it
+	bool bEquipPending = false;
 	// The Blueprint's WasEquipped runs late: the game's own part of it has run already
 	bool bSkipNativeEquip = false;
 	bool bRejectLogged = false;

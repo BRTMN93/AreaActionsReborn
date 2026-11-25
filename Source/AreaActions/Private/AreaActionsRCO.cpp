@@ -4,6 +4,7 @@
 #include "AreaActionsLog.h"
 #include "AreaActionsServerSubsystem.h"
 #include "FGCharacterPlayer.h"
+#include "FGInventoryComponent.h"
 #include "FGPlayerController.h"
 #include "FGRecipe.h"
 #include "FGRecipeManager.h"
@@ -213,13 +214,51 @@ void UAreaActionsRCO::ServerPlaceCopies_Implementation(int32 RequestId, const FA
 	Start(RequestId, Area, AreaActionsJobs::MakePlaceCopies(Placement, bUseBuildCost, Distance));
 }
 
-void UAreaActionsRCO::ServerDismantle_Implementation(int32 RequestId, const FAreaActionsArea& InArea, bool bRefundToCrate)
+void UAreaActionsRCO::ServerDismantle_Implementation(int32 RequestId, const FAreaActionsArea& InArea, EAreaActionsDismantleRefund Refund)
 {
 	FAreaActionsArea Area = InArea;
-	if (ValidateRequest(RequestId, Area, TEXT("MassDismantle")))
+	if (!ValidateRequest(RequestId, Area, TEXT("MassDismantle")))
 	{
-		Start(RequestId, Area, AreaActionsJobs::MakeDismantle(bRefundToCrate));
+		return;
 	}
+	if (Refund != EAreaActionsDismantleRefund::None && Refund != EAreaActionsDismantleRefund::All && Refund != EAreaActionsDismantleRefund::CostOnly)
+	{
+		Reject(RequestId, TEXT("MassDismantle"), EAreaActionsResultCode::Rejected, FString::Printf(TEXT("refund kind %d"), static_cast<int32>(Refund)));
+		return;
+	}
+	// The flag is the server's own: the player's inventory as the game reads it for its Build Gun
+	const AFGPlayerController* Player = GetOwnerPlayerController();
+	const AFGCharacterPlayer* Character = Player ? Cast<AFGCharacterPlayer>(Player->GetPawn()) : nullptr;
+	const UFGInventoryComponent* Inventory = Character ? Character->GetInventory() : nullptr;
+	if (Refund == EAreaActionsDismantleRefund::CostOnly && Inventory && Inventory->GetNoBuildCost())
+	{
+		Reject(RequestId, TEXT("MassDismantle"), EAreaActionsResultCode::Rejected, TEXT("cost only refund with No Build Cost on"));
+		return;
+	}
+	Start(RequestId, Area, AreaActionsJobs::MakeDismantle(Refund));
+}
+
+void UAreaActionsRCO::ServerSetFlying_Implementation(bool bFly)
+{
+	AFGPlayerController* Player = GetOwnerPlayerController();
+	AFGCharacterPlayer* Character = Player ? Cast<AFGCharacterPlayer>(Player->GetPawn()) : nullptr;
+	const APlayerState* State = Player ? Player->PlayerState : nullptr;
+	const TCHAR* Name = State ? *State->GetPlayerName() : TEXT("<no player>");
+	if (!Character || !Character->IsAliveAndWell())
+	{
+		UE_LOG(LogAreaActionsCpp, Warning, TEXT("reject %s SetFlying: no living character"), Name);
+		++RejectCount;
+		return;
+	}
+	// Landing needs no tool, taking off does
+	if (bFly && !Character->GetActiveEquipments().ContainsByPredicate([](const AFGEquipment* Equipment) { return Cast<AAreaActionsEquipment>(Equipment) != nullptr; }))
+	{
+		UE_LOG(LogAreaActionsCpp, Warning, TEXT("reject %s SetFlying: the tool is not in hand"), Name);
+		++RejectCount;
+		return;
+	}
+	AAreaActionsEquipment::ApplyFlying(Character, bFly);
+	UE_LOG(LogAreaActionsCpp, Display, TEXT("SetFlying %s: %s"), Name, bFly ? TEXT("on") : TEXT("off"));
 }
 
 void UAreaActionsRCO::ClientResult_Implementation(int32 RequestId, const FAreaActionsResult& Result)

@@ -5,6 +5,9 @@
 #include "Blueprint/UserWidget.h"
 #include "Blueprint/WidgetTree.h"
 #include "Components/Button.h"
+#include "Components/CanvasPanel.h"
+#include "Components/CanvasPanelSlot.h"
+#include "Components/ScaleBox.h"
 #include "Components/TextBlock.h"
 #include "FGCharacterPlayer.h"
 #include "TimerManager.h"
@@ -189,20 +192,80 @@ bool AAreaActionBase::BindWindowEvent(UUserWidget* Window, FName Dispatcher, UOb
 
 bool AAreaActionBase::OpenChoice(const FText& Title, const FText& Message, const FText& First, const FText& Second, UObject* Target, FName OnFirst, FName OnSecond)
 {
-	UUserWidget* Window = OpenWindow(MessageYesNoClass, Title, Message);
+	return OpenChoice(Title, Message, { { First, OnFirst }, { Second, OnSecond } }, Target);
+}
+
+bool AAreaActionBase::OpenChoice(const FText& Title, const FText& Message, const TArray<FChoiceAnswer>& Answers, UObject* Target)
+{
+	UUserWidget* Window = Answers.Num() >= 2 ? OpenWindow(MessageYesNoClass, Title, Message) : nullptr;
 	if (!Window || !BindWindowEvent(Window, TEXT("NoClicked"), this, GET_FUNCTION_NAME_CHECKED(AAreaActionBase, ChoiceClosed)))
 	{
 		return false;
 	}
 	RequestCountAtChoice = RequestCount;
-	struct FAnswer { const TCHAR* Button; FText Label; FName Function; };
-	const FAnswer Answers[] = { { TEXT("YesButton"), First, OnFirst }, { TEXT("NoButton"), Second, OnSecond } };
-	for (const FAnswer& Answer : Answers)
+	ChoiceWindow = Window;
+	UButton* Yes = Cast<UButton>(Window->GetWidgetFromName(TEXT("YesButton")));
+	UButton* No = Cast<UButton>(Window->GetWidgetFromName(TEXT("NoButton")));
+	UCanvasPanelSlot* YesSlot = Yes ? Cast<UCanvasPanelSlot>(Yes->Slot) : nullptr;
+	UCanvasPanelSlot* NoSlot = No ? Cast<UCanvasPanelSlot>(No->Slot) : nullptr;
+	UCanvasPanel* Panel = YesSlot ? Cast<UCanvasPanel>(Yes->GetParent()) : nullptr;
+	if (!Yes || !No || (Answers.Num() > 2 && (!Panel || !NoSlot)))
 	{
-		UButton* Button = Cast<UButton>(Window->GetWidgetFromName(Answer.Button));
-		if (!Button || !Target || !Target->FindFunction(Answer.Function))
+		UE_LOG(LogAreaActionsCpp, Error, TEXT("%s has no YesButton and NoButton for %d answers"), *GetNameSafe(Window), Answers.Num());
+		return false;
+	}
+	// The window's two buttons take the first two answers; more answers get buttons made like the first one, in the same row (the two
+	// buttons fill 0.3 to 0.7 of the window's width, the row then shares 0.1 to 0.9)
+	TArray<UButton*> Buttons{ Yes, No };
+	for (int32 Index = 2; Index < Answers.Num(); ++Index)
+	{
+		UButton* Extra = Window->WidgetTree->ConstructWidget<UButton>(UButton::StaticClass(), *FString::Printf(TEXT("ChoiceButton%d"), Index));
+		Extra->SetStyle(Yes->GetStyle());
+		Extra->SetColorAndOpacity(Yes->GetColorAndOpacity());
+		Extra->SetBackgroundColor(Yes->GetBackgroundColor());
+		UTextBlock* YesText = nullptr;
+		UWidgetTree::ForWidgetAndChildren(Yes, [&YesText](UWidget* Child) { YesText = YesText ? YesText : Cast<UTextBlock>(Child); });
+		UScaleBox* Box = Window->WidgetTree->ConstructWidget<UScaleBox>();
+		UTextBlock* Text = Window->WidgetTree->ConstructWidget<UTextBlock>();
+		if (YesText)
 		{
-			UE_LOG(LogAreaActionsCpp, Error, TEXT("Cannot bind %s.%s to %s.%s"), *GetNameSafe(Window), Answer.Button, *GetNameSafe(Target), *Answer.Function.ToString());
+			Text->SetFont(YesText->GetFont());
+			Text->SetColorAndOpacity(YesText->GetColorAndOpacity());
+			Text->SetJustification(ETextJustify::Center);
+		}
+		if (const UScaleBox* YesBox = Cast<UScaleBox>(Yes->GetContent()))
+		{
+			Box->SetStretch(YesBox->GetStretch());
+		}
+		Box->AddChild(Text);
+		Extra->AddChild(Box);
+		UCanvasPanelSlot* ExtraSlot = Panel->AddChildToCanvas(Extra);
+		ExtraSlot->SetOffsets(YesSlot->GetOffsets());
+		ExtraSlot->SetAnchors(YesSlot->GetAnchors());
+		FScriptDelegate Close;
+		Close.BindUFunction(this, GET_FUNCTION_NAME_CHECKED(AAreaActionBase, CloseChoice));
+		Extra->OnClicked.Add(Close);
+		Buttons.Add(Extra);
+	}
+	if (Answers.Num() > 2)
+	{
+		const double Width = 0.8 / Answers.Num();
+		for (int32 Index = 0; Index < Buttons.Num(); ++Index)
+		{
+			UCanvasPanelSlot* Slot = Cast<UCanvasPanelSlot>(Buttons[Index]->Slot);
+			FAnchors Anchors = Slot->GetAnchors();
+			Anchors.Minimum.X = 0.1 + Index * Width + 0.005;
+			Anchors.Maximum.X = 0.1 + (Index + 1) * Width - 0.005;
+			Slot->SetAnchors(Anchors);
+		}
+	}
+	for (int32 Index = 0; Index < Answers.Num(); ++Index)
+	{
+		const FChoiceAnswer& Answer = Answers[Index];
+		UButton* Button = Buttons[Index];
+		if (!Target || !Target->FindFunction(Answer.Function))
+		{
+			UE_LOG(LogAreaActionsCpp, Error, TEXT("Cannot bind %s.%s to %s.%s"), *GetNameSafe(Window), *Button->GetName(), *GetNameSafe(Target), *Answer.Function.ToString());
 			return false;
 		}
 		const FText& Label = Answer.Label;
@@ -218,6 +281,22 @@ bool AAreaActionBase::OpenChoice(const FText& Title, const FText& Message, const
 		Button->OnClicked.Add(Delegate);
 	}
 	return true;
+}
+
+void AAreaActionBase::CloseChoice()
+{
+	// The window's own buttons close it in its graph; a button made here closes it the same way, through the tool's window stack
+	UUserWidget* Window = ChoiceWindow.Get();
+	AAreaActionsEquipment* Equipment = GetEquipment();
+	UFunction* RemoveWidget = Equipment ? Equipment->FindFunction(TEXT("RemoveWidget")) : nullptr;
+	FObjectPropertyBase* Param = RemoveWidget ? CastField<FObjectPropertyBase>(RemoveWidget->ChildProperties) : nullptr;
+	if (Window && Param && Window->IsA(Param->PropertyClass))
+	{
+		TArray<uint8> Params;
+		Params.SetNumZeroed(RemoveWidget->ParmsSize);
+		Param->SetObjectPropertyValue_InContainer(Params.GetData(), Window);
+		Equipment->ProcessEvent(RemoveWidget, Params.GetData());
+	}
 }
 
 void AAreaActionBase::ChoiceClosed()
