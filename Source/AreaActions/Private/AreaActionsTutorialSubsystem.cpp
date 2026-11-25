@@ -1,8 +1,10 @@
 #include "AreaActionsTutorialSubsystem.h"
 #include "AreaActionsSettings.h"
+#include "AreaActionsLog.h"
 #include "HAL/FileManager.h"
 #include "Misc/CommandLine.h"
 #include "Misc/ConfigCacheIni.h"
+#include "Misc/FileHelper.h"
 #include "Misc/Paths.h"
 
 namespace AreaActionsSettings
@@ -40,8 +42,13 @@ namespace AreaActionsSettings
 	{
 		const FString Path = GetPath();
 		IFileManager::Get().MakeDirectory(*FPaths::GetPath(Path), true);
-		File().Dirty = true;
-		File().Write(Path);
+		// FConfigFile::Write skips the disk under -Multiprocess (two games on one computer), so the text is saved here
+		FString Text;
+		File().WriteToString(Text, Path);
+		if (!FFileHelper::SaveStringToFile(Text, *Path))
+		{
+			UE_LOG(LogAreaActionsCpp, Warning, TEXT("settings file %s not saved"), *Path);
+		}
 	}
 
 	bool GetBool(const TCHAR* Key, bool bDefault)
@@ -85,15 +92,25 @@ namespace AreaActionsSettings
 #endif
 }
 
+AAreaActionsTutorialSubsystem::AAreaActionsTutorialSubsystem()
+{
+	// The world module spawns it on the server only; the tool and the menu find it in every game, a client's too, and the calls below
+	// touch only that game's settings file
+	bReplicates = true;
+	bAlwaysRelevant = true;
+}
+
 void AAreaActionsTutorialSubsystem::OnEquip(bool& ShowHelp)
 {
 	// The help shows by itself until the player saw it to its end, in any save (D21; the original kept it in the save)
 	ShowHelp = !AreaActionsSettings::GetBool(AreaActionsSettings::HelpDoneKey, false);
 	HasDoneFirstEquip = true;
+	UE_LOG(LogAreaActionsCpp, Display, TEXT("Tutorial OnEquip: help shows by itself %d"), ShowHelp ? 1 : 0);
 }
 
 void AAreaActionsTutorialSubsystem::HelpDone()
 {
 	HasSeenHelp = true;
 	AreaActionsSettings::SetBool(AreaActionsSettings::HelpDoneKey, true);
+	UE_LOG(LogAreaActionsCpp, Display, TEXT("Tutorial HelpDone"));
 }

@@ -66,8 +66,6 @@ AAreaActionsPreview::AAreaActionsPreview()
 	PrimaryActorTick.bCanEverTick = false;
 	bReplicates = false;
 	RootComponent = CreateDefaultSubobject<USceneComponent>(TEXT("Root"));
-	Lines = CreateDefaultSubobject<ULineBatchComponent>(TEXT("Lines"));
-	Lines->SetupAttachment(RootComponent);
 }
 
 void AAreaActionsPreview::Show(const TArray<AreaActionsBuildings::FSnapshot>& Buildings, const TArray<AreaActionsBuildings::FPlanned>& Copies)
@@ -125,15 +123,8 @@ void AAreaActionsPreview::Show(const TArray<AreaActionsBuildings::FSnapshot>& Bu
 			Own = &Parts.Add(Copy.Source);
 			AreaActionsBuildings::GetMeshes(GetWorld(), Source, *Own);
 		}
-		if (Own->IsEmpty())
-		{
-			// A building without meshes of its own: its box
-			if (FBox Box; AreaActionsBuildings::GetLocalBox(Source, Box))
-			{
-				Lines->DrawBox(Copy.Transform.TransformPosition(Box.GetCenter()), Box.GetExtent() * Copy.Transform.GetScale3D(), Copy.Transform.GetRotation(),
-					FLinearColor(0.1f, 0.6f, 1.0f), 0.0f, SDPG_World, 8.0f);
-			}
-		}
+		// A building without meshes of its own (ladder, foundation passthrough, vehicle path, elevator, blueprint designer) has no box
+		// either, in the world or on its class default (AA-091), so its copy shows nothing
 		for (const TPair<UStaticMesh*, FTransform>& Part : *Own)
 		{
 			TObjectPtr<UInstancedStaticMeshComponent>& Component = Meshes.FindOrAdd(Part.Key);
@@ -178,10 +169,6 @@ void AAreaActionsPreview::Clear()
 		}
 	}
 	Holograms.Reset();
-	if (Lines)
-	{
-		Lines->Flush();
-	}
 	LiveGhosts -= Ghosts;
 	Ghosts = 0;
 }

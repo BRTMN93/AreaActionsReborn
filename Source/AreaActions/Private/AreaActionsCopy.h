@@ -8,12 +8,11 @@
 
 class AFGHologram;
 class UInstancedStaticMeshComponent;
-class ULineBatchComponent;
 class UStaticMesh;
 
 // The preview of Copy and Fill on the player's machine: ghosts, not buildings. The first AreaActions.PreviewHolograms copies are the game's
 // own holograms (as the build gun shows them, decision D20); the rest, and buildings whose hologram cannot show their data (a beam's
-// length) or has children, are instanced meshes in the game's valid placement material, a box of lines for a building without meshes. Nothing of it is
+// length) or has children, are instanced meshes in the game's valid placement material. Nothing of it is
 // saved or replicated.
 UCLASS(NotPlaceable, Transient)
 class AREAACTIONS_API AAreaActionsPreview : public AActor
@@ -39,8 +38,6 @@ protected:
 private:
 	UPROPERTY()
 	TMap<TObjectPtr<UStaticMesh>, TObjectPtr<UInstancedStaticMeshComponent>> Meshes;
-	UPROPERTY()
-	TObjectPtr<ULineBatchComponent> Lines;
 	UPROPERTY()
 	TArray<TObjectPtr<AFGHologram>> Holograms;
 	int32 Ghosts = 0;

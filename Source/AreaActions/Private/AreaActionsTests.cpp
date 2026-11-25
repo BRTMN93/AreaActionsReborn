@@ -5673,7 +5673,8 @@ namespace
 	// The tool put away (the game's unequip); AddEquipTool takes it again
 	void AddPutToolAway(FRun& R)
 	{
-		R.Steps.Add([](FRun& Self)
+		// The server puts it away, as it put it in hand; a client's own unequip stays in its game and the server keeps the tool in hand
+		AddHost(R, [](FRun& Self)
 		{
 			AFGCharacterPlayer* Character = GetCharacter(Self);
 			if (AAreaActionsEquipment* Tool = GetTool(Self); Character && Tool)
@@ -5683,7 +5684,7 @@ namespace
 			return EStep::Next;
 		});
 		R.Steps.Add(WaitFrames(10));
-		R.Steps.Add([](FRun& Self)
+		AddChecks(R, [](FRun& Self)
 		{
 			Self.Check(!GetTool(Self), TEXT("tool put away"));
 			return EStep::Next;
@@ -5891,7 +5892,7 @@ namespace
 			const FSlateBrush Icon = Schematic ? UFGSchematic::GetItemIcon(Schematic) : FSlateBrush();
 			Self.Check(Icon.GetResourceObject() != nullptr, FString::Printf(TEXT("%s: schematic icon %s"), When, *GetNameSafe(Icon.GetResourceObject())));
 			TArray<FString> Producers;
-			for (const TSubclassOf<UObject> Producer : ToolRecipe ? UFGRecipe::GetProducedIn(ToolRecipe) : TArray<TSubclassOf<UObject>>())
+			for (const TSubclassOf<UObject>& Producer : ToolRecipe ? UFGRecipe::GetProducedIn(ToolRecipe) : TArray<TSubclassOf<UObject>>())
 			{
 				Producers.Add(GetNameSafe(Producer));
 			}
@@ -6150,7 +6151,11 @@ namespace
 					}
 					if (Meshes == 0)
 					{
-						Boxed.Add(Class->GetName());
+						// The preview's box branch draws only when the class gives a box without an actor
+						AreaActionsBuildings::FSnapshot Snapshot;
+						Snapshot.Class = Class;
+						FBox Box;
+						Boxed.Add(FString::Printf(TEXT("%s (box %d)"), *Class->GetName(), AreaActionsBuildings::GetLocalBox(Snapshot, Box) ? 1 : 0));
 					}
 				}
 			}
@@ -6424,8 +6429,8 @@ namespace
 	}
 
 	// AA-091 (1), (3): the classes PreviewBoxProbe found without meshes on their class default (a ladder and foundation passthroughs build
-	// their meshes when they are placed), placed for real; with AreaActions.PreviewHolograms 0 every copy is drawn by the preview itself:
-	// a copy whose building has no meshes is the box (12 lines)
+	// their meshes when they are placed), placed for real; with AreaActions.PreviewHolograms 0 every copy is drawn by the preview itself.
+	// Placed, they have no meshes the preview finds and no box either, so the preview opens without drawing them
 	void AddPreviewBox(FRun& R)
 	{
 		FSceneRef S = MakeShared<FScene>();
@@ -6451,7 +6456,10 @@ namespace
 				Snapshot.Transform = Actor->GetActorTransform();
 				TArray<TPair<UStaticMesh*, FTransform>> Meshes;
 				AreaActionsBuildings::GetMeshes(Self.GetWorld(), Snapshot, Meshes);
-				Self.Step(FString::Printf(TEXT("%s placed: %d meshes the preview draws"), Name[0], Meshes.Num()));
+				FBox Box;
+				const bool bBox = AreaActionsBuildings::GetLocalBox(Snapshot, Box);
+				Self.Step(FString::Printf(TEXT("%s placed: %d meshes the preview draws, box %d %s, clearance %s"), Name[0], Meshes.Num(), bBox ? 1 : 0,
+					*Box.ToString(), *Actor->GetCombinedClearanceBox().ToString()));
 				*Boxed += Meshes.IsEmpty() ? 1 : 0;
 			}
 			AddControlStorages(Self, Scene);
@@ -6466,14 +6474,16 @@ namespace
 		R.Steps.Add(WaitFrames(10));
 		R.Steps.Add([Boxed](FRun& Self)
 		{
-			int32 Lines = 0;
+			// AA-091 (3): no game class reaches the box branch (no meshes and no box, PreviewBoxProbe), so the branch is gone
+			int32 Batches = 0;
+			int32 Previews = 0;
 			for (TActorIterator<AAreaActionsPreview> It(Self.GetWorld()); It; ++It)
 			{
-				const ULineBatchComponent* Batch = It->FindComponentByClass<ULineBatchComponent>();
-				Lines += Batch ? Batch->BatchedLines.Num() : 0;
+				Batches += It->FindComponentByClass<ULineBatchComponent>() ? 1 : 0;
+				++Previews;
 			}
-			Self.Step(FString::Printf(TEXT("copies of buildings without meshes %d, box lines %d"), *Boxed, Lines));
-			Self.Check(Lines == 12 * *Boxed, FString::Printf(TEXT("12 lines a box: %d lines for %d boxed copies"), Lines, *Boxed));
+			Self.Check(Previews == 1 && *Boxed == 3, FString::Printf(TEXT("preview of %d buildings without meshes open: %d previews"), *Boxed, Previews));
+			Self.Check(Batches == 0, FString::Printf(TEXT("no box lines in the preview: %d line batches"), Batches));
 			return EStep::Next;
 		});
 		AddCloseWithX(R, TEXT("Widget_Copy"));
@@ -7222,7 +7232,9 @@ void FAreaActionsTests::StartFromCommandLine(UWorld* World)
 			// A dedicated server has no player: after the client left nobody acted there either
 			if (Self.Acts() && !Self.bDedicated)
 			{
-				Self.Check(Self.MaxIndicators > 0, FString::Printf(TEXT("this game's player acted: here at most %s"), *Seen));
+				// Flying and the tutorial use the menu alone (no area, so no indicators); the schematic opens nothing of the mod
+				const bool bShowsNothing = Self.Scenario == TEXT("Schematic");
+				Self.Check(bShowsNothing || Self.MaxIndicators > 0 || Self.MaxWindows > 0, FString::Printf(TEXT("this game's player acted: here at most %s"), *Seen));
 			}
 			else
 			{

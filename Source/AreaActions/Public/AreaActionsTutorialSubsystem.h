@@ -14,6 +14,8 @@ class AREAACTIONS_API AAreaActionsTutorialSubsystem : public AActor, public IFGS
 	GENERATED_BODY()
 
 public:
+	AAreaActionsTutorialSubsystem();
+
 	virtual bool ShouldSave_Implementation() const override { return true; }
 	virtual bool NeedTransform_Implementation() override { return false; }
 

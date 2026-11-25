@@ -243,7 +243,8 @@ void UAreaActionsRCO::ServerSetFlying_Implementation(bool bFly)
 	AFGPlayerController* Player = GetOwnerPlayerController();
 	AFGCharacterPlayer* Character = Player ? Cast<AFGCharacterPlayer>(Player->GetPawn()) : nullptr;
 	const APlayerState* State = Player ? Player->PlayerState : nullptr;
-	const TCHAR* Name = State ? *State->GetPlayerName() : TEXT("<no player>");
+	const FString PlayerName = State ? State->GetPlayerName() : FString(TEXT("<no player>"));
+	const TCHAR* Name = *PlayerName;
 	if (!Character || !Character->IsAliveAndWell())
 	{
 		UE_LOG(LogAreaActionsCpp, Warning, TEXT("reject %s SetFlying: no living character"), Name);
