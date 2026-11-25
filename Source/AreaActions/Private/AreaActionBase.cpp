@@ -221,8 +221,9 @@ bool AAreaActionBase::OpenChoice(const FText& Title, const FText& Message, const
 		bHasCancel |= Answer.Function == TEXT("Cancel");
 		const FName Name = Index == 0 ? FName(TEXT("YesButton")) : Index == 1 ? FName(TEXT("NoButton")) : FName(*FString::Printf(TEXT("ChoiceButton%d"), Index));
 		TWeakObjectPtr<UObject> WeakTarget(Target);
+		TWeakObjectPtr<AAreaActionBase> WeakShell(this);
 		const FName Function = Answer.Function;
-		Buttons.Add({ Answer.Label, Name, [WeakTarget, Function]()
+		Buttons.Add({ Answer.Label, Name, [WeakTarget, WeakShell, Function]()
 		{
 			if (UObject* Live = WeakTarget.Get())
 			{
@@ -230,6 +231,11 @@ bool AAreaActionBase::OpenChoice(const FText& Title, const FText& Message, const
 				{
 					Live->ProcessEvent(Found, nullptr);
 				}
+			}
+			// The action's own Cancel answer ends it, as the old window's close did
+			if (AAreaActionBase* Shell = WeakShell.Get(); Shell && Function == TEXT("Cancel"))
+			{
+				Shell->ChoiceClosed();
 			}
 		} });
 	}

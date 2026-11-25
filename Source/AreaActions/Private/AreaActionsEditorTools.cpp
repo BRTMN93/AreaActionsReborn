@@ -24,6 +24,8 @@ bool UAreaActionsEditorTools::ClearWidgetTree(UObject* WidgetBlueprint)
 	}
 	Blueprint->WidgetTree->RootWidget = nullptr;
 	Blueprint->Bindings.Empty();
+	// The compiler ensures every named widget it remembers still exists
+	Blueprint->WidgetVariableNameToGuidMap.Empty();
 	FBlueprintEditorUtils::MarkBlueprintAsStructurallyModified(Blueprint);
 	UE_LOG(LogAreaActionsCpp, Display, TEXT("ClearWidgetTree: %s, %d widgets removed"), *Blueprint->GetName(), Widgets.Num());
 	return true;

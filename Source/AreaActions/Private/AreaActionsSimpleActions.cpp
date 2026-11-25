@@ -224,7 +224,7 @@ void UAreaActionMassDismantle::CostOnly()
 
 void UAreaActionMassDismantle::Cancel()
 {
-	// The window closes and its NoClicked ends the action
+	// Nothing to send: the question's Cancel answer ends the action (AAreaActionBase::OpenChoice)
 }
 
 void UAreaActionMassDismantle::Send(EAreaActionsDismantleRefund InRefund)

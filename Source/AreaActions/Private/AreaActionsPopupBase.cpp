@@ -134,8 +134,16 @@ UWidget* UAreaActionsPopupBase::BuildContent()
 
 	// Selection modes: the Blueprint dispatcher's enum, all but its last value (the original hid it too)
 	const FMulticastDelegateProperty* StateDispatcher = FindFProperty<FMulticastDelegateProperty>(GetClass(), TEXT("BuildStatusSelected"));
-	const FProperty* StateParam = StateDispatcher && StateDispatcher->SignatureFunction ? StateDispatcher->SignatureFunction->ChildProperties : nullptr;
-	const UEnum* Enum = CastField<FByteProperty>(StateParam) ? CastField<FByteProperty>(StateParam)->Enum : CastField<FEnumProperty>(StateParam) ? CastField<FEnumProperty>(StateParam)->GetEnum() : nullptr;
+	const FProperty* StateParam = StateDispatcher && StateDispatcher->SignatureFunction ? CastField<FProperty>(StateDispatcher->SignatureFunction->ChildProperties) : nullptr;
+	const UEnum* Enum = nullptr;
+	if (const FByteProperty* ByteParam = CastField<FByteProperty>(StateParam))
+	{
+		Enum = ByteParam->Enum;
+	}
+	else if (const FEnumProperty* EnumParam = CastField<FEnumProperty>(StateParam))
+	{
+		Enum = EnumParam->GetEnum();
+	}
 	if (!Enum)
 	{
 		UE_LOG(LogAreaActionsCpp, Error, TEXT("%s: no BuildStatusSelected(enum)"), *GetClass()->GetName());
@@ -202,14 +210,15 @@ void UAreaActionsPopupBase::Broadcast(FName Dispatcher, TFunctionRef<void(FPrope
 {
 	FMulticastDelegateProperty* Property = FindFProperty<FMulticastDelegateProperty>(GetClass(), Dispatcher);
 	UFunction* Signature = Property ? Property->SignatureFunction : nullptr;
-	if (!Signature || !Signature->ChildProperties)
+	FProperty* Param = Signature ? CastField<FProperty>(Signature->ChildProperties) : nullptr;
+	if (!Param)
 	{
 		UE_LOG(LogAreaActionsCpp, Error, TEXT("%s: no dispatcher %s with a parameter"), *GetClass()->GetName(), *Dispatcher.ToString());
 		return;
 	}
 	TArray<uint8> Params;
 	Params.SetNumZeroed(Signature->ParmsSize);
-	SetParam(Signature->ChildProperties, Params.GetData());
+	SetParam(Param, Params.GetData());
 	Property->ContainerPtrToValuePtr<FMulticastScriptDelegate>(this)->ProcessMulticastDelegate<UObject>(Params.GetData());
 }
 

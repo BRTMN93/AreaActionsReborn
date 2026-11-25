@@ -51,6 +51,7 @@
 #include "Misc/App.h"
 #include "AreaActionsInstanceModule.h"
 #include "AreaActionsPopupBase.h"
+#include "AreaActionsWindows.h"
 #include "Buildables/FGBuildable.h"
 #include "Components/ListView.h"
 #include "Components/TextBlock.h"
@@ -400,6 +401,8 @@ namespace
 		FObjectPropertyBase* Property = Object ? FindFProperty<FObjectPropertyBase>(Object->GetClass(), Name) : nullptr;
 		return Property ? Property->GetObjectPropertyValue_InContainer(Object) : nullptr;
 	}
+
+	TArray<UUserWidget*> NamedButtons(UUserWidget* Window, const FString& Prefix);
 
 	// The tool's state, as the menu's state list sets it: the Blueprint event SelectBuildStatus(BuildingState)
 	bool SelectState(UObject* Tool, const TCHAR* Enumerator)
@@ -814,8 +817,8 @@ namespace
 			}
 			const FString Title = Popup->GetTitle().ToString();
 			Self.Check(!Version.IsEmpty() && Title.Contains(Version), FString::Printf(TEXT("title '%s' has the version '%s'"), *Title, *Version));
-			const UListView* Actions = Cast<UListView>(Popup->GetWidgetFromName(TEXT("Actions")));
-			Self.Check(Actions && Actions->GetNumItems() == 6, FString::Printf(TEXT("action list items: %d"), Actions ? Actions->GetNumItems() : -1));
+			const int32 Actions = NamedButtons(Popup, TEXT("Action_")).Num();
+			Self.Check(Actions == 6, FString::Printf(TEXT("action list items: %d"), Actions));
 			return EStep::Next;
 		});
 	}
@@ -1375,9 +1378,45 @@ namespace
 		return true;
 	}
 
-	// The newest of the tool's windows (its Widgets stack)
+	// The game's popup the player sees (the mod's messages and questions, D23), if any
+	UFGPopupWidget* ShownPopup(const FRun& R)
+	{
+		APlayerController* Player = R.GetPlayer();
+		if (!Player || !UFGBlueprintFunctionLibrary::HasActivePopup(Player))
+		{
+			return nullptr;
+		}
+		for (TObjectIterator<UFGPopupWidget> It; It; ++It)
+		{
+			if (!It->IsTemplate() && It->GetOwningPlayer() == Player && (It->IsInViewport() || It->GetParent()))
+			{
+				return *It;
+			}
+		}
+		return nullptr;
+	}
+
+	// The text of the game's popup (Widget_Popup.mPopupData)
+	FString PopupBody(const UUserWidget* Popup)
+	{
+		const FStructProperty* Data = Popup ? FindFProperty<FStructProperty>(Popup->GetClass(), TEXT("mPopupData")) : nullptr;
+		return Data && Data->Struct == FPopupData::StaticStruct() ? Data->ContainerPtrToValuePtr<FPopupData>(Popup)->Body.ToString() : FString();
+	}
+
+	bool IsShown(const UUserWidget* Window)
+	{
+		return Window && (Window->IsInViewport() || Window->GetParent());
+	}
+
+	// What the player answers first: the game's popup (a question shows its content, the mod's answers), else the newest of the
+	// tool's windows (its Widgets stack)
 	UUserWidget* TopWindow(const FRun& R)
 	{
+		if (UFGPopupWidget* Popup = ShownPopup(R))
+		{
+			UUserWidget* Content = Cast<UUserWidget>(ObjectValue(Popup, TEXT("mContent")));
+			return Cast<UAreaActionsChoiceContent>(Content) ? Content : Popup;
+		}
 		AAreaActionsEquipment* Tool = GetTool(R);
 		FArrayProperty* Property = Tool ? FindFProperty<FArrayProperty>(Tool->GetClass(), TEXT("Widgets")) : nullptr;
 		if (!Property)
@@ -1388,47 +1427,92 @@ namespace
 		return Array.Num() > 0 ? Cast<UUserWidget>(CastField<FObjectPropertyBase>(Property->Inner)->GetObjectPropertyValue(Array.GetRawPtr(Array.Num() - 1))) : nullptr;
 	}
 
+	// The scenarios name the windows as the original did; D23 made them the game's popups and C++ windows
 	bool IsWindow(const UUserWidget* Window, const TCHAR* Name)
 	{
-		return Window && Window->GetClass()->GetName().StartsWith(Name);
+		if (!Window)
+		{
+			return false;
+		}
+		const FStringView Old(Name);
+		if (Old == TEXT("Widget_MessageOk"))
+		{
+			return Window->IsA<UFGPopupWidget>();
+		}
+		if (Old == TEXT("Widget_MessageYesNo"))
+		{
+			return Window->IsA<UAreaActionsChoiceContent>();
+		}
+		if (Old == TEXT("Widget_SetRecipe"))
+		{
+			return Window->IsA<UAreaActionsRecipeWindow>();
+		}
+		if (Old == TEXT("Widget_Copy"))
+		{
+			return Window->IsA<UAreaActionsCopyWindow>();
+		}
+		if (Old == TEXT("Widget_Fill"))
+		{
+			return Window->IsA<UAreaActionsFillWindow>();
+		}
+		return Window->GetClass()->GetName().StartsWith(Name);
 	}
 
-	// The window's own button, as a mouse click fires it
+	// The window's own button, as a mouse click fires it: a plain button or the game's (Widget_StandardButton); the game popup's OK is
+	// its mConfirmButton
 	bool PressButton(UUserWidget* Window, const TCHAR* Name)
 	{
-		UButton* Button = Window ? Cast<UButton>(Window->GetWidgetFromName(Name)) : nullptr;
-		if (!Button)
+		if (Window && Window->IsA<UFGPopupWidget>() && FStringView(Name) == TEXT("OkButton"))
 		{
-			return false;
+			return AreaActionsUI::Click(Cast<UUserWidget>(ObjectValue(Window, TEXT("mConfirmButton"))));
 		}
-		Button->OnClicked.Broadcast();
-		return true;
+		UWidget* Found = Window ? Window->GetWidgetFromName(Name) : nullptr;
+		if (UButton* Button = Cast<UButton>(Found))
+		{
+			Button->OnClicked.Broadcast();
+			return true;
+		}
+		return AreaActionsUI::Click(Cast<UUserWidget>(Found));
 	}
 
-	UClass* ClassValue(UObject* Object, const TCHAR* Name)
+	// A window closed as the player closes it: the X of a tool window's frame (the game window's OnClose), or a question's popup
+	// closed without an answer (as Escape)
+	bool CloseWithX(const FRun& R, UUserWidget* Window)
 	{
-		FObjectPropertyBase* Property = Object ? FindFProperty<FObjectPropertyBase>(Object->GetClass(), Name) : nullptr;
-		return Property ? Cast<UClass>(Property->GetObjectPropertyValue_InContainer(Object)) : nullptr;
-	}
-
-	// A click on a list entry: the list's own "On Item Clicked" event, which the window's graph handles
-	bool ClickListItem(UListView* List, TFunctionRef<bool(UObject*)> Pick)
-	{
-		FMulticastDelegateProperty* Property = List ? FindFProperty<FMulticastDelegateProperty>(List->GetClass(), TEXT("BP_OnItemClicked")) : nullptr;
-		if (!Property)
+		if (const UAreaActionsWindow* Tool = Cast<UAreaActionsWindow>(Window))
 		{
-			return false;
-		}
-		for (UObject* Entry : List->GetListItems())
-		{
-			if (Pick(Entry))
+			UUserWidget* Frame = Tool->GetFrame();
+			FMulticastDelegateProperty* Property = Frame ? FindFProperty<FMulticastDelegateProperty>(Frame->GetClass(), TEXT("OnClose")) : nullptr;
+			if (Property)
 			{
-				struct { UObject* Item; } Params{ Entry };
-				Property->ContainerPtrToValuePtr<FMulticastScriptDelegate>(List)->ProcessMulticastDelegate<UObject>(&Params);
-				return true;
+				Property->ContainerPtrToValuePtr<FMulticastScriptDelegate>(Frame)->ProcessMulticastDelegate<UObject>(nullptr);
 			}
+			return Property != nullptr;
 		}
-		return false;
+		UFGPopupWidget* Popup = Cast<UAreaActionsChoiceContent>(Window) ? ShownPopup(R) : nullptr;
+		if (Popup)
+		{
+			Popup->CallPopupClosedClicked(false);
+			UFGBlueprintFunctionLibrary::ClosePopup(R.GetPlayer());
+		}
+		return Popup != nullptr;
+	}
+
+	// The window's widgets whose names start with Prefix (the menu's game buttons Action_<class>, State_<n>)
+	TArray<UUserWidget*> NamedButtons(UUserWidget* Window, const FString& Prefix)
+	{
+		TArray<UUserWidget*> Found;
+		if (Window && Window->WidgetTree)
+		{
+			Window->WidgetTree->ForEachWidget([&Found, &Prefix](UWidget* Widget)
+			{
+				if (UUserWidget* Button = Cast<UUserWidget>(Widget); Button && Widget->GetName().StartsWith(Prefix))
+				{
+					Found.Add(Button);
+				}
+			});
+		}
+		return Found;
 	}
 
 	UObject* ActiveAction(const FRun& R)
@@ -1453,13 +1537,8 @@ namespace
 		R.Steps.Add([Action](FRun& Self)
 		{
 			UAreaActionsPopupBase* Popup = Cast<UAreaActionsPopupBase>(ObjectValue(GetTool(Self), TEXT("PopupWidget")));
-			UListView* List = Popup ? Cast<UListView>(Popup->GetWidgetFromName(TEXT("Actions"))) : nullptr;
-			const bool bClicked = ClickListItem(List, [Action](UObject* Entry)
-			{
-				const UClass* Class = ClassValue(Entry, TEXT("Action"));
-				return Class && Class->GetName().StartsWith(Action);
-			});
-			Self.Check(bClicked, FString::Printf(TEXT("menu entry %s clicked"), Action));
+			const TArray<UUserWidget*> Entries = NamedButtons(Popup, FString(TEXT("Action_")) + Action);
+			Self.Check(Entries.Num() == 1 && AreaActionsUI::Click(Entries[0]), FString::Printf(TEXT("menu entry %s clicked (%d found)"), Action, Entries.Num()));
 			return EStep::Next;
 		});
 	}
@@ -1470,7 +1549,7 @@ namespace
 		R.Steps.Add([Name, Act](FRun& Self)
 		{
 			UUserWidget* Window = TopWindow(Self);
-			if (!IsWindow(Window, Name) || !Window->IsInViewport())
+			if (!IsWindow(Window, Name) || !IsShown(Window))
 			{
 				return EStep::Wait;
 			}
@@ -1494,8 +1573,7 @@ namespace
 	{
 		AddOnWindow(R, TEXT("Widget_MessageOk"), [S](FRun& Self, UUserWidget* Window)
 		{
-			FStrProperty* Message = FindFProperty<FStrProperty>(Window->GetClass(), TEXT("Message"));
-			S->Message = Message ? Message->GetPropertyValue_InContainer(Window) : FString();
+			S->Message = PopupBody(Window);
 			Self.Step(FString::Printf(TEXT("result message: %s"), *S->Message));
 			Self.Check(PressButton(Window, TEXT("OkButton")), TEXT("button OkButton pressed"));
 		});
@@ -1515,13 +1593,27 @@ namespace
 	{
 		AddOnWindow(R, TEXT("Widget_SetRecipe"), [](FRun& Self, UUserWidget* Window) {});
 		// -AATestBreakLayout: the checks measure a list that is never drawn (no size, no rows), so they must fail after the wait (AA-094)
-		static const auto GetList = [](UUserWidget* Window) -> UListView*
+		static const auto GetList = [](UUserWidget* Window) -> UPanelWidget*
 		{
 			if (Window && FParse::Param(FCommandLine::Get(), TEXT("AATestBreakLayout")))
 			{
-				return NewObject<UListView>(Window);
+				return NewObject<UVerticalBox>(Window);
 			}
-			return Window ? Cast<UListView>(Window->GetWidgetFromName(TEXT("RecipeList"))) : nullptr;
+			const UAreaActionsRecipeWindow* Recipes = Cast<UAreaActionsRecipeWindow>(Window);
+			return Recipes ? Recipes->GetList() : nullptr;
+		};
+		// The rows the player sees: list buttons with a size
+		static const auto Shown = [](const UPanelWidget* List)
+		{
+			TArray<UUserWidget*> Rows;
+			for (UWidget* Child : List ? List->GetAllChildren() : TArray<UWidget*>())
+			{
+				if (UUserWidget* Row = Cast<UUserWidget>(Child); Row && Row->GetCachedGeometry().GetLocalSize().X > 0.0)
+				{
+					Rows.Add(Row);
+				}
+			}
+			return Rows;
 		};
 		// The window is laid out some frames after it opens, more under load (AA-094): wait for a list with a size and a row, at most 2 s;
 		// after that the checks below run on whatever is there
@@ -1531,8 +1623,8 @@ namespace
 			{
 				*Since = Self.Now();
 			}
-			UListView* List = GetList(TopWindow(Self));
-			const bool bLaidOut = List && List->GetCachedGeometry().GetAbsoluteSize().X > 0.0 && List->GetDisplayedEntryWidgets().Num() > 0;
+			UPanelWidget* List = GetList(TopWindow(Self));
+			const bool bLaidOut = List && List->GetCachedGeometry().GetAbsoluteSize().X > 0.0 && Shown(List).Num() > 0;
 			if (!bLaidOut && Self.Now() - *Since < 2.0)
 			{
 				return EStep::Wait;
@@ -1548,7 +1640,7 @@ namespace
 		R.Steps.Add(WaitFrames(2));
 		R.Steps.Add([](FRun& Self)
 		{
-			UListView* List = GetList(TopWindow(Self));
+			UPanelWidget* List = GetList(TopWindow(Self));
 			FVector2D Viewport = FVector2D::ZeroVector;
 			if (GEngine && GEngine->GameViewport)
 			{
@@ -1557,8 +1649,8 @@ namespace
 			const double Width = List ? List->GetCachedGeometry().GetAbsoluteSize().X : 0.0;
 			Self.Check(Viewport.X > 0.0 && Width >= Viewport.X * 0.3,
 				FString::Printf(TEXT("recipe list width %.0f of viewport %.0f (at least 30%%)"), Width, Viewport.X));
-			const TArray<UUserWidget*> Rows = List ? List->GetDisplayedEntryWidgets() : TArray<UUserWidget*>();
-			const UTextBlock* Text = Rows.IsEmpty() ? nullptr : Cast<UTextBlock>(Rows[0]->GetWidgetFromName(TEXT("ItemText")));
+			const TArray<UUserWidget*> Rows = Shown(List);
+			const UTextBlock* Text = Rows.IsEmpty() ? nullptr : Cast<UTextBlock>(Rows[0]->GetWidgetFromName(TEXT("mButtonText")));
 			const FString Name = Text ? Text->GetText().ToString() : FString();
 			// The name is readable when its box is as wide as the text wants
 			const double TextWidth = Text ? Text->GetCachedGeometry().GetLocalSize().X : 0.0;
@@ -1569,17 +1661,27 @@ namespace
 		});
 	}
 
+	// A click on the recipe's button in SetRecipe's window
+	bool ClickRecipe(UUserWidget* Window, const TCHAR* RecipePath)
+	{
+		const UClass* Want = Recipe(RecipePath);
+		const UAreaActionsRecipeWindow* Recipes = Cast<UAreaActionsRecipeWindow>(Window);
+		for (const TPair<TObjectPtr<UUserWidget>, TSubclassOf<UFGRecipe>>& Entry : Recipes ? Recipes->GetRecipeButtons() : TMap<TObjectPtr<UUserWidget>, TSubclassOf<UFGRecipe>>())
+		{
+			if (Want && Entry.Value == Want)
+			{
+				return AreaActionsUI::Click(Entry.Key);
+			}
+		}
+		return false;
+	}
+
 	void AddPickRecipe(FRun& R, const TCHAR* RecipePath)
 	{
 		AddCheckRecipeWindowLayout(R);
 		AddOnWindow(R, TEXT("Widget_SetRecipe"), [RecipePath](FRun& Self, UUserWidget* Window)
 		{
-			const UClass* Want = Recipe(RecipePath);
-			const bool bClicked = ClickListItem(Cast<UListView>(Window->GetWidgetFromName(TEXT("RecipeList"))), [Want](UObject* Entry)
-			{
-				return ClassValue(Entry, TEXT("Recipe")) == Want;
-			});
-			Self.Check(bClicked, FString::Printf(TEXT("recipe %s picked in the list"), *GetNameSafe(Want)));
+			Self.Check(ClickRecipe(Window, RecipePath), FString::Printf(TEXT("recipe %s picked in the list"), *GetNameSafe(Recipe(RecipePath))));
 		});
 	}
 
@@ -2012,13 +2114,7 @@ namespace
 		AddOpenAction(R, TEXT("SetStationLoadUnload"));
 		AddOnWindow(R, TEXT("Widget_MessageYesNo"), [](FRun& Self, UUserWidget* Window)
 		{
-			UUserWidget* Frame = Cast<UUserWidget>(Window->GetWidgetFromName(TEXT("WindowDark")));
-			FMulticastDelegateProperty* Property = Frame ? FindFProperty<FMulticastDelegateProperty>(Frame->GetClass(), TEXT("OnClose")) : nullptr;
-			if (Property)
-			{
-				Property->ContainerPtrToValuePtr<FMulticastScriptDelegate>(Frame)->ProcessMulticastDelegate<UObject>(nullptr);
-			}
-			Self.Check(Property != nullptr, TEXT("window closed with X"));
+			Self.Check(CloseWithX(Self, Window), TEXT("window closed with X"));
 		});
 		R.Steps.Add([S](FRun& Self)
 		{
@@ -2744,26 +2840,24 @@ namespace
 			FString::Printf(TEXT("%s: pattern kept %d of %d, controls %d, copies of controls %d (want 0)"), When, Kept, C.Pattern.Num(), S.Controls.Num(), ControlCopies));
 	}
 
-	// A number typed into one of the windows' number boxes
+	// A number typed into one of the windows' number fields
 	void SetBox(UUserWidget* Window, const TCHAR* Name, double Value)
 	{
-		UUserWidget* Box = Window ? Cast<UUserWidget>(Window->GetWidgetFromName(Name)) : nullptr;
-		UEditableTextBox* Text = Box ? Cast<UEditableTextBox>(Box->GetWidgetFromName(TEXT("TextBox"))) : nullptr;
-		if (Text)
+		if (UAreaActionsPlaceWindow* Place = Cast<UAreaActionsPlaceWindow>(Window))
 		{
-			Text->SetText(FText::FromString(FString::SanitizeFloat(Value, 0)));
+			Place->SetNumber(Name, Value);
 		}
 		else
 		{
-			UE_LOG(LogAreaActionsCpp, Display, TEXT("AATEST no number box %s in %s"), Name, *GetNameSafe(Window));
+			UE_LOG(LogAreaActionsCpp, Display, TEXT("AATEST no number field %s in %s"), Name, *GetNameSafe(Window));
 		}
 	}
 
 	void SetCost(UUserWidget* Window, bool bUseCost)
 	{
-		if (UCheckBox* Box = Window ? Cast<UCheckBox>(Window->GetWidgetFromName(TEXT("UseBuildCost"))) : nullptr)
+		if (UAreaActionsPlaceWindow* Place = Cast<UAreaActionsPlaceWindow>(Window))
 		{
-			Box->SetIsChecked(bUseCost);
+			Place->SetUseCost(bUseCost);
 		}
 	}
 
@@ -3337,13 +3431,7 @@ namespace
 		AddCopyPreview(R, C);
 		AddOnWindow(R, TEXT("Widget_Copy"), [](FRun& Self, UUserWidget* Window)
 		{
-			UUserWidget* Frame = Cast<UUserWidget>(Window->GetWidgetFromName(TEXT("WindowDark")));
-			FMulticastDelegateProperty* Property = Frame ? FindFProperty<FMulticastDelegateProperty>(Frame->GetClass(), TEXT("OnClose")) : nullptr;
-			if (Property)
-			{
-				Property->ContainerPtrToValuePtr<FMulticastScriptDelegate>(Frame)->ProcessMulticastDelegate<UObject>(nullptr);
-			}
-			Self.Check(Property != nullptr, TEXT("Copy window closed with X"));
+			Self.Check(CloseWithX(Self, Window), TEXT("Copy window closed with X"));
 		});
 		R.Steps.Add(WaitFrames(5));
 		R.Steps.Add([](FRun& Self)
@@ -3491,15 +3579,6 @@ namespace
 		}
 	};
 
-	bool ClickRecipe(UUserWidget* Window, const TCHAR* RecipePath)
-	{
-		const UClass* Want = Recipe(RecipePath);
-		return ClickListItem(Window ? Cast<UListView>(Window->GetWidgetFromName(TEXT("RecipeList"))) : nullptr, [Want](UObject* Entry)
-		{
-			return ClassValue(Entry, TEXT("Recipe")) == Want;
-		});
-	}
-
 	// The same button twice, in one frame (GapFrames 0) or GapFrames apart: one request, one job, a result with success
 	void AddDoubleClick(FRun& R, bool bRecipe, int32 GapFrames, double Side)
 	{
@@ -3529,7 +3608,7 @@ namespace
 		R.Steps.Add([=](FRun& Self)
 		{
 			UUserWidget* Window = TopWindow(Self);
-			if (!IsWindow(Window, WindowName) || !Window->IsInViewport())
+			if (!IsWindow(Window, WindowName) || !IsShown(Window))
 			{
 				return EStep::Wait;
 			}
@@ -3568,35 +3647,29 @@ namespace
 	{
 		R.Steps.Add([](FRun& Self)
 		{
-			const UAreaActionsWorldModule* Module = UAreaActionsWorldModule::Get(Self.GetWorld());
-			// The message window of the first action that names one
-			TSubclassOf<UUserWidget> MessageOk;
-			for (const TSubclassOf<AAreaActionBase>& Action : Module ? Module->AvailableActions : TArray<TSubclassOf<AAreaActionBase>>())
-			{
-				MessageOk = MessageOk ? MessageOk : Action->GetDefaultObject<AAreaActionBase>()->MessageOkClass;
-			}
-			UUserWidget* Window = MessageOk ? CreateWidget<UUserWidget>(Self.GetPlayer(), MessageOk) : nullptr;
-			if (!Self.Check(Window != nullptr, FString::Printf(TEXT("message window %s"), *GetNameSafe(Window))))
+			// SetRecipe's window: WidgetCanceled() sends nothing
+			UUserWidget* Window = CreateWidget<UAreaActionsRecipeWindow>(Self.GetPlayer(), UAreaActionsRecipeWindow::StaticClass());
+			if (!Self.Check(Window != nullptr, FString::Printf(TEXT("window %s"), *GetNameSafe(Window))))
 			{
 				return EStep::Next;
 			}
 			UAreaActionSetRecipe* Target = NewObject<UAreaActionSetRecipe>(GetTransientPackage());
-			FMulticastDelegateProperty* Property = FindFProperty<FMulticastDelegateProperty>(Window->GetClass(), TEXT("OkClicked"));
+			FMulticastDelegateProperty* Property = FindFProperty<FMulticastDelegateProperty>(Window->GetClass(), TEXT("WidgetCanceled"));
 			const FMulticastScriptDelegate* Bound = Property ? Property->ContainerPtrToValuePtr<FMulticastScriptDelegate>(Window) : nullptr;
 			int32 Errors = 0;
 			bool bWrong = true;
 			{
 				FErrorCounter Counter;
-				// OkClicked() sends nothing; Selected takes a recipe
-				bWrong = AAreaActionBase::BindWindowEvent(Window, TEXT("OkClicked"), Target, GET_FUNCTION_NAME_CHECKED(UAreaActionSetRecipe, Selected));
+				// WidgetCanceled() sends nothing; Selected takes a recipe
+				bWrong = AAreaActionBase::BindWindowEvent(Window, TEXT("WidgetCanceled"), Target, GET_FUNCTION_NAME_CHECKED(UAreaActionSetRecipe, Selected));
 				// The redirector hands lines to this device later, on a flush
 				GLog->Flush();
 				Errors = Counter.Errors;
 			}
-			Self.Check(!bWrong && Errors == 1, FString::Printf(TEXT("OkClicked to Selected(recipe): bound %d, error lines %d (want 0, 1)"), bWrong, Errors));
-			Self.Check(Bound && !Bound->Contains(Target, GET_FUNCTION_NAME_CHECKED(UAreaActionSetRecipe, Selected)), TEXT("OkClicked has no Selected"));
-			const bool bRight = AAreaActionBase::BindWindowEvent(Window, TEXT("OkClicked"), Target, GET_FUNCTION_NAME_CHECKED(UAreaActionSetRecipe, Canceled));
-			Self.Check(bRight && Bound && Bound->Contains(Target, GET_FUNCTION_NAME_CHECKED(UAreaActionSetRecipe, Canceled)), TEXT("OkClicked to Canceled() binds"));
+			Self.Check(!bWrong && Errors == 1, FString::Printf(TEXT("WidgetCanceled to Selected(recipe): bound %d, error lines %d (want 0, 1)"), bWrong, Errors));
+			Self.Check(Bound && !Bound->Contains(Target, GET_FUNCTION_NAME_CHECKED(UAreaActionSetRecipe, Selected)), TEXT("WidgetCanceled has no Selected"));
+			const bool bRight = AAreaActionBase::BindWindowEvent(Window, TEXT("WidgetCanceled"), Target, GET_FUNCTION_NAME_CHECKED(UAreaActionSetRecipe, Canceled));
+			Self.Check(bRight && Bound && Bound->Contains(Target, GET_FUNCTION_NAME_CHECKED(UAreaActionSetRecipe, Canceled)), TEXT("WidgetCanceled to Canceled() binds"));
 			return EStep::Next;
 		});
 	}
@@ -3608,13 +3681,7 @@ namespace
 		R.Steps.Add([](FRun& Self)
 		{
 			UUserWidget* Popup = Cast<UUserWidget>(ObjectValue(GetTool(Self), TEXT("PopupWidget")));
-			UUserWidget* Frame = Popup ? Cast<UUserWidget>(Popup->GetWidgetFromName(TEXT("WindowDark"))) : nullptr;
-			FMulticastDelegateProperty* Property = Frame ? FindFProperty<FMulticastDelegateProperty>(Frame->GetClass(), TEXT("OnClose")) : nullptr;
-			if (Property)
-			{
-				Property->ContainerPtrToValuePtr<FMulticastScriptDelegate>(Frame)->ProcessMulticastDelegate<UObject>(nullptr);
-			}
-			Self.Check(Property != nullptr, TEXT("menu closed with X"));
+			Self.Check(CloseWithX(Self, Popup), TEXT("menu closed with X"));
 			return EStep::Next;
 		});
 		R.Steps.Add(WaitFrames(5));
@@ -4290,18 +4357,10 @@ namespace
 		AddOnWindow(R, TEXT("Widget_MessageYesNo"), [ButtonName, Want](FRun& Self, UUserWidget* Window)
 		{
 			// The answers are named after what they do (D16)
-			UButton* Button = Cast<UButton>(Window->GetWidgetFromName(ButtonName));
-			FString Label;
-			if (Button)
-			{
-				UWidgetTree::ForWidgetAndChildren(Button, [&Label](UWidget* Child)
-				{
-					if (const UTextBlock* Text = Cast<UTextBlock>(Child))
-					{
-						Label = Text->GetText().ToString();
-					}
-				});
-			}
+			// The game's button (Widget_StandardButton) keeps its label in mText
+			const UWidget* Button = Window->GetWidgetFromName(ButtonName);
+			const FTextProperty* Text = Button ? FindFProperty<FTextProperty>(Button->GetClass(), TEXT("mText")) : nullptr;
+			const FString Label = Text ? Text->GetPropertyValue_InContainer(Button).ToString() : FString();
 			Self.Check(Label == Want, FString::Printf(TEXT("button %s reads '%s' (want '%s')"), ButtonName, *Label, Want));
 			Self.Check(PressButton(Window, ButtonName), FString::Printf(TEXT("'%s' pressed"), Want));
 		});
@@ -5342,13 +5401,7 @@ namespace
 	{
 		AddOnWindow(R, Name, [Name](FRun& Self, UUserWidget* Window)
 		{
-			UUserWidget* Frame = Cast<UUserWidget>(Window->GetWidgetFromName(TEXT("WindowDark")));
-			FMulticastDelegateProperty* Property = Frame ? FindFProperty<FMulticastDelegateProperty>(Frame->GetClass(), TEXT("OnClose")) : nullptr;
-			if (Property)
-			{
-				Property->ContainerPtrToValuePtr<FMulticastScriptDelegate>(Frame)->ProcessMulticastDelegate<UObject>(nullptr);
-			}
-			Self.Check(Property != nullptr, FString::Printf(TEXT("%s closed with X"), Name));
+			Self.Check(CloseWithX(Self, Window), FString::Printf(TEXT("%s closed with X"), Name));
 		});
 	}
 
@@ -5869,7 +5922,10 @@ namespace
 	{
 		R.Steps.Add([](FRun& Self)
 		{
-			CallNoParams(GetPopup(Self), TEXT("Close"));
+			if (UAreaActionsPopupBase* Popup = GetPopup(Self))
+			{
+				Popup->CloseWindow();
+			}
 			return EStep::Next;
 		});
 		R.Steps.Add(WaitFrames(3));
@@ -6084,7 +6140,7 @@ namespace
 		R.Steps.Add([bWant, When](FRun& Self)
 		{
 			Self.Check(TutorialShown(Self) == bWant, FString::Printf(TEXT("%s: the help %s by itself (want %s), step %d"), When, TutorialShown(Self) ? TEXT("shows") : TEXT("does not show"),
-				bWant ? TEXT("shown") : TEXT("not shown"), IntValue(GetPopup(Self), TEXT("HelpIdx"))));
+				bWant ? TEXT("shown") : TEXT("not shown"), IntValue(GetPopup(Self), TEXT("TutorialStep"))));
 			return EStep::Next;
 		});
 	}
@@ -6099,11 +6155,11 @@ namespace
 		{
 			UAreaActionsPopupBase* Popup = GetPopup(Self);
 			const int32 Count = ArrayNum(Popup, TEXT("HelpMessages"));
-			Self.Check(Count >= 2 && IntValue(Popup, TEXT("HelpIdx")) == 0, FString::Printf(TEXT("help steps %d, at step %d"), Count, IntValue(Popup, TEXT("HelpIdx"))));
+			Self.Check(Count >= 2 && IntValue(Popup, TEXT("TutorialStep")) == 0, FString::Printf(TEXT("help steps %d, at step %d"), Count, IntValue(Popup, TEXT("TutorialStep"))));
 			PressButton(Popup, TEXT("TutorialNext"));
-			const int32 AfterNext = IntValue(Popup, TEXT("HelpIdx"));
+			const int32 AfterNext = IntValue(Popup, TEXT("TutorialStep"));
 			PressButton(Popup, TEXT("TutorialPrev"));
-			const int32 AfterPrev = IntValue(Popup, TEXT("HelpIdx"));
+			const int32 AfterPrev = IntValue(Popup, TEXT("TutorialStep"));
 			Self.Check(AfterNext == 1 && AfterPrev == 0, FString::Printf(TEXT("Next goes to step %d (want 1), Prev back to %d (want 0)"), AfterNext, AfterPrev));
 			Self.Check(!SettingsText().Contains(TEXT("HelpDone=True")), FString::Printf(TEXT("before Done the settings file has no HelpDone: '%s'"), *SettingsText()));
 			for (int32 Step = 0; Step < Count && TutorialShown(Self); ++Step)
@@ -6120,7 +6176,7 @@ namespace
 		AddCheckHelpOnOpen(R, false, TEXT("tool taken again"));
 		R.Steps.Add([](FRun& Self)
 		{
-			Self.Check(PressButton(GetPopup(Self), TEXT("HelpButton")) && TutorialShown(Self) && IntValue(GetPopup(Self), TEXT("HelpIdx")) == 0, TEXT("Help shows the help from its first step"));
+			Self.Check(PressButton(GetPopup(Self), TEXT("HelpButton")) && TutorialShown(Self) && IntValue(GetPopup(Self), TEXT("TutorialStep")) == 0, TEXT("Help shows the help from its first step"));
 			return EStep::Next;
 		});
 		AddCloseMenu(R);
@@ -6606,8 +6662,8 @@ namespace
 		AddOpenAction(R, TEXT("MassDismantle"));
 		AddOnWindow(R, TEXT("Widget_MessageYesNo"), [](FRun& Self, UUserWidget* Window)
 		{
-			FStrProperty* Message = FindFProperty<FStrProperty>(Window->GetClass(), TEXT("Message"));
-			const FString Text = Message ? Message->GetPropertyValue_InContainer(Window) : FString();
+			const UTextBlock* Message = Cast<UTextBlock>(Window->GetWidgetFromName(TEXT("MessageText")));
+			const FString Text = Message ? Message->GetText().ToString() : FString();
 			Self.Check(Text.Contains(TEXT("No Build Cost")) && Text.Contains(TEXT("does not come back")), FString::Printf(TEXT("the window says: %s"), *Text));
 			Self.Check(!Window->GetWidgetFromName(TEXT("ChoiceButton2")), TEXT("two buttons only"));
 			Self.Check(PressButton(Window, TEXT("NoButton")), TEXT("Cancel pressed"));
