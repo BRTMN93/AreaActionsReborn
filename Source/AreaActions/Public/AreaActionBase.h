@@ -44,26 +44,22 @@ public:
 	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "Area Actions")
 	TSubclassOf<UAreaAction> NativeAction;
 
-	// The action's own window (SetRecipe: the recipe list); the message windows are shared
+	// The action's own window (SetRecipe: the recipe list; Copy, Fill: their settings); messages and questions are the game's popups
 	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "Area Actions")
 	TSubclassOf<UUserWidget> ParamsWidgetClass;
-	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "Area Actions")
-	TSubclassOf<UUserWidget> MessageOkClass;
-	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "Area Actions")
-	TSubclassOf<UUserWidget> MessageYesNoClass;
 
 	// Opens a window of the tool: interact object = the tool, Title and Message set when the window has them, added to the tool's stack
 	UUserWidget* OpenWindow(TSubclassOf<UUserWidget> Class, const FText& Title = FText::GetEmpty(), const FText& Message = FText::GetEmpty());
 	// Binds a Blueprint event dispatcher of the window to a function of Target by name; false (and an error) when either is missing or
 	// their parameters differ
 	static bool BindWindowEvent(UUserWidget* Window, FName Dispatcher, UObject* Target, FName Function);
-	// A question with two named answers: the yes/no window with its buttons renamed, each button calls a function of Target by name.
-	// Closing the window (X, or the tool put away) without an answer ends the action. False (and an error) when the window cannot open.
+	// A question with two named answers in the game's popup, each button calls a function of Target by name. Cancel (added unless an
+	// answer is Target's Cancel) and Escape end the action; the tool put away closes the popup. False (and an error) when it cannot open.
 	bool OpenChoice(const FText& Title, const FText& Message, const FText& First, const FText& Second, UObject* Target, FName OnFirst, FName OnSecond);
-	// The same with two or more answers; past the window's two buttons, more are made like its first
+	// The same with two or more answers
 	struct FChoiceAnswer { FText Label; FName Function; };
 	bool OpenChoice(const FText& Title, const FText& Message, const TArray<FChoiceAnswer>& Answers, UObject* Target);
-	// A message with OK; OK ends the action
+	// A message in the game's popup; its Confirm ends the action
 	void ShowMessage(const FText& Title, const FText& Message);
 	// A message for a result code that is not Ok; false when Code is Ok
 	bool ShowFailure(EAreaActionsResultCode Code);
@@ -88,14 +84,15 @@ public:
 	UFUNCTION()
 	void Finish();
 
-	// The yes/no window's NoClicked, which it also fires for X and for its second button: the cancel waits one tick, so a button that
-	// sends a request in the same click wins
-	UFUNCTION()
+	// The question's Cancel: the cancel waits one tick, so an answer that sent a request in the same click wins
 	void ChoiceClosed();
 
-	// A button the choice window got from OpenChoice closes the window
+	// The message popup closed
 	UFUNCTION()
-	void CloseChoice();
+	void MessageClosed(bool bConfirmed);
+
+	// The question on screen, for the test mode
+	class UAreaActionsChoiceContent* GetChoice() const { return Choice; }
 
 protected:
 	virtual void BeginPlay() override;
@@ -113,7 +110,8 @@ private:
 	// Requests begun so far, and that count when the open choice window appeared
 	int32 RequestCount = 0;
 	int32 RequestCountAtChoice = 0;
-	TWeakObjectPtr<UUserWidget> ChoiceWindow;
+	UPROPERTY(Transient)
+	TObjectPtr<class UAreaActionsChoiceContent> Choice;
 	FDelegateHandle ResultHandle;
 	bool bFinished = false;
 };

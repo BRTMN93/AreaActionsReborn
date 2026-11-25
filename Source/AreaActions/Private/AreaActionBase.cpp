@@ -2,13 +2,10 @@
 #include "AreaActionsEquipment.h"
 #include "AreaActionsLog.h"
 #include "AreaActionsRCO.h"
+#include "AreaActionsUI.h"
+#include "FGBlueprintFunctionLibrary.h"
+#include "UI/FGPopupWidget.h"
 #include "Blueprint/UserWidget.h"
-#include "Blueprint/WidgetTree.h"
-#include "Components/Button.h"
-#include "Components/CanvasPanel.h"
-#include "Components/CanvasPanelSlot.h"
-#include "Components/ScaleBox.h"
-#include "Components/TextBlock.h"
 #include "FGCharacterPlayer.h"
 #include "TimerManager.h"
 #include "UI/FGInteractWidget.h"
@@ -54,6 +51,12 @@ void AAreaActionBase::EndPlay(const EEndPlayReason::Type Reason)
 	if (Action)
 	{
 		Action->End();
+	}
+	// A question still on screen goes with the action
+	if (Choice)
+	{
+		Choice->Close();
+		Choice = nullptr;
 	}
 	if (UAreaActionsRCO* Rco = GetRco(); Rco && ResultHandle.IsValid())
 	{
@@ -197,106 +200,54 @@ bool AAreaActionBase::OpenChoice(const FText& Title, const FText& Message, const
 
 bool AAreaActionBase::OpenChoice(const FText& Title, const FText& Message, const TArray<FChoiceAnswer>& Answers, UObject* Target)
 {
-	UUserWidget* Window = Answers.Num() >= 2 ? OpenWindow(MessageYesNoClass, Title, Message) : nullptr;
-	if (!Window || !BindWindowEvent(Window, TEXT("NoClicked"), this, GET_FUNCTION_NAME_CHECKED(AAreaActionBase, ChoiceClosed)))
+	APlayerController* OwnerPC = Cast<APlayerController>(GetOwner());
+	if (Answers.Num() < 2 || !OwnerPC)
 	{
+		UE_LOG(LogAreaActionsCpp, Error, TEXT("%s: a question needs 2 answers and the player (%d answers)"), *GetClass()->GetName(), Answers.Num());
 		return false;
 	}
-	RequestCountAtChoice = RequestCount;
-	ChoiceWindow = Window;
-	UButton* Yes = Cast<UButton>(Window->GetWidgetFromName(TEXT("YesButton")));
-	UButton* No = Cast<UButton>(Window->GetWidgetFromName(TEXT("NoButton")));
-	UCanvasPanelSlot* YesSlot = Yes ? Cast<UCanvasPanelSlot>(Yes->Slot) : nullptr;
-	UCanvasPanelSlot* NoSlot = No ? Cast<UCanvasPanelSlot>(No->Slot) : nullptr;
-	UCanvasPanel* Panel = YesSlot ? Cast<UCanvasPanel>(Yes->GetParent()) : nullptr;
-	if (!Yes || !No || (Answers.Num() > 2 && (!Panel || !NoSlot)))
-	{
-		UE_LOG(LogAreaActionsCpp, Error, TEXT("%s has no YesButton and NoButton for %d answers"), *GetNameSafe(Window), Answers.Num());
-		return false;
-	}
-	// The window's two buttons take the first two answers; more answers get buttons made like the first one, in the same row (the two
-	// buttons fill 0.3 to 0.7 of the window's width, the row then shares 0.1 to 0.9)
-	TArray<UButton*> Buttons{ Yes, No };
-	for (int32 Index = 2; Index < Answers.Num(); ++Index)
-	{
-		UButton* Extra = Window->WidgetTree->ConstructWidget<UButton>(UButton::StaticClass(), *FString::Printf(TEXT("ChoiceButton%d"), Index));
-		Extra->SetStyle(Yes->GetStyle());
-		Extra->SetColorAndOpacity(Yes->GetColorAndOpacity());
-		Extra->SetBackgroundColor(Yes->GetBackgroundColor());
-		UTextBlock* YesText = nullptr;
-		UWidgetTree::ForWidgetAndChildren(Yes, [&YesText](UWidget* Child) { YesText = YesText ? YesText : Cast<UTextBlock>(Child); });
-		UScaleBox* Box = Window->WidgetTree->ConstructWidget<UScaleBox>();
-		UTextBlock* Text = Window->WidgetTree->ConstructWidget<UTextBlock>();
-		if (YesText)
-		{
-			Text->SetFont(YesText->GetFont());
-			Text->SetColorAndOpacity(YesText->GetColorAndOpacity());
-			Text->SetJustification(ETextJustify::Center);
-		}
-		if (const UScaleBox* YesBox = Cast<UScaleBox>(Yes->GetContent()))
-		{
-			Box->SetStretch(YesBox->GetStretch());
-		}
-		Box->AddChild(Text);
-		Extra->AddChild(Box);
-		UCanvasPanelSlot* ExtraSlot = Panel->AddChildToCanvas(Extra);
-		ExtraSlot->SetOffsets(YesSlot->GetOffsets());
-		ExtraSlot->SetAnchors(YesSlot->GetAnchors());
-		FScriptDelegate Close;
-		Close.BindUFunction(this, GET_FUNCTION_NAME_CHECKED(AAreaActionBase, CloseChoice));
-		Extra->OnClicked.Add(Close);
-		Buttons.Add(Extra);
-	}
-	if (Answers.Num() > 2)
-	{
-		const double Width = 0.8 / Answers.Num();
-		for (int32 Index = 0; Index < Buttons.Num(); ++Index)
-		{
-			UCanvasPanelSlot* Slot = Cast<UCanvasPanelSlot>(Buttons[Index]->Slot);
-			FAnchors Anchors = Slot->GetAnchors();
-			Anchors.Minimum.X = 0.1 + Index * Width + 0.005;
-			Anchors.Maximum.X = 0.1 + (Index + 1) * Width - 0.005;
-			Slot->SetAnchors(Anchors);
-		}
-	}
+	// The game's popup (D23): the first two answers keep the names the old window's buttons had (YesButton, NoButton), the others
+	// ChoiceButton<n>; a question without a Cancel answer gets one, which (as Escape) ends the action
+	TArray<UAreaActionsChoiceContent::FAnswer> Buttons;
+	bool bHasCancel = false;
 	for (int32 Index = 0; Index < Answers.Num(); ++Index)
 	{
 		const FChoiceAnswer& Answer = Answers[Index];
-		UButton* Button = Buttons[Index];
 		if (!Target || !Target->FindFunction(Answer.Function))
 		{
-			UE_LOG(LogAreaActionsCpp, Error, TEXT("Cannot bind %s.%s to %s.%s"), *GetNameSafe(Window), *Button->GetName(), *GetNameSafe(Target), *Answer.Function.ToString());
+			UE_LOG(LogAreaActionsCpp, Error, TEXT("Cannot bind answer %d to %s.%s"), Index, *GetNameSafe(Target), *Answer.Function.ToString());
 			return false;
 		}
-		const FText& Label = Answer.Label;
-		UWidgetTree::ForWidgetAndChildren(Button, [&Label](UWidget* Child)
+		bHasCancel |= Answer.Function == TEXT("Cancel");
+		const FName Name = Index == 0 ? FName(TEXT("YesButton")) : Index == 1 ? FName(TEXT("NoButton")) : FName(*FString::Printf(TEXT("ChoiceButton%d"), Index));
+		TWeakObjectPtr<UObject> WeakTarget(Target);
+		const FName Function = Answer.Function;
+		Buttons.Add({ Answer.Label, Name, [WeakTarget, Function]()
 		{
-			if (UTextBlock* Text = Cast<UTextBlock>(Child))
+			if (UObject* Live = WeakTarget.Get())
 			{
-				Text->SetText(Label);
+				if (UFunction* Found = Live->FindFunction(Function); Found && Found->ParmsSize == 0)
+				{
+					Live->ProcessEvent(Found, nullptr);
+				}
 			}
-		});
-		FScriptDelegate Delegate;
-		Delegate.BindUFunction(Target, Answer.Function);
-		Button->OnClicked.Add(Delegate);
+		} });
 	}
-	return true;
-}
-
-void AAreaActionBase::CloseChoice()
-{
-	// The window's own buttons close it in its graph; a button made here closes it the same way, through the tool's window stack
-	UUserWidget* Window = ChoiceWindow.Get();
-	AAreaActionsEquipment* Equipment = GetEquipment();
-	UFunction* RemoveWidget = Equipment ? Equipment->FindFunction(TEXT("RemoveWidget")) : nullptr;
-	FObjectPropertyBase* Param = RemoveWidget ? CastField<FObjectPropertyBase>(RemoveWidget->ChildProperties) : nullptr;
-	if (Window && Param && Window->IsA(Param->PropertyClass))
+	if (!bHasCancel)
 	{
-		TArray<uint8> Params;
-		Params.SetNumZeroed(RemoveWidget->ParmsSize);
-		Param->SetObjectPropertyValue_InContainer(Params.GetData(), Window);
-		Equipment->ProcessEvent(RemoveWidget, Params.GetData());
+		TWeakObjectPtr<AAreaActionBase> WeakThis(this);
+		Buttons.Add({ LOCTEXT("ChoiceCancel", "Cancel"), TEXT("CancelButton"), [WeakThis]()
+		{
+			if (AAreaActionBase* Live = WeakThis.Get())
+			{
+				Live->ChoiceClosed();
+			}
+		} });
 	}
+	UE_LOG(LogAreaActionsCpp, Display, TEXT("Action %s asks '%s' (%d answers)"), *GetClass()->GetName(), *Title.ToString(), Buttons.Num());
+	RequestCountAtChoice = RequestCount;
+	Choice = UAreaActionsChoiceContent::Open(OwnerPC, Title, Message, MoveTemp(Buttons));
+	return Choice != nullptr;
 }
 
 void AAreaActionBase::ChoiceClosed()
@@ -313,11 +264,21 @@ void AAreaActionBase::ChoiceClosed()
 void AAreaActionBase::ShowMessage(const FText& Title, const FText& Message)
 {
 	UE_LOG(LogAreaActionsCpp, Display, TEXT("Action %s message '%s': %s"), *GetClass()->GetName(), *Title.ToString(), *Message.ToString());
-	UUserWidget* Window = OpenWindow(MessageOkClass, Title, Message);
-	if (!Window || !BindWindowEvent(Window, TEXT("OkClicked"), this, GET_FUNCTION_NAME_CHECKED(AAreaActionBase, Finish)))
+	APlayerController* OwnerPC = Cast<APlayerController>(GetOwner());
+	if (!OwnerPC)
 	{
 		Finish();
+		return;
 	}
+	// The game's own popup with its Confirm button (D23); closing it ends the action
+	FPopupClosed Closed;
+	Closed.BindUFunction(this, GET_FUNCTION_NAME_CHECKED(AAreaActionBase, MessageClosed));
+	UFGBlueprintFunctionLibrary::AddPopupWithCloseDelegate(OwnerPC, Title, Message, Closed, PID_OK);
+}
+
+void AAreaActionBase::MessageClosed(bool bConfirmed)
+{
+	Finish();
 }
 
 bool AAreaActionBase::ShowFailure(EAreaActionsResultCode Code)

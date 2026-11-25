@@ -1,4 +1,5 @@
 #include "AreaActionsCopy.h"
+#include "AreaActionsWindows.h"
 #include "AkComponent.h"
 #include "AreaActionsEquipment.h"
 #include "AreaActionsJobs.h"
@@ -201,9 +202,9 @@ void UAreaActionPlaceCopies::Start()
 	}
 	const AActor* Settings = GetSettings();
 	const FBoolProperty* UseCost = Settings ? FindFProperty<FBoolProperty>(Settings->GetClass(), TEXT("UseBuildCost")) : nullptr;
-	if (UCheckBox* Box = Cast<UCheckBox>(Window->GetWidgetFromName(TEXT("UseBuildCost"))); Box && UseCost)
+	if (UAreaActionsPlaceWindow* Place = Cast<UAreaActionsPlaceWindow>(Window); Place && UseCost)
 	{
-		Box->SetIsChecked(UseCost->GetPropertyValue_InContainer(Settings));
+		Place->SetUseCost(UseCost->GetPropertyValue_InContainer(Settings));
 	}
 	UE_LOG(LogAreaActionsCpp, Display, TEXT("%s: %d buildings, reference %s, yaw %.2f, pattern %s"), *GetClass()->GetName(), Buildings.Num(), *Frame.Position.ToString(), Frame.Yaw,
 		*Frame.PatternSize.ToString());

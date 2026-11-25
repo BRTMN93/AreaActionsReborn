@@ -32,6 +32,8 @@ public class AreaActions : ModuleRules
 		});
 		if (Target.Type == TargetRules.TargetType.Editor) {
 			PublicDependencyModuleNames.Add("AnimGraph");
+			// UAreaActionsEditorTools (editor scripts only)
+			PrivateDependencyModuleNames.AddRange(new string[] { "UnrealEd", "UMGEditor" });
 		}
 
 		// AbstractInstance: the lightweight instance data. UBT warns that the .uplugin does not list the plugin; the game ships it inside

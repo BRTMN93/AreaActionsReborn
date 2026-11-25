@@ -12,6 +12,9 @@
 #include "AreaActionsJobs.h"
 #include "Algo/AnyOf.h"
 #include "Blueprint/WidgetTree.h"
+#include "Blueprint/WidgetBlueprintGeneratedClass.h"
+#include "Components/NamedSlotInterface.h"
+#include "Components/PanelWidget.h"
 #include "Buildables/FGBuildablePowerPole.h"
 #include "Buildables/FGBuildableWire.h"
 #include "FGPowerConnectionComponent.h"
@@ -6420,6 +6423,168 @@ namespace
 		});
 	}
 
+	// AA-084 (D23): the game's own widgets as the packaged game has them (the starter project holds stubs). Writes, per widget class, the
+	// archetype tree with every property that differs from the widget class's default, then the class's own Blueprint variables and
+	// functions; nested widget classes are written too. File: <Saved>/AreaActionsUIProbe.txt
+	void DumpObjectDiff(const UObject* Object, const FString& Indent, TArray<FString>& Out)
+	{
+		const UObject* Default = Object->GetClass()->GetDefaultObject();
+		for (TFieldIterator<FProperty> It(Object->GetClass()); It; ++It)
+		{
+			const FProperty* Property = *It;
+			if (Property->HasAnyPropertyFlags(CPF_Transient | CPF_DuplicateTransient) || Property->GetFName() == TEXT("Slot")
+				|| Property->Identical_InContainer(Object, Default))
+			{
+				continue;
+			}
+			FString Value;
+			Property->ExportText_InContainer(0, Value, Object, Default, const_cast<UObject*>(Object), PPF_None);
+			Out.Add(FString::Printf(TEXT("%s  %s = %s"), *Indent, *Property->GetName(), *Value.Left(1500)));
+		}
+	}
+
+	void DumpWidget(UWidget* Widget, int32 Depth, TArray<FString>& Out, TSet<UClass*>& Queue)
+	{
+		const FString Indent = FString::ChrN(Depth * 2, TEXT(' '));
+		Out.Add(FString::Printf(TEXT("%s%s [%s]"), *Indent, *Widget->GetName(), *Widget->GetClass()->GetPathName()));
+		if (Widget->Slot)
+		{
+			TArray<FString> SlotLines;
+			DumpObjectDiff(Widget->Slot, Indent + TEXT("  slot"), SlotLines);
+			Out.Append(SlotLines);
+		}
+		DumpObjectDiff(Widget, Indent, Out);
+		if (Cast<UUserWidget>(Widget) && Cast<UWidgetBlueprintGeneratedClass>(Widget->GetClass()) != nullptr)
+		{
+			Queue.Add(Widget->GetClass());
+		}
+		if (INamedSlotInterface* Named = Cast<INamedSlotInterface>(Widget))
+		{
+			TArray<FName> Names;
+			Named->GetSlotNames(Names);
+			for (const FName& Name : Names)
+			{
+				if (UWidget* Content = Named->GetContentForSlot(Name))
+				{
+					Out.Add(FString::Printf(TEXT("%s  named slot %s:"), *Indent, *Name.ToString()));
+					DumpWidget(Content, Depth + 2, Out, Queue);
+				}
+			}
+		}
+		if (const UPanelWidget* Panel = Cast<UPanelWidget>(Widget))
+		{
+			for (int32 Index = 0; Index < Panel->GetChildrenCount(); ++Index)
+			{
+				if (UWidget* Child = Panel->GetChildAt(Index))
+				{
+					DumpWidget(Child, Depth + 1, Out, Queue);
+				}
+			}
+		}
+	}
+
+	void DumpWidgetClass(UClass* Class, TArray<FString>& Out, TSet<UClass*>& Queue)
+	{
+		Out.Add(FString::Printf(TEXT("=== %s (parent %s)"), *Class->GetPathName(), *GetNameSafe(Class->GetSuperClass())));
+		for (UClass* Own = Class; Cast<UBlueprintGeneratedClass>(Own) != nullptr; Own = Own->GetSuperClass())
+		{
+			for (TFieldIterator<FProperty> It(Own, EFieldIterationFlags::None); It; ++It)
+			{
+				FString Value;
+				if (!It->IsA<FMulticastDelegateProperty>())
+				{
+					It->ExportText_InContainer(0, Value, Class->GetDefaultObject(), nullptr, Class->GetDefaultObject(), PPF_None);
+				}
+				Out.Add(FString::Printf(TEXT("  var %s.%s: %s = %s"), *Own->GetName(), *It->GetName(), *It->GetCPPType(), *Value.Left(300)));
+			}
+			for (TFieldIterator<UFunction> It(Own, EFieldIterationFlags::None); It; ++It)
+			{
+				TArray<FString> Params;
+				for (TFieldIterator<FProperty> Param(*It); Param && Param->HasAnyPropertyFlags(CPF_Parm); ++Param)
+				{
+					Params.Add(Param->GetCPPType() + TEXT(" ") + Param->GetName());
+				}
+				Out.Add(FString::Printf(TEXT("  function %s.%s(%s)"), *Own->GetName(), *It->GetName(), *FString::Join(Params, TEXT(", "))));
+			}
+		}
+		UWidgetBlueprintGeneratedClass* Generated = Cast<UWidgetBlueprintGeneratedClass>(Class);
+		UWidgetBlueprintGeneratedClass* Owner = Generated ? Generated->FindWidgetTreeOwningClass() : nullptr;
+		UWidgetTree* Tree = Owner ? Owner->GetWidgetTreeArchetype() : nullptr;
+		if (Tree && Tree->RootWidget)
+		{
+			DumpWidget(Tree->RootWidget, 1, Out, Queue);
+		}
+		if (const UUserWidget* Default = Cast<UUserWidget>(Class->GetDefaultObject()))
+		{
+			DumpObjectDiff(Default, TEXT("  cdo"), Out);
+		}
+	}
+
+	void AddUIProbe(FRun& R)
+	{
+		R.Steps.Add([](FRun& Self)
+		{
+			static const TCHAR* Paths[] = {
+				TEXT("/Game/FactoryGame/Interface/UI/Widget_Window_DarkMode.Widget_Window_DarkMode_C"),
+				TEXT("/Game/FactoryGame/Interface/UI/InGame/Widget_Window_ContentBackground_DarkMode.Widget_Window_ContentBackground_DarkMode_C"),
+				TEXT("/Game/FactoryGame/Interface/UI/InGame/-Shared/Widget_StandardButton.Widget_StandardButton_C"),
+				TEXT("/Game/FactoryGame/Interface/UI/InGame/-Shared/Widget_ListButton.Widget_ListButton_C"),
+				TEXT("/Game/FactoryGame/Interface/UI/BigMenu/Widget_Recipe_ListButton.Widget_Recipe_ListButton_C"),
+				TEXT("/Game/FactoryGame/Interface/UI/InGame/Widget_Popup.Widget_Popup_C"),
+				TEXT("/Game/FactoryGame/Interface/UI/InGame/Widget_PopupDefaultText.Widget_PopupDefaultText_C"),
+				TEXT("/Game/FactoryGame/Interface/UI/InGame/Widget_PopupSplitStack.Widget_PopupSplitStack_C"),
+				TEXT("/Game/FactoryGame/Interface/UI/InGame/Widget_StackSplitSlider.Widget_StackSplitSlider_C"),
+				TEXT("/Game/FactoryGame/Interface/UI/Menu/Options/BPW_OptionsCheckbox.BPW_OptionsCheckbox_C"),
+				TEXT("/Game/FactoryGame/Interface/UI/Menu/Options/BPW_OptionsSlider.BPW_OptionsSlider_C"),
+				TEXT("/Game/FactoryGame/Interface/UI/InGame/-Shared/ComboBox/BPW_ComboboxSearch.BPW_ComboboxSearch_C"),
+				TEXT("/Game/FactoryGame/Interface/UI/InGame/-Shared/InputTextWarning/BPW_InputTextWarning.BPW_InputTextWarning_C"),
+				TEXT("/Game/FactoryGame/Interface/UI/InGame/-Shared/Widget_Scrollbox.Widget_Scrollbox_C"),
+				TEXT("/Game/FactoryGame/Interface/BPW_ToggleButton.BPW_ToggleButton_C"),
+				TEXT("/Game/FactoryGame/-Shared/Blueprint/Widget_ButtonHintBar.Widget_ButtonHintBar_C"),
+				TEXT("/Game/FactoryGame/-Shared/Blueprint/Widget_ButtonHint.Widget_ButtonHint_C"),
+				TEXT("/Game/FactoryGame/Interface/UI/InGame/Onboarding/BPW_OnboardingHint.BPW_OnboardingHint_C"),
+			};
+			TArray<UClass*> Todo;
+			for (const TCHAR* Path : Paths)
+			{
+				UClass* Class = LoadClass<UUserWidget>(nullptr, Path);
+				Self.Check(Class != nullptr, FString::Printf(TEXT("loaded %s"), Path));
+				if (Class)
+				{
+					Todo.Add(Class);
+				}
+			}
+			// The Constructor's window: which widgets the game's recipe selection is made of
+			UClass* Constructor = LoadClass<AFGBuildable>(nullptr, TEXT("/Game/FactoryGame/Buildable/Factory/ConstructorMk1/Build_ConstructorMk1.Build_ConstructorMk1_C"));
+			FSoftClassProperty* Soft = Constructor ? FindFProperty<FSoftClassProperty>(Constructor, TEXT("mInteractWidgetSoftClass")) : nullptr;
+			UClass* Window = Soft ? Cast<UClass>(Soft->GetPropertyValue_InContainer(Constructor->GetDefaultObject()).LoadSynchronous()) : nullptr;
+			Self.Check(Window != nullptr, FString::Printf(TEXT("Constructor window %s"), *GetPathNameSafe(Window)));
+			if (Window)
+			{
+				Todo.Add(Window);
+			}
+			TArray<FString> Out;
+			TSet<UClass*> Done;
+			for (int32 Index = 0; Index < Todo.Num() && Done.Num() < 80; ++Index)
+			{
+				if (Done.Contains(Todo[Index]))
+				{
+					continue;
+				}
+				Done.Add(Todo[Index]);
+				TSet<UClass*> Queue;
+				DumpWidgetClass(Todo[Index], Out, Queue);
+				for (UClass* Nested : Queue)
+				{
+					Todo.AddUnique(Nested);
+				}
+			}
+			const FString File = FPaths::ProjectSavedDir() / TEXT("AreaActionsUIProbe.txt");
+			Self.Check(FFileHelper::SaveStringArrayToFile(Out, *File), FString::Printf(TEXT("%d classes, %d lines written to %s"), Done.Num(), Out.Num(), *File));
+			return EStep::Next;
+		});
+	}
+
 	// AA-092 (1): "No Build Cost": the window says the cost does not come back and has OK and Cancel only; Cancel leaves the world, OK
 	// dismantles with the contents in the crates (as DismantleNoCost)
 	void AddDismantleNoCostWindow(FRun& R)
@@ -6814,6 +6979,11 @@ namespace
 		if (R.Scenario == TEXT("PreviewHolograms300"))
 		{
 			AddPreviewHolograms300(R);
+			return true;
+		}
+		if (R.Scenario == TEXT("UIProbe"))
+		{
+			AddUIProbe(R);
 			return true;
 		}
 		if (R.Scenario == TEXT("PreviewBoxProbe"))
