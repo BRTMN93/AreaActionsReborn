@@ -251,8 +251,11 @@ namespace AreaActionsUI
 		Box->AddChildToVerticalBox(Title)->SetPadding(FMargin(4.0f, 0.0f, 4.0f, 4.0f));
 		UImage* Line = Tree->ConstructWidget<UImage>();
 		Line->SetColorAndOpacity(Orange);
-		Line->SetDesiredSizeOverride(FVector2D(1.0, 2.0));
-		Box->AddChildToVerticalBox(Line)->SetPadding(FMargin(0.0f, 0.0f, 0.0f, 6.0f));
+		// The image's own desired size override does not hold in the game (a 32 px bar): the size box keeps the line thin
+		USizeBox* LineSize = Tree->ConstructWidget<USizeBox>();
+		LineSize->SetHeightOverride(2.0f);
+		LineSize->AddChild(Line);
+		Box->AddChildToVerticalBox(LineSize)->SetPadding(FMargin(0.0f, 0.0f, 0.0f, 6.0f));
 		return Box;
 	}
 

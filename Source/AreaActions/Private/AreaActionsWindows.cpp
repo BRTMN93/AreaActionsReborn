@@ -266,10 +266,27 @@ double UAreaActionsPlaceWindow::GetNumber(FName Name) const
 
 void UAreaActionsPlaceWindow::SetNumber(FName Name, double Value)
 {
-	const FField* Field = Fields.Find(Name);
-	if (UEditableText* Text = Field ? InnerText(Field->Box) : nullptr)
+	FField* Field = Fields.Find(Name);
+	if (!Field)
+	{
+		return;
+	}
+	Field->Shown = Value;
+	if (UEditableText* Text = InnerText(Field->Box))
 	{
 		Text->SetText(Number(Value, Field->bFloat));
+		// The game's input box draws its own text block (InputText), which follows the edit box only as the player types
+		Text->OnTextChanged.Broadcast(Text->GetText());
+	}
+}
+
+void UAreaActionsPlaceWindow::NativeConstruct()
+{
+	Super::NativeConstruct();
+	// The game's input boxes empty their text when they are constructed, after BuildContent filled them: their values again
+	for (TPair<FName, FField>& Entry : Fields)
+	{
+		SetNumber(Entry.Key, Entry.Value.Shown);
 	}
 }
 
@@ -489,7 +506,7 @@ UWidget* UAreaActionsFillWindow::BuildContent()
 	Count.bFloat = false;
 	Count.Default = 1.0;
 	Count.bAllowZero = false;
-	UVerticalBox* Amount = Column(LOCTEXT("FillAmount", "Copies (minus: the other way)"), false);
+	UVerticalBox* Amount = Column(LOCTEXT("FillAmount", "Copies (minus: back)"), false);
 	Add(Amount, TEXT("XAmount"), TEXT("X"), Red, Count);
 	Add(Amount, TEXT("YAmount"), TEXT("Y"), Green, Count);
 	Add(Amount, TEXT("ZAmount"), TEXT("Z"), Blue, Count);

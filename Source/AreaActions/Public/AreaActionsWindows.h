@@ -93,9 +93,12 @@ protected:
 		double Min = -1.0e9;
 		double Max = 1.0e9;
 		bool bAllowZero = true;
+		// The value last set, put back when the window is constructed
+		double Shown = 0.0;
 	};
 
 	virtual void Canceled() override { WidgetCanceled.Broadcast(); }
+	virtual void NativeConstruct() override;
 	// A labelled field (the label in the axis's colour when it is an axis)
 	UWidget* MakeField(FName Name, const FText& Label, const FLinearColor& LabelColor, const FField& Field);
 	UWidget* MakeCostAndDistance();

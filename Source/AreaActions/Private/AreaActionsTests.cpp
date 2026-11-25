@@ -1410,6 +1410,8 @@ namespace
 
 	// What the player answers first: the game's popup (a question shows its content, the mod's answers), else the newest of the
 	// tool's windows (its Widgets stack)
+	UUserWidget* TopToolWindow(const FRun& R);
+
 	UUserWidget* TopWindow(const FRun& R)
 	{
 		if (UFGPopupWidget* Popup = ShownPopup(R))
@@ -1417,6 +1419,12 @@ namespace
 			UUserWidget* Content = Cast<UUserWidget>(ObjectValue(Popup, TEXT("mContent")));
 			return Cast<UAreaActionsChoiceContent>(Content) ? Content : Popup;
 		}
+		return TopToolWindow(R);
+	}
+
+	// The newest of the tool's own windows (its Widgets stack)
+	UUserWidget* TopToolWindow(const FRun& R)
+	{
 		AAreaActionsEquipment* Tool = GetTool(R);
 		FArrayProperty* Property = Tool ? FindFProperty<FArrayProperty>(Tool->GetClass(), TEXT("Widgets")) : nullptr;
 		if (!Property)
@@ -6576,6 +6584,93 @@ namespace
 		}
 	}
 
+	// AA-084: every window of the tool and the game's popups it uses, as the player sees them, for the comparison with the game's own
+	// windows (screenshots with the UI, <Saved>/Screenshots/AAWindow_<width>x<height>_<name>.png); at a question, with no window of the
+	// tool open, the mouse cursor shows
+	void AddWindowShots(FRun& R)
+	{
+		auto Shot = [&R](const TCHAR* Name)
+		{
+			R.Steps.Add(WaitFrames(20));
+			R.Steps.Add([Name](FRun& Self)
+			{
+				FVector2D Size = FVector2D::ZeroVector;
+				if (GEngine && GEngine->GameViewport)
+				{
+					GEngine->GameViewport->GetViewportSize(Size);
+				}
+				const FString File = FPaths::Combine(FPaths::ProjectSavedDir(), TEXT("Screenshots"), FString::Printf(TEXT("AAWindow_%.0fx%.0f_%s.png"), Size.X, Size.Y, Name));
+				FScreenshotRequest::RequestScreenshot(File, true, false);
+				Self.Step(FString::Printf(TEXT("screenshot %s"), *File));
+				return EStep::Next;
+			});
+			R.Steps.Add(WaitFrames(10));
+		};
+		FSceneRef S = MakeShared<FScene>();
+		AddScene(R, S, 4000.0, [](FRun& Self, FScene& Scene)
+		{
+			MakeAvailable(Self, Asset::IronRod);
+			for (int32 Index = 0; Index < 3; ++Index)
+			{
+				Scene.Inside.Add(SpawnMachine(Self, Asset::Constructor, Scene.Slot(Index), Asset::IronPlate, 10, 5));
+			}
+			Scene.Inside.Add(SpawnStorage(Self, Scene.Slot(3), 20, 0));
+			AddControlMachines(Self, Scene, Asset::IronPlate, 4, 2);
+		});
+		Shot(TEXT("status"));
+		// The first menu shows the help by itself; Done hides it (the test's own settings file)
+		AddOpenMenu(R);
+		Shot(TEXT("menu_help"));
+		R.Steps.Add([](FRun& Self)
+		{
+			UAreaActionsPopupBase* Popup = GetPopup(Self);
+			for (int32 Step = 0; Step < 20 && TutorialShown(Self); ++Step)
+			{
+				PressButton(Popup, TEXT("TutorialNext"));
+			}
+			Self.Check(!TutorialShown(Self), TEXT("help done"));
+			return EStep::Next;
+		});
+		Shot(TEXT("menu"));
+		AddCloseMenu(R);
+		AddOpenAction(R, TEXT("SetRecipe"));
+		AddCheckRecipeWindowLayout(R);
+		Shot(TEXT("setrecipe"));
+		AddCloseWithX(R, TEXT("Widget_SetRecipe"));
+		AddOpenAction(R, TEXT("Copy"));
+		AddOnWindow(R, TEXT("Widget_Copy"), [](FRun& Self, UUserWidget* Window) {});
+		R.Steps.Add(WaitFrames(5));
+		R.Steps.Add([](FRun& Self)
+		{
+			// What the game's input box draws (its InputText), not only what its edit box holds
+			UUserWidget* Box = TopWindow(Self) ? Cast<UUserWidget>(TopWindow(Self)->GetWidgetFromName(TEXT("XNumberBox"))) : nullptr;
+			const UTextBlock* Drawn = Box ? Cast<UTextBlock>(ObjectValue(Box, TEXT("InputText"))) : nullptr;
+			const FString Text = Drawn ? Drawn->GetText().ToString() : FString(TEXT("-"));
+			Self.Check(Text == TEXT("0"), FString::Printf(TEXT("Copy's X field shows '%s' (want '0')"), *Text));
+			return EStep::Next;
+		});
+		Shot(TEXT("copy"));
+		AddCloseWithX(R, TEXT("Widget_Copy"));
+		AddOpenAction(R, TEXT("Fill"));
+		AddOnWindow(R, TEXT("Widget_Fill"), [](FRun& Self, UUserWidget* Window) {});
+		Shot(TEXT("fill"));
+		AddCloseWithX(R, TEXT("Widget_Fill"));
+		AddOpenAction(R, TEXT("MassDismantle"));
+		AddOnWindow(R, TEXT("Widget_MessageYesNo"), [](FRun& Self, UUserWidget* Window)
+		{
+			const APlayerController* Player = Self.GetPlayer();
+			Self.Check(Player && Player->bShowMouseCursor && !TopToolWindow(Self), FString::Printf(TEXT("question with no window of the tool: mouse cursor shown %d"),
+				Player ? Player->bShowMouseCursor : -1));
+		});
+		Shot(TEXT("question"));
+		AddPress(R, TEXT("Widget_MessageYesNo"), TEXT("CancelButton"));
+		AddOpenAction(R, TEXT("SetRecipe"));
+		AddPickRecipe(R, Asset::IronRod);
+		AddOnWindow(R, TEXT("Widget_MessageOk"), [](FRun& Self, UUserWidget* Window) {});
+		Shot(TEXT("message"));
+		AddResultWindow(R, S);
+	}
+
 	void AddUIProbe(FRun& R)
 	{
 		R.Steps.Add([](FRun& Self)
@@ -7035,6 +7130,11 @@ namespace
 		if (R.Scenario == TEXT("PreviewHolograms300"))
 		{
 			AddPreviewHolograms300(R);
+			return true;
+		}
+		if (R.Scenario == TEXT("WindowShots"))
+		{
+			AddWindowShots(R);
 			return true;
 		}
 		if (R.Scenario == TEXT("UIProbe"))

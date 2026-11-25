@@ -45,7 +45,7 @@ public:
 protected:
 	virtual UWidget* BuildContent() override;
 	virtual FText GetWindowTitle() const override { return GetTitle(); }
-	virtual FVector2D GetWindowSize() const override { return FVector2D(960.0, 680.0); }
+	virtual FVector2D GetWindowSize() const override { return FVector2D(960.0, 820.0); }
 
 private:
 	void UpdateTutorial();
