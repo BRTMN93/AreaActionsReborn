@@ -60,6 +60,9 @@ public:
 
 	// The middle mouse button: the Build Gun takes the recipe of the building under the mouse (actor or lightweight) and goes into the hand
 	void SampleBuilding();
+
+	// The corners in order around the area, so its walls never cross (AA-074); true when the order changed
+	bool OrderCorners();
 	// The recipe that builds the building's class: the one it was built with when the player has it, otherwise one of the Build Gun's
 	static TSubclassOf<UFGRecipe> FindBuildRecipe(UWorld* World, const AreaActionsBuildings::FSnapshot& Building, TSubclassOf<UObject> BuildGun);
 

@@ -160,6 +160,17 @@ void AAreaActionsEquipment::ProcessEvent(UFunction* Function, void* Parameters)
 		}
 		return;
 	}
+	// The Blueprint's InputKey LeftMouseButton places or deletes a corner at the end of the list, and its walls join the corners in that
+	// order: corners placed out of order around the area crossed into an X (AA-074). The corners are put in order around their centre.
+	if (Name.ToString().StartsWith(TEXT("InpActEvt_LeftMouseButton")))
+	{
+		Super::ProcessEvent(Function, Parameters);
+		if (bEquippedLocally)
+		{
+			OrderCorners();
+		}
+		return;
+	}
 	if (Name == TickName)
 	{
 		if (!bEquippedLocally && bEquipPending && IsEquipped() && IsLocalInstigator())
@@ -368,4 +379,61 @@ void AAreaActionsEquipment::SelectBuilding()
 	MaxZ->SetPropertyValue_InContainer(this, High);
 	ProcessEvent(UpdateIndicators, nullptr);
 	UE_LOG(LogAreaActionsCpp, Display, TEXT("SelectBuilding: %s, %d corners, Z %.0f..%.0f"), *GetNameSafe(Building.Class), Flat.Num(), Low, High);
+}
+
+bool AAreaActionsEquipment::OrderCorners()
+{
+	FArrayProperty* Corners = FindFProperty<FArrayProperty>(GetClass(), TEXT("CornerLocations"));
+	FDoubleProperty* MinZ = FindFProperty<FDoubleProperty>(GetClass(), TEXT("MinZ"));
+	FDoubleProperty* MaxZ = FindFProperty<FDoubleProperty>(GetClass(), TEXT("MaxZ"));
+	UFunction* Clear = FindFunction(TEXT("Clear"));
+	UFunction* UpdateIndicators = FindFunction(TEXT("UpdateIndicators"));
+	const FStructProperty* Inner = Corners ? CastField<FStructProperty>(Corners->Inner) : nullptr;
+	if (!Inner || Inner->Struct != TBaseStructure<FVector>::Get() || !MinZ || !MaxZ || !Clear || Clear->ParmsSize || !UpdateIndicators || UpdateIndicators->ParmsSize)
+	{
+		return false;
+	}
+	TArray<FVector>& List = *Corners->ContainerPtrToValuePtr<TArray<FVector>>(this);
+	if (List.Num() < 4)
+	{
+		// Three corners or fewer never cross
+		return false;
+	}
+	// Sorted by angle around a point inside them the corners make a polygon whose edges never cross (a star-shaped one)
+	FVector2D Centre = FVector2D::ZeroVector;
+	for (const FVector& Corner : List)
+	{
+		Centre += FVector2D(Corner);
+	}
+	Centre /= List.Num();
+	TArray<FVector> Ordered = List;
+	Ordered.StableSort([&Centre](const FVector& A, const FVector& B)
+	{
+		return FMath::Atan2(A.Y - Centre.Y, A.X - Centre.X) < FMath::Atan2(B.Y - Centre.Y, B.X - Centre.X);
+	});
+	// The same cycle from another start or the other way round needs no change
+	const int32 Count = List.Num();
+	const int32 Start = Ordered.IndexOfByKey(List[0]);
+	bool bSame = Start != INDEX_NONE;
+	for (int32 Step : {1, -1})
+	{
+		bSame = Start != INDEX_NONE;
+		for (int32 I = 0; bSame && I < Count; ++I)
+		{
+			bSame = List[I] == Ordered[((Start + Step * I) % Count + Count) % Count];
+		}
+		if (bSame)
+		{
+			return false;
+		}
+	}
+	// As SelectBuilding: the Blueprint's Clear takes the indicators and the height limits away, UpdateIndicators draws them again
+	const double Low = MinZ->GetPropertyValue_InContainer(this), High = MaxZ->GetPropertyValue_InContainer(this);
+	ProcessEvent(Clear, nullptr);
+	*Corners->ContainerPtrToValuePtr<TArray<FVector>>(this) = Ordered;
+	MinZ->SetPropertyValue_InContainer(this, Low);
+	MaxZ->SetPropertyValue_InContainer(this, High);
+	ProcessEvent(UpdateIndicators, nullptr);
+	UE_LOG(LogAreaActionsCpp, Display, TEXT("Corners put in order around the area: %d"), Count);
+	return true;
 }

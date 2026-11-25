@@ -847,17 +847,64 @@ namespace
 		});
 	}
 
-	// Three corners around a point in front of the player, clicked in the corner mode
+	// Corners around a point in front of the player at the given angles (degrees, in click order), clicked in the corner mode
+	void AddClickCorners(FRun& R, const TArray<double>& Angles);
+
 	void AddThreeCorners(FRun& R)
 	{
+		AddClickCorners(R, {0.0, 120.0, 240.0});
+	}
+
+	// AA-074: corners clicked out of order around the area (a square's corners, opposite ones one after the other) used to join into an
+	// X; the tool puts them in order, so no two walls cross
+	void AddCornersOrder(FRun& R)
+	{
+		AddEquipTool(R);
+		AddClickCorners(R, {45.0, 225.0, 135.0, 315.0});
+		R.Steps.Add(WaitFrames(3));
+		R.Steps.Add([](FRun& Self)
+		{
+			AAreaActionsEquipment* Tool = GetTool(Self);
+			const FArrayProperty* Property = Tool ? FindFProperty<FArrayProperty>(Tool->GetClass(), TEXT("CornerLocations")) : nullptr;
+			const TArray<FVector> Corners = Property ? *Property->ContainerPtrToValuePtr<TArray<FVector>>(Tool) : TArray<FVector>();
+			Self.Check(Corners.Num() == 4, FString::Printf(TEXT("corners after 4 clicks: %d"), Corners.Num()));
+			Self.Check(ArrayNum(Tool, TEXT("AreaWalls")) == 4 && ArrayNum(Tool, TEXT("CornerIndicators")) == 4,
+				FString::Printf(TEXT("walls %d, corner indicators %d (want 4 and 4)"), ArrayNum(Tool, TEXT("AreaWalls")), ArrayNum(Tool, TEXT("CornerIndicators"))));
+			int32 Crossings = 0;
+			const int32 N = Corners.Num();
+			for (int32 I = 0; I < N; ++I)
+			{
+				for (int32 J = I + 2; J < N; ++J)
+				{
+					if ((J + 1) % N == I)
+					{
+						continue;
+					}
+					FVector Cross;
+					const FVector A(FVector2D(Corners[I]), 0.0), B(FVector2D(Corners[(I + 1) % N]), 0.0), C(FVector2D(Corners[J]), 0.0), D(FVector2D(Corners[(J + 1) % N]), 0.0);
+					Crossings += FMath::SegmentIntersection2D(A, B, C, D, Cross) ? 1 : 0;
+				}
+			}
+			FString Order;
+			for (const FVector& Corner : Corners)
+			{
+				Order += Corner.ToCompactString() + TEXT(" ");
+			}
+			Self.Check(Crossings == 0, FString::Printf(TEXT("walls that cross: %d (want 0), corners %s"), Crossings, *Order));
+			return EStep::Next;
+		});
+	}
+
+	void AddClickCorners(FRun& R, const TArray<double>& Angles)
+	{
 		TSharedRef<TArray<FVector>> Targets = MakeShared<TArray<FVector>>();
-		R.Steps.Add([Targets](FRun& Self)
+		R.Steps.Add([Targets, Angles](FRun& Self)
 		{
 			APawn* Pawn = Self.GetPlayer()->GetPawn();
 			const FVector Center = Pawn->GetActorLocation() + Pawn->GetActorForwardVector() * 1200.0;
-			for (int32 Index = 0; Index < 3; ++Index)
+			for (const double Angle : Angles)
 			{
-				const FVector Point = Center + FRotator(0, Index * 120.0, 0).RotateVector(FVector(500, 0, 0));
+				const FVector Point = Center + FRotator(0, Angle, 0).RotateVector(FVector(500, 0, 0));
 				FVector Ground;
 				if (!GroundBelow(Self.GetWorld(), Point, Ground))
 				{
@@ -869,7 +916,7 @@ namespace
 			Self.Check(SelectState(GetTool(Self), TEXT("NewEnumerator1")), TEXT("corner mode set"));
 			return EStep::Next;
 		});
-		for (int32 Index = 0; Index < 3; ++Index)
+		for (int32 Index = 0; Index < Angles.Num(); ++Index)
 		{
 			R.Steps.Add([Targets, Index](FRun& Self)
 			{
@@ -6833,6 +6880,11 @@ namespace
 		if (R.Scenario == TEXT("Corners"))
 		{
 			AddCorners(R);
+			return true;
+		}
+		if (R.Scenario == TEXT("CornersOrder"))
+		{
+			AddCornersOrder(R);
 			return true;
 		}
 		if (R.Scenario == TEXT("SelectBuilding"))
