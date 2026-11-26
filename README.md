@@ -1,5 +1,7 @@
 # Area Actions Reborn
 
+![Area Actions Reborn: a marked area with factories and a dashed copy next to it](Images/banner.png)
+
 A mod for Satisfactory 1.x. Mark an area with the Area Actions tool and run one action on everything in it:
 
 - **Set Recipe**: one recipe for every machine in the area that accepts it.
@@ -46,6 +48,6 @@ The module has a test mode for development: the game started with `-AATest=<Scen
 
 ## Credits and licence
 
-Original mod: Mircea Roata. Port to Satisfactory 1.x: BRTMN.
+Original mod: Mircea Roata. Port to Satisfactory 1.x: BRTMN. The icon is based on the icon of the original Area Actions.
 
 GPL-3.0, see [LICENSE](LICENSE).
