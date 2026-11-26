@@ -33,6 +33,12 @@ namespace
 	{
 		return FMath::IsFinite(Value.X) && FMath::IsFinite(Value.Y) && FMath::IsFinite(Value.Z) && Value.GetAbsMax() <= Limit;
 	}
+
+	// Without Abs: the smallest int has no positive twin and would pass as itself
+	bool IsCount(int32 Value)
+	{
+		return Value >= -MaxAmount && Value <= MaxAmount;
+	}
 }
 
 int32 UAreaActionsRCO::RejectCount = 0;
@@ -203,7 +209,7 @@ void UAreaActionsRCO::ServerPlaceCopies_Implementation(int32 RequestId, const FA
 	}
 	const bool bNumbers = IsBounded(Placement.Delta, 2.0 * MaxCoordinate) && IsBounded(Placement.RotationCenter, 2.0 * MaxCoordinate) && FMath::IsFinite(Placement.Yaw)
 		&& IsBounded(Placement.Border, MaxGap) && IsBounded(FVector(Placement.Ramp, 0.0), MaxGap)
-		&& FMath::Abs(Placement.Amount.X) <= MaxAmount && FMath::Abs(Placement.Amount.Y) <= MaxAmount && FMath::Abs(Placement.Amount.Z) <= MaxAmount
+		&& IsCount(Placement.Amount.X) && IsCount(Placement.Amount.Y) && IsCount(Placement.Amount.Z)
 		// The Fill window never sends a count of 0; a request with one would plan nothing through loops as large as its other counts
 		&& (!Placement.bFill || (Placement.Amount.X != 0 && Placement.Amount.Y != 0 && Placement.Amount.Z != 0));
 	if (!bNumbers)

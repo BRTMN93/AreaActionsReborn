@@ -4,6 +4,7 @@
 #include "AreaActionsLog.h"
 #include "Buildables/FGBuildable.h"
 #include "Buildables/FGBuildableConveyorBase.h"
+#include "Buildables/FGBuildableHubTerminal.h"
 #include "Buildables/FGBuildableManufacturer.h"
 #include "Buildables/FGBuildablePipeBase.h"
 #include "Buildables/FGBuildablePipeHyper.h"
@@ -61,7 +62,9 @@ namespace AreaActionsBuildings
 			Out.BuiltWith = Actor->GetBuiltWithRecipe();
 			Out.Customization = Actor->GetCustomizationData_Native();
 			Out.Actor = Actor;
-			Out.bIgnored = ShouldIgnore(Out.Class);
+			// A part of an ignored building is ignored with it (the HUB's bench, storage and burners are buildings of their own)
+			const AActor* Parent = Actor->GetParentBuildableActor();
+			Out.bIgnored = ShouldIgnore(Out.Class) || (Parent && ShouldIgnore(Parent->GetClass()));
 			if (const AFGBuildableManufacturer* Machine = Cast<AFGBuildableManufacturer>(Actor))
 			{
 				Out.MachineRecipe = Machine->GetCurrentRecipe();
@@ -97,7 +100,7 @@ namespace AreaActionsBuildings
 			AFGBuildablePoleStackable::StaticClass(), AFGPipeHyperStart::StaticClass(), AFGBuildableResourceExtractor::StaticClass(),
 			AFGBuildablePipeHyperAttachment::StaticClass(),
 			// The game allows one of each; its Build Gun refuses a second, a spawned copy would not be refused
-			AFGBuildableTradingPost::StaticClass(), AFGBuildableSpaceElevator::StaticClass() };
+			AFGBuildableTradingPost::StaticClass(), AFGBuildableHubTerminal::StaticClass(), AFGBuildableSpaceElevator::StaticClass() };
 		for (const UClass* Each : Skipped)
 		{
 			if (Class && Class->IsChildOf(Each))
@@ -399,7 +402,8 @@ namespace AreaActionsBuildings
 		FillSteps(Placement.Amount.Y, StepsY);
 		FillSteps(Placement.Amount.Z, StepsZ);
 		// A count of 0 asks for nothing; without this the two other loops would still run in full around an empty one
-		if (StepsX.IsEmpty() || StepsY.IsEmpty() || StepsZ.IsEmpty())
+		// The same for an area with nothing to copy (belts or poles alone): no copy would ever reach the limit that ends the loops
+		if (StepsX.IsEmpty() || StepsY.IsEmpty() || StepsZ.IsEmpty() || !Buildings.ContainsByPredicate([](const FSnapshot& Each) { return !Each.bIgnored; }))
 		{
 			return;
 		}

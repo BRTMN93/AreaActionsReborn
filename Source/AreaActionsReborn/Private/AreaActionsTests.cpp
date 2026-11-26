@@ -46,6 +46,9 @@
 #include "AkComponent.h"
 #include "UI/FGInteractWidget.h"
 #include "FGHUD.h"
+#include "FGHUDBase.h"
+#include "UI/FGBaseUI.h"
+#include "UI/FGPopupWidget.h"
 #include "UI/FGGameUI.h"
 #include "FGItemPickup_Spawnable.h"
 #include "FGRecipe.h"
@@ -132,6 +135,10 @@ namespace
 		double AwaitStarted = 0.0;
 		FString LoadSave;
 		bool bLoadIssued = false;
+		// The longest the way through the menu into the next world may take
+		double AwaitTimeoutSec = 180.0;
+		// Runs every tick in the main menu before the load is issued, until it returns true (ThreeLoads: what is left of the last world)
+		TFunction<bool(FRun&, UWorld*)> OnMenu;
 
 		void Step(const FString& Text) const
 		{
@@ -1579,10 +1586,14 @@ namespace
 	}
 
 	// The result window: its message is kept, OK ends the action
-	void AddResultWindow(FRun& R, const FSceneRef& S)
+	void AddResultWindow(FRun& R, const FSceneRef& S, TFunction<void(FRun&)> OnShown = nullptr)
 	{
-		AddOnWindow(R, TEXT("Widget_MessageOk"), [S](FRun& Self, UUserWidget* Window)
+		AddOnWindow(R, TEXT("Widget_MessageOk"), [S, OnShown](FRun& Self, UUserWidget* Window)
 		{
+			if (OnShown)
+			{
+				OnShown(Self);
+			}
 			S->Message = PopupBody(Window);
 			Self.Step(FString::Printf(TEXT("result message: %s"), *S->Message));
 			Self.Check(PressButton(Window, TEXT("OkButton")), TEXT("button OkButton pressed"));
@@ -2270,13 +2281,51 @@ namespace
 			}
 			return EStep::Next;
 		});
+		// Numbers no window sends: a Fill with a count of 0 next to two of a million, a move that is not a number, a count over the
+		// limit, a refund kind that does not exist
+		R.Steps.Add([S](FRun& Self)
+		{
+			UAreaActionsRCO* Rco = UAreaActionsRCO::Of(Self.GetPlayer());
+			FAreaActionsPlacement ZeroCount;
+			ZeroCount.bFill = true;
+			ZeroCount.Amount = FIntVector(1000000, 1000000, 0);
+			FAreaActionsPlacement NotANumber;
+			NotANumber.Delta.X = NAN;
+			FAreaActionsPlacement OverLimit;
+			OverLimit.bFill = true;
+			OverLimit.Amount = FIntVector(2000000, 1, 1);
+			// The smallest int: its absolute value is itself
+			FAreaActionsPlacement Smallest;
+			Smallest.bFill = true;
+			Smallest.Amount = FIntVector(MIN_int32, 1, 1);
+			Self.Step(TEXT("requests 108 (Fill with a count of 0), 109 (Copy moved by NaN), 110 (Fill with a count of 2,000,000), 111 (refund kind 7), 112 (Fill with the smallest int)"));
+			Rco->ServerPlaceCopies(112, S->Area, Smallest, false, 0.0f);
+			Rco->ServerPlaceCopies(108, S->Area, ZeroCount, false, 0.0f);
+			Rco->ServerPlaceCopies(109, S->Area, NotANumber, false, 0.0f);
+			Rco->ServerPlaceCopies(110, S->Area, OverLimit, false, 0.0f);
+			Rco->ServerDismantle(111, S->Area, static_cast<EAreaActionsDismantleRefund>(7));
+			return EStep::Next;
+		});
+		R.Steps.Add([S](FRun& Self)
+		{
+			if (S->Results.Num() < 12)
+			{
+				return EStep::Wait;
+			}
+			for (int32 Id = 108; Id <= 112; ++Id)
+			{
+				const FAreaActionsResult* Result = S->Results.Find(Id);
+				Self.Check(Result && Result->Code == EAreaActionsResultCode::Rejected, FString::Printf(TEXT("request %d: code %d (Rejected)"), Id, Result ? static_cast<int32>(Result->Code) : -1));
+			}
+			return EStep::Next;
+		});
 		AddChecks(R, [S](FRun& Self)
 		{
 			if (!Self.bClient)
 			{
 				// The reject lines are in the server's log
 				const int32 Rejects = UAreaActionsRCO::RejectCount - S->RejectsBefore;
-				Self.Check(Rejects == 6, FString::Printf(TEXT("reject lines: %d of 6"), Rejects));
+				Self.Check(Rejects == 11, FString::Printf(TEXT("reject lines: %d of 11"), Rejects));
 			}
 			const AFGBuildableManufacturer* Constructor = Machine(*S, 0);
 			Self.Check(Constructor && Constructor->GetCurrentRecipe() == Recipe(Asset::IronPlate) && (Self.bClient || MachineItems(Constructor) == 10), TEXT("Constructor in the area unchanged"));
@@ -3581,11 +3630,16 @@ namespace
 	struct FErrorCounter : public FOutputDevice
 	{
 		int32 Errors = 0;
+		FString Last;
 		FErrorCounter() { GLog->AddOutputDevice(this); }
 		virtual ~FErrorCounter() override { GLog->RemoveOutputDevice(this); }
 		virtual void Serialize(const TCHAR* V, ELogVerbosity::Type Verbosity, const FName& Category) override
 		{
-			Errors += Category == LogAreaActionsCpp.GetCategoryName() && Verbosity == ELogVerbosity::Error ? 1 : 0;
+			if (Category == LogAreaActionsCpp.GetCategoryName() && Verbosity == ELogVerbosity::Error)
+			{
+				++Errors;
+				Last = V;
+			}
 		}
 	};
 
@@ -5651,7 +5705,8 @@ namespace
 	// AA-095: the client fills with build cost, paid from a container next to it; the server builds one copy a frame (budget 0) and the
 	// client leaves on the way. The server builds every copy and takes the cost once. With bRefuse every 10th copy counts as refused by
 	// the game: a copy is paid when it is built (D22), so a refused one costs nothing and no crate is made
-	void AddDisconnectCopy(FRun& R, bool bRefuse)
+	// bOwn: the cost is in the leaving player's own inventory instead (AA-102 point 4): what the server makes of it is written down
+	void AddDisconnectCopy(FRun& R, bool bRefuse, bool bOwn = false)
 	{
 		const int32 Side = 20;
 		const int32 Copies = Side * Side - 1;
@@ -5660,11 +5715,15 @@ namespace
 		FSceneRef S = MakeShared<FScene>();
 		FCopyRef C = MakeShared<FCopyState>();
 		TSharedRef<int32> UnsentBefore = MakeShared<int32>(0);
+		TSharedRef<TWeakObjectPtr<AFGCharacterPlayer>> Leaver = MakeShared<TWeakObjectPtr<AFGCharacterPlayer>>();
 		AddCopyScene(R, S, C, BuildSingle);
-		AddHost(R, [S, C, UnsentBefore, Copies, EveryNth, bRefuse](FRun& Self)
+		AddHost(R, [S, C, UnsentBefore, Leaver, Copies, EveryNth, bRefuse, bOwn](FRun& Self)
 		{
-			// The whole cost and 7 more of each item in the container 15 m behind the player, none in the inventory
-			SetCostSources(Self, *C, CostNone, [Copies](int32 Cost) { return Cost * Copies + 7; }, CostNone, CostNone);
+			// The whole cost and 7 more of each item in the container 15 m behind the player, none in the inventory; with bOwn the
+			// other way round
+			const TFunction<int32(int32)> Whole = [Copies](int32 Cost) { return Cost * Copies + 7; };
+			SetCostSources(Self, *C, bOwn ? Whole : TFunction<int32(int32)>(CostNone), bOwn ? TFunction<int32(int32)>(CostNone) : Whole, CostNone, CostNone);
+			*Leaver = GetCharacter(Self);
 			SnapshotCrates(Self, *S);
 			*UnsentBefore = AAreaActionsServerSubsystem::ResultsWithoutPlayer;
 			SetBudget(0.0f);
@@ -5675,7 +5734,21 @@ namespace
 		AddFillWindow(R, FVector(1, 1, 0), FIntVector(Side, Side, 1), FVector2D(0, 0), true);
 		R.Steps.Add(WaitFrames(10));
 		AddClientLeaves(R, TEXT("in the middle of its Fill job with build cost"));
-		R.Steps.Add([S, C, UnsentBefore, Copies, Refused](FRun& Self)
+		// AA-102 (4): AddClientLeaves has waited 2 s since the player went
+		R.Steps.Add(WaitSeconds(3.0));
+		R.Steps.Add([Leaver](FRun& Self)
+		{
+			int32 Ownerless = 0;
+			for (TActorIterator<AFGCharacterPlayer> It(Self.GetWorld()); It; ++It)
+			{
+				Ownerless += IsValid(*It) && !It->GetController() ? 1 : 0;
+			}
+			const AAreaActionsServerSubsystem* Server = AAreaActionsServerSubsystem::Get(Self.GetWorld());
+			Self.Step(FString::Printf(TEXT("5 s after the client left: its character %s, characters without a controller in the world %d, jobs running %d"),
+				Leaver->IsValid() ? TEXT("is still in the world") : TEXT("is gone"), Ownerless, Server ? Server->NumJobs() : -1));
+			return EStep::Next;
+		});
+		R.Steps.Add([S, C, UnsentBefore, Leaver, Copies, Refused, bOwn](FRun& Self)
 		{
 			const AAreaActionsServerSubsystem* Server = AAreaActionsServerSubsystem::Get(Self.GetWorld());
 			if (Server && Server->NumJobs() > 0)
@@ -5687,6 +5760,27 @@ namespace
 			const int32 Lightweights = LightweightCount(Self.GetWorld());
 			const int32 Finished = AAreaActionsServerSubsystem::FinishedJobs - C->JobsBefore;
 			const int32 Unsent = AAreaActionsServerSubsystem::ResultsWithoutPlayer - *UnsentBefore;
+			const int32 Built = Lightweights - C->LightweightsBefore;
+			Self.Step(FString::Printf(TEXT("copies after the player left: built %d of %d planned, not built %d (%d of them refused by the test); the leaver's character %s"), Built, Copies,
+				Copies - Built, Refused, Leaver->IsValid() ? TEXT("is still in the world") : TEXT("is gone")));
+			if (bOwn)
+			{
+				// The cost was the leaver's own: every copy that stands was paid from that inventory, to the item, and nothing else paid
+				UFGInventoryComponent* Inventory = Leaver->IsValid() ? (*Leaver)->GetInventory() : nullptr;
+				Self.Check(Finished == 1 && Unsent == 1 && Built >= 0 && Built <= Copies, FString::Printf(TEXT("the Fill ended after the player left: built %d of %d, AAJOB lines %d (want 1), results with no player to go to %d (want 1)"),
+					Built, Copies, Finished, Unsent));
+				for (const TPair<TSubclassOf<UFGItemDescriptor>, int32>& Entry : C->Cost)
+				{
+					const int32 Own = Inventory ? Inventory->GetNumItems(Entry.Key) : -1;
+					const int32 WantOwn = C->Inventory.FindRef(Entry.Key) - Entry.Value * Built;
+					const bool bOthersKept = StorageCount(C->NearBox, Entry.Key) == C->Near.FindRef(Entry.Key) && StorageCount(C->FarBox, Entry.Key) == C->Far.FindRef(Entry.Key)
+						&& DepotCount(Self.GetWorld(), Entry.Key) == C->Depot.FindRef(Entry.Key);
+					// Without the character its inventory cannot be read: then only the copies say what happened (the Step line above)
+					Self.Check(bOthersKept && (!Inventory || Own == WantOwn), FString::Printf(TEXT("paid from the leaver's inventory: %s there %d (want %d, -1: the inventory is gone), other sources untouched %d"),
+						*GetNameSafe(Entry.Key), Own, WantOwn, bOthersKept));
+				}
+				return EStep::Next;
+			}
 			Self.Check(Lightweights == C->LightweightsBefore + Copies - Refused && Finished == 1 && Unsent == 1,
 				FString::Printf(TEXT("the Fill ran to its end after the player left: lightweights %d (want %d), AAJOB lines %d (want 1), results with no player to go to %d (want 1)"),
 					Lightweights, C->LightweightsBefore + Copies - Refused, Finished, Unsent));
@@ -7097,8 +7191,662 @@ namespace
 		});
 	}
 
+	// --- The release gate (AA-080): questions the game does not show, a paid Fill, three loads, a big save ---
+
+	// The scene of the question scenarios: a Truck Station and a Freight Platform that load, and the control stations
+	void BuildLoadingStations(FRun& R, FScene& S)
+	{
+		S.Inside.Add(SpawnBuildable(R, Asset::TruckStation, S.Slot(0)));
+		S.Inside.Add(SpawnBuildable(R, Asset::FreightPlatform, S.Slot(6)));
+		for (const TWeakObjectPtr<AFGBuildable>& Station : S.Inside)
+		{
+			SetLoadMode(R.bClient ? nullptr : Station.Get(), true);
+		}
+		AddControlStations(R, S);
+	}
+
+	void CheckStationsStillLoad(FRun& R, const FScene& S)
+	{
+		for (const TWeakObjectPtr<AFGBuildable>& Station : S.Inside)
+		{
+			R.Check(Station.IsValid() && LoadMode(Station.Get()), FString::Printf(TEXT("%s still loads"), *GetNameSafe(Station.Get())));
+		}
+		CheckControlStations(R, S);
+	}
+
+	// AA-104 (1): a question the game never takes (forced here) ends its action after 2 s with one error line that names it; the next
+	// question works as before
+	void AddChoiceNotShown(FRun& R)
+	{
+		struct FState { TUniquePtr<FErrorCounter> Counter; double Clicked = 0.0; bool bStarted = false; };
+		FSceneRef S = MakeShared<FScene>();
+		TSharedRef<FState> State = MakeShared<FState>();
+		AddScene(R, S, 4000.0, BuildLoadingStations);
+		R.Steps.Add([State](FRun& Self)
+		{
+			UAreaActionsChoiceContent::bDropForTest = true;
+			State->Counter = MakeUnique<FErrorCounter>();
+			return EStep::Next;
+		});
+		AddOpenAction(R, TEXT("SetStationLoadUnload"));
+		R.Steps.Add([S, State](FRun& Self)
+		{
+			State->Clicked = State->Clicked > 0.0 ? State->Clicked : Self.Now();
+			State->bStarted |= ActiveAction(Self) != nullptr;
+			const double Waited = Self.Now() - State->Clicked;
+			if (Waited < 1.0 || (ActiveAction(Self) && Waited < 10.0))
+			{
+				return EStep::Wait;
+			}
+			UAreaActionsChoiceContent::bDropForTest = false;
+			GLog->Flush();
+			Self.Check(State->bStarted && !ActiveAction(Self) && Waited >= 1.5 && Waited <= 5.0,
+				FString::Printf(TEXT("the action started (%d) and ended %.1f s after the click (the wait for a question is 2 s)"), State->bStarted, Waited));
+			Self.Check(State->Counter->Errors == 1 && State->Counter->Last.Contains(TEXT("the question '")) && State->Counter->Last.Contains(TEXT("did not show")),
+				FString::Printf(TEXT("error lines of the mod: %d (want 1), the last: %s"), State->Counter->Errors, *State->Counter->Last));
+			State->Counter.Reset();
+			Self.Check(!TopWindow(Self), FString::Printf(TEXT("no window on screen (%s)"), *GetNameSafe(TopWindow(Self))));
+			CheckStationsStillLoad(Self, *S);
+			return EStep::Next;
+		});
+		AddStationPass(R, S, false);
+	}
+
+	// The game's popups of Player that wait behind the one on screen and have this text
+	int32 QueuedPopups(APlayerController* Player, const FString& Body)
+	{
+		AFGHUDBase* Hud = Player ? Cast<AFGHUDBase>(Player->GetHUD()) : nullptr;
+		UFGBaseUI* BaseUI = Hud ? Hud->GetBaseUI() : nullptr;
+		const FArrayProperty* Queue = FindFProperty<FArrayProperty>(UFGBaseUI::StaticClass(), TEXT("mPopupDataQueue"));
+		const FStructProperty* Entry = Queue ? CastField<FStructProperty>(Queue->Inner) : nullptr;
+		if (!BaseUI || !Entry || Entry->Struct != FPopupData::StaticStruct())
+		{
+			return -1;
+		}
+		int32 Count = 0;
+		FScriptArrayHelper Waiting(Queue, Queue->ContainerPtrToValuePtr<void>(BaseUI));
+		for (int32 Index = 0; Index < Waiting.Num(); ++Index)
+		{
+			Count += reinterpret_cast<const FPopupData*>(Waiting.GetRawPtr(Index))->Body.ToString() == Body ? 1 : 0;
+		}
+		return Count;
+	}
+
+	// AA-104 (2): a popup of the game waits behind the mod's question; answering the question must not close it
+	void AddChoiceBehindGamePopup(FRun& R)
+	{
+		static const TCHAR* const GameBody = TEXT("AATest: a popup of the game");
+		FSceneRef S = MakeShared<FScene>();
+		AddScene(R, S, 4000.0, BuildLoadingStations);
+		AddOpenAction(R, TEXT("SetStationLoadUnload"));
+		AddOnWindow(R, TEXT("Widget_MessageYesNo"), [](FRun& Self, UUserWidget* Window)
+		{
+			UFGBlueprintFunctionLibrary::AddPopupWithCloseDelegate(Self.GetPlayer(), FText::FromString(TEXT("AATest")), FText::FromString(GameBody), FPopupClosed(), PID_OK);
+			Self.Step(TEXT("a popup of the game added while the question is on screen"));
+		});
+		R.Steps.Add(WaitFrames(10));
+		AddOnWindow(R, TEXT("Widget_MessageYesNo"), [](FRun& Self, UUserWidget* Window)
+		{
+			const int32 Queued = QueuedPopups(Self.GetPlayer(), GameBody);
+			Self.Check(Queued == 1, FString::Printf(TEXT("the question is still on screen, the game's popup waits behind it: %d in the queue (want 1)"), Queued));
+			Self.Check(PressButton(Window, TEXT("CancelButton")), TEXT("the question's Cancel pressed"));
+		});
+		R.Steps.Add([S, Since = MakeShared<double>(0.0)](FRun& Self)
+		{
+			*Since = *Since > 0.0 ? *Since : Self.Now();
+			const UFGPopupWidget* Popup = ShownPopup(Self);
+			const bool bShown = Popup && PopupBody(Popup) == GameBody;
+			if ((ActiveAction(Self) || !bShown) && Self.Now() - *Since < 5.0)
+			{
+				return EStep::Wait;
+			}
+			const int32 Queued = QueuedPopups(Self.GetPlayer(), GameBody);
+			Self.Check(!ActiveAction(Self), TEXT("the action ended with Cancel"));
+			Self.Check(bShown || Queued == 1, FString::Printf(TEXT("the game's popup after the answer: on screen %d, in the queue %d (popup %s: '%s')"), bShown, Queued,
+				*GetNameSafe(Popup), *PopupBody(Popup)));
+			CheckStationsStillLoad(Self, *S);
+			return EStep::Next;
+		});
+		AddOnWindow(R, TEXT("Widget_MessageOk"), [](FRun& Self, UUserWidget* Window)
+		{
+			Self.Check(PopupBody(Window) == GameBody && PressButton(Window, TEXT("OkButton")), TEXT("the game's popup closed with its own button"));
+		});
+		R.Steps.Add([](FRun& Self)
+		{
+			if (TopWindow(Self))
+			{
+				return EStep::Wait;
+			}
+			Self.Check(true, TEXT("no popup left"));
+			return EStep::Next;
+		});
+	}
+
+	// AA-104 (3): back to the menu with the question open, the save loaded again: no question, no error; then the game closes with a
+	// question open (the run script reports whether it closed by itself)
+	void AddChoiceOnQuit(FRun& R)
+	{
+		static const TCHAR* const SaveName = TEXT("AATest_ChoiceOnQuit");
+		FSceneRef S = MakeShared<FScene>();
+		TSharedRef<TUniquePtr<FErrorCounter>> Counter = MakeShared<TUniquePtr<FErrorCounter>>();
+		AddScene(R, S, 4000.0, BuildLoadingStations);
+		R.Steps.Add([Counter](FRun& Self)
+		{
+			*Counter = MakeUnique<FErrorCounter>();
+			return EStep::Next;
+		});
+		AddOpenAction(R, TEXT("SetStationLoadUnload"));
+		AddOnWindow(R, TEXT("Widget_MessageYesNo"), [](FRun& Self, UUserWidget* Window)
+		{
+			Self.Check(true, TEXT("the question is on screen; saving and leaving for the menu"));
+		});
+		AddSaveAndLoad(R, SaveName);
+		R.Steps.Add([](FRun& Self) { return GetCharacter(Self) ? EStep::Next : EStep::Wait; });
+		R.Steps.Add(WaitSeconds(3.0));
+		R.Steps.Add([Counter](FRun& Self)
+		{
+			int32 Shown = 0, Alive = 0;
+			for (TObjectIterator<UAreaActionsChoiceContent> It; It; ++It)
+			{
+				Alive += It->IsTemplate() ? 0 : 1;
+				Shown += !It->IsTemplate() && IsShown(*It) ? 1 : 0;
+			}
+			GLog->Flush();
+			Self.Check(!ShownPopup(Self) && Shown == 0 && !ActiveAction(Self), FString::Printf(TEXT("loaded: popup %s, questions on screen %d (objects not collected yet %d), action %s"),
+				*GetNameSafe(ShownPopup(Self)), Shown, Alive, *GetNameSafe(ActiveAction(Self))));
+			Self.Check((*Counter)->Errors == 0, FString::Printf(TEXT("error lines of the mod over the way through the menu: %d (%s)"), (*Counter)->Errors, *(*Counter)->Last));
+			return EStep::Next;
+		});
+		AddDeleteSave(R, SaveName);
+		AddEquipTool(R);
+		R.Steps.Add([S](FRun& Self)
+		{
+			Self.Check(SetToolArea(Self, *S), TEXT("tool area set again"));
+			return EStep::Next;
+		});
+		R.Steps.Add(WaitFrames(10));
+		AddOpenAction(R, TEXT("SetStationLoadUnload"));
+		AddOnWindow(R, TEXT("Widget_MessageYesNo"), [Counter](FRun& Self, UUserWidget* Window)
+		{
+			GLog->Flush();
+			Self.Check((*Counter)->Errors == 0, FString::Printf(TEXT("error lines of the mod: %d (%s)"), (*Counter)->Errors, *(*Counter)->Last));
+			Counter->Reset();
+			Self.Check(true, TEXT("the question is on screen again; the game closes with it open"));
+		});
+	}
+
+	// AA-102 (1): W5 on a Fill of 5049 foundations paid from 50 containers around the player; the cost is right to the item
+	void AddFillLargeCost(FRun& R)
+	{
+		static constexpr int32 Copies = 5049;
+		static constexpr int32 BoxCount = 50;
+		struct FState { TArray<TWeakObjectPtr<AFGBuildableStorage>> Boxes; AreaActionsBuildings::FItemCounts Before; double Pressed = 0.0, Seconds = 0.0; };
+		FSceneRef S = MakeShared<FScene>();
+		FCopyRef C = MakeShared<FCopyState>();
+		TSharedRef<FState> State = MakeShared<FState>();
+		const auto InBoxes = [](const FState& Of, TSubclassOf<UFGItemDescriptor> ItemClass)
+		{
+			int32 Sum = 0;
+			for (const TWeakObjectPtr<AFGBuildableStorage>& Box : Of.Boxes)
+			{
+				Sum += StorageCount(Box, ItemClass);
+			}
+			return Sum;
+		};
+		AddCopyScene(R, S, C, BuildSingle);
+		R.Steps.Add([C, State, InBoxes](FRun& Self)
+		{
+			// Nothing of the cost in the inventory; the far container (600 m) and the depot hold some and must keep it. The container
+			// 15 m behind the player is the first of the 50: 5 rows of 5, two high
+			SetCostSources(Self, *C, CostNone, CostNone, [](int32 Cost) { return Cost * 10; }, [](int32) { return 100; });
+			const APawn* Pawn = Self.GetPlayer()->GetPawn();
+			const FVector Forward = Pawn->GetActorForwardVector().GetSafeNormal2D();
+			const FVector Right(-Forward.Y, Forward.X, 0.0);
+			const FVector First = C->NearBox.IsValid() ? C->NearBox->GetActorLocation() : FVector::ZeroVector;
+			State->Boxes.Add(C->NearBox);
+			double Farthest = 0.0;
+			for (int32 Index = 1; Index < BoxCount; ++Index)
+			{
+				// Index 0 is the first container's own place: the middle of the front row, on the ground
+				const int32 Row = Index % 5, Column = (Index / 5 + 2) % 5 - 2, Level = Index / 25;
+				const FVector At = First - Forward * (Row * 600.0) + Right * (Column * 1100.0) + FVector(0, 0, Level * 450.0);
+				State->Boxes.Add(SpawnStorage(Self, At, 0, 0));
+				Farthest = FMath::Max(Farthest, FVector::Dist(At, Pawn->GetActorLocation()));
+			}
+			for (const TPair<TSubclassOf<UFGItemDescriptor>, int32>& Entry : C->Cost)
+			{
+				const int32 All = Entry.Value * Copies + 7;
+				for (int32 Index = 0; Index < State->Boxes.Num(); ++Index)
+				{
+					if (State->Boxes[Index].IsValid())
+					{
+						State->Boxes[Index]->GetStorageInventory()->AddStack(FInventoryStack(All / BoxCount + (Index == 0 ? All % BoxCount : 0), Entry.Key), true);
+					}
+				}
+				State->Before.Add(Entry.Key, InBoxes(*State, Entry.Key));
+				Self.Check(State->Before[Entry.Key] == All, FString::Printf(TEXT("%s in the 50 containers: %d (want %d: %d a copy, 7 more)"), *GetNameSafe(Entry.Key), State->Before[Entry.Key], All, Entry.Value));
+			}
+			Self.Check(State->Boxes.Num() == BoxCount && !State->Boxes.ContainsByPredicate([](const TWeakObjectPtr<AFGBuildableStorage>& Box) { return !Box.IsValid(); }),
+				FString::Printf(TEXT("%d containers, the farthest %.0f cm from the player"), State->Boxes.Num(), Farthest));
+			CountWorld(Self, *C);
+			return EStep::Next;
+		});
+		R.Steps.Add(WaitFrames(30));
+		R.Steps.Add(WaitCalm(60));
+		R.Steps.Add([](FRun& Self)
+		{
+			Self.MaxFrameMs = 0.0;
+			Self.bMeasureFrames = true;
+			Self.StepTimeoutSec = 600.0;
+			return EStep::Next;
+		});
+		AddOpenAction(R, TEXT("Fill"));
+		AddFillWindow(R, FVector(1, 1, 0), FIntVector(101, 50, 1), FVector2D(0, 0), true);
+		R.Steps.Add([State](FRun& Self)
+		{
+			State->Pressed = Self.Now();
+			return EStep::Next;
+		});
+		AddResultWindow(R, S, [State](FRun& Self)
+		{
+			Self.bMeasureFrames = false;
+			State->Seconds = Self.Now() - State->Pressed;
+		});
+		AddCheckMessage(R, S, TEXT("Filled with 5,049 buildings."));
+		R.Steps.Add([C, State, InBoxes](FRun& Self)
+		{
+			Self.StepTimeoutSec = 30.0;
+			Self.Step(FString::Printf(TEXT("job time: %.1f s from OK to the result for %d copies paid from %d containers"), State->Seconds, Copies, BoxCount));
+			Self.Check(Self.MaxFrameMs <= 200.0, FString::Printf(TEXT("longest frame during the job: %.1f ms (W5: 200)"), Self.MaxFrameMs));
+			Self.Check(LightweightCount(Self.GetWorld()) == C->LightweightsBefore + Copies, FString::Printf(TEXT("lightweights %d (want %d)"), LightweightCount(Self.GetWorld()), C->LightweightsBefore + Copies));
+			UFGInventoryComponent* Inventory = PlayerInventory(Self);
+			for (const TPair<TSubclassOf<UFGItemDescriptor>, int32>& Entry : C->Cost)
+			{
+				const int32 Now = InBoxes(*State, Entry.Key), Want = State->Before.FindRef(Entry.Key) - Entry.Value * Copies;
+				const int32 Own = Inventory ? Inventory->GetNumItems(Entry.Key) : -1, Far = StorageCount(C->FarBox, Entry.Key), Depot = DepotCount(Self.GetWorld(), Entry.Key);
+				Self.Check(Now == Want && Own == C->Inventory.FindRef(Entry.Key) && Far == C->Far.FindRef(Entry.Key) && Depot == C->Depot.FindRef(Entry.Key),
+					FString::Printf(TEXT("cost to the item: %s in the 50 containers %d (want %d), inventory %d (want %d), far container %d (want %d), depot %d (want %d)"), *GetNameSafe(Entry.Key),
+						Now, Want, Own, C->Inventory.FindRef(Entry.Key), Far, C->Far.FindRef(Entry.Key), Depot, C->Depot.FindRef(Entry.Key)));
+			}
+			return EStep::Next;
+		});
+	}
+
+	// A Copy over the HUB and the Space Elevator copies neither, and none of the HUB's own parts (its terminal, bench, storage and burners
+	// are buildings of their own)
+	void AddCopyHub(FRun& R)
+	{
+		struct FState { int32 Actors = 0, Lightweights = 0; };
+		FSceneRef S = MakeShared<FScene>();
+		TSharedRef<FState> State = MakeShared<FState>();
+		AddScene(R, S, 6000.0, [](FRun& Self, FScene& Scene)
+		{
+			const FVector Base = Ground(Self, Scene.Center);
+			if (AFGBuildable* Hub = SpawnGameBuildable(Self, TEXT("Build_TradingPost"), TEXT("Recipe_TradingPost"), Base + FVector(-3000, -3000, 0)))
+			{
+				Scene.Inside.Add(Hub);
+			}
+			if (AFGBuildable* Elevator = SpawnGameBuildable(Self, TEXT("Build_SpaceElevator"), TEXT("Recipe_SpaceElevator"), Base + FVector(1500, 1500, 0)))
+			{
+				Scene.Inside.Add(Elevator);
+			}
+			for (const FVector& Place : Scene.ControlPlaces())
+			{
+				Scene.Controls.Add(SpawnStorage(Self, Place, 15, 0));
+			}
+		});
+		R.Steps.Add(WaitFrames(60));
+		R.Steps.Add([S, State](FRun& Self)
+		{
+			int32 InArea = 0, Parts = 0;
+			if (const AFGBuildableSubsystem* Buildables = AFGBuildableSubsystem::Get(Self.GetWorld()))
+			{
+				for (const AFGBuildable* Each : Buildables->GetAllBuildablesRef())
+				{
+					if (IsValid(Each) && S->Area.Contains(Each->GetActorLocation()))
+					{
+						++InArea;
+						Parts += Each->GetParentBuildableActor() ? 1 : 0;
+						Self.Step(FString::Printf(TEXT("in the area: %s, parent building %s"), *Each->GetClass()->GetName(), *GetNameSafe(Each->GetParentBuildableActor())));
+					}
+				}
+			}
+			State->Actors = ActorCount(Self.GetWorld());
+			State->Lightweights = LightweightCount(Self.GetWorld());
+			Self.Check(S->Inside.Num() == 2 && InArea > 2, FString::Printf(TEXT("the HUB stands with its own parts: %d building actors in the area, %d of them parts of another"), InArea, Parts));
+			return EStep::Next;
+		});
+		AddOpenAction(R, TEXT("Copy"));
+		AddCopyWindow(R, FVector(150, 0, 0), 0.0, false);
+		AddResultWindow(R, S);
+		R.Steps.Add(WaitFrames(30));
+		R.Steps.Add([S, State](FRun& Self)
+		{
+			Self.Check(S->Message.Contains(TEXT("No buildings in the area")), FString::Printf(TEXT("result '%s'"), *S->Message));
+			Self.Check(ActorCount(Self.GetWorld()) == State->Actors && LightweightCount(Self.GetWorld()) == State->Lightweights, FString::Printf(
+				TEXT("nothing built: actors %d (were %d), lightweights %d (were %d)"), ActorCount(Self.GetWorld()), State->Actors, LightweightCount(Self.GetWorld()), State->Lightweights));
+			return EStep::Next;
+		});
+	}
+
+	// A Fill preview over an area with nothing to copy (a conveyor pole alone) plans nothing whatever the counts say: the game must not stall
+	void AddFillOnlyIgnored(FRun& R)
+	{
+		FSceneRef S = MakeShared<FScene>();
+		FCopyRef C = MakeShared<FCopyState>();
+		AddCopyScene(R, S, C, [](FRun& Self, FScene& Scene, FCopyState& Copy)
+		{
+			Copy.Base = Ground(Self, Scene.Center);
+			AddActor(Self, Scene, Copy, TEXT("Build_ConveyorPole"), TEXT("Recipe_ConveyorPole"), FTransform(Copy.Base));
+			AddControlStorages(Self, Scene);
+		});
+		R.Steps.Add([](FRun& Self)
+		{
+			Self.MaxFrameMs = 0.0;
+			Self.bMeasureFrames = true;
+			return EStep::Next;
+		});
+		AddOpenAction(R, TEXT("Fill"));
+		AddFillWindow(R, FVector(1, 1, 0), FIntVector(1000000, 1000000, 1000000), FVector2D(0, 0), false, TEXT("PreviewButton"));
+		R.Steps.Add(WaitFrames(10));
+		R.Steps.Add([](FRun& Self)
+		{
+			Self.bMeasureFrames = false;
+			Self.Check(Self.MaxFrameMs <= 200.0 && AAreaActionsPreview::LiveGhosts == 0, FString::Printf(TEXT("preview of 1,000,000 x 1,000,000 x 1,000,000 over nothing to copy: longest frame %.1f ms, ghosts %d"),
+				Self.MaxFrameMs, AAreaActionsPreview::LiveGhosts));
+			return EStep::Next;
+		});
+		AddPress(R, TEXT("Widget_Fill"), TEXT("OkButton"));
+		AddResultWindow(R, S);
+		AddCheckMessage(R, S, TEXT("No buildings in the area"));
+		R.Steps.Add([C](FRun& Self)
+		{
+			CheckNothingBuilt(Self, *C, TEXT("nothing to copy"));
+			return EStep::Next;
+		});
+	}
+
+	// What the mod left behind once a world has closed: objects of its classes that belong to a world other than the menu's, its widgets,
+	// the preview's ghosts
+	int32 ModLeftovers(FRun& R, const UWorld* Menu)
+	{
+		TMap<const UClass*, bool> Ours;
+		int32 Left = 0, Worlds = 0;
+		for (TObjectIterator<UWorld> It; It; ++It)
+		{
+			++Worlds;
+		}
+		for (TObjectIterator<UObject> It; It; ++It)
+		{
+			const UClass* Class = It->GetClass();
+			bool* bOurs = Ours.Find(Class);
+			if (!bOurs)
+			{
+				const FString Package = Class->GetOutermost()->GetName();
+				bOurs = &Ours.Add(Class, Package.StartsWith(TEXT("/AreaActionsReborn/")) || Package == TEXT("/Script/AreaActionsReborn"));
+			}
+			if (!*bOurs || !IsValid(*It) || It->IsTemplate())
+			{
+				continue;
+			}
+			const UWorld* World = It->GetWorld();
+			if ((World && World != Menu) || It->IsA<UUserWidget>())
+			{
+				if (++Left <= 20)
+				{
+					R.Step(FString::Printf(TEXT("left over: %s (world %s)"), *It->GetFullName(), *GetNameSafe(World)));
+				}
+			}
+		}
+		R.Step(FString::Printf(TEXT("in the menu %s: mod objects left from the last world %d, preview ghosts %d, UWorld objects %d"), *GetNameSafe(Menu), Left, AAreaActionsPreview::LiveGhosts, Worlds));
+		return Left + AAreaActionsPreview::LiveGhosts;
+	}
+
+	// AA-080 (6): a save loaded three times in one process with the menu in between; in every world the tool, an area and a Copy preview
+	// opened and cancelled, then 15 s for the memory readings from outside (mem_watch.ps1). In the menu, after a garbage collection,
+	// nothing of the mod is left from the world before. The fourth load ends the scenario.
+	void AddThreeLoads(FRun& R)
+	{
+		struct FState { FString Save; uint64 GcFrame = 0; int32 Menus = 0; };
+		TSharedRef<FState> State = MakeShared<FState>();
+		R.AwaitTimeoutSec = 900.0;
+		R.StepTimeoutSec = 120.0;
+		R.OnMenu = [State](FRun& Self, UWorld* Menu)
+		{
+			// A full collection on the engine's own next tick, never from inside this one
+			if (State->GcFrame == 0)
+			{
+				GEngine->ForceGarbageCollection(true);
+				State->GcFrame = GFrameCounter;
+			}
+			if (GFrameCounter < State->GcFrame + 5)
+			{
+				return false;
+			}
+			State->GcFrame = 0;
+			const int32 Left = ModLeftovers(Self, Menu);
+			++State->Menus;
+			Self.Check(Left == 0, FString::Printf(TEXT("back in the menu after world %d and a garbage collection: %d objects of the mod left (want 0)"), State->Menus, Left));
+			return true;
+		};
+		R.Steps.Add([State](FRun& Self)
+		{
+			if (!FParse::Value(FCommandLine::Get(), TEXT("AATestSave="), State->Save))
+			{
+				State->Save = Self.GetWorld()->URL.GetOption(TEXT("loadgame="), TEXT(""));
+			}
+			Self.Check(!State->Save.IsEmpty(), FString::Printf(TEXT("the save to load again: '%s'"), *State->Save));
+			return EStep::Next;
+		});
+		for (int32 Load = 1; Load <= 3; ++Load)
+		{
+			if (Load > 1)
+			{
+				AddPlace(R);
+			}
+			FSceneRef S = MakeShared<FScene>();
+			FCopyRef C = MakeShared<FCopyState>();
+			R.Steps.Add(WaitCalm(60));
+			AddCopyScene(R, S, C, BuildBasic);
+			AddOpenAction(R, TEXT("Copy"));
+			AddCopyWindow(R, FVector(20, 0, 0), 0.0, false, TEXT("PreviewButton"));
+			R.Steps.Add(WaitFrames(5));
+			AddOnWindow(R, TEXT("Widget_Copy"), [Load](FRun& Self, UUserWidget* Window)
+			{
+				// The save's own buildings may stand in the area too: at least the pattern's 9 ghosts
+				Self.Check(AAreaActionsPreview::LiveGhosts >= 9, FString::Printf(TEXT("world %d: preview ghosts %d (at least 9)"), Load, AAreaActionsPreview::LiveGhosts));
+				Self.Check(CloseWithX(Self, Window), TEXT("Copy window closed with X"));
+			});
+			R.Steps.Add(WaitFrames(5));
+			R.Steps.Add([Load](FRun& Self)
+			{
+				Self.Check(AAreaActionsPreview::LiveGhosts == 0 && PreviewHolograms(Self) == 0 && !ActiveAction(Self), FString::Printf(TEXT("world %d after Cancel: ghosts %d, holograms %d, action %s"),
+					Load, AAreaActionsPreview::LiveGhosts, PreviewHolograms(Self), *GetNameSafe(ActiveAction(Self))));
+				Self.Step(FString::Printf(TEXT("mem window %d begin, process RAM %.0f MB"), Load, FPlatformMemory::GetStats().UsedPhysical / 1048576.0));
+				return EStep::Next;
+			});
+			R.Steps.Add(WaitSeconds(15.0));
+			R.Steps.Add([State, Load](FRun& Self)
+			{
+				Self.Step(FString::Printf(TEXT("mem window %d end, process RAM %.0f MB"), Load, FPlatformMemory::GetStats().UsedPhysical / 1048576.0));
+				Self.bAwaitWorld = true;
+				Self.bLoadIssued = false;
+				Self.LoadSave = State->Save;
+				Self.AwaitStarted = Self.Now();
+				Self.Step(FString::Printf(TEXT("to the main menu to load %s"), *State->Save));
+				UFGBlueprintFunctionLibrary::TravelToMainMenu(Self.GetPlayer());
+				return EStep::Next;
+			});
+			R.Steps.Add(WaitFrames(30));
+		}
+		R.Steps.Add([State](FRun& Self)
+		{
+			Self.Check(State->Menus == 3 && AAreaActionsPreview::LiveGhosts == 0, FString::Printf(TEXT("loaded a fourth time: menu checks made %d (want 3), ghosts %d"), State->Menus,
+				AAreaActionsPreview::LiveGhosts));
+			return EStep::Next;
+		});
+	}
+
+	// The tool's area over every building of the save, and what the save holds
+	void AddWholeMap(FRun& R, const FSceneRef& S)
+	{
+		R.StepTimeoutSec = 120.0;
+		AddEquipTool(R);
+		R.Steps.Add(WaitCalm(60));
+		R.Steps.Add([S](FRun& Self)
+		{
+			const double Z = Self.GetPlayer()->GetPawn()->GetActorLocation().Z;
+			S->Corners = { FVector(-400000, -400000, Z), FVector(500000, -400000, Z), FVector(500000, 400000, Z), FVector(-400000, 400000, Z) };
+			S->Area.Polygon.Reset();
+			for (const FVector& Corner : S->Corners)
+			{
+				S->Area.Polygon.Add(FVector2D(Corner));
+			}
+			S->Area.MinZ = -350000.0;
+			S->Area.MaxZ = 450000.0;
+			SnapshotCrates(Self, *S);
+			Self.Step(FString::Printf(TEXT("the save: %d building actors, %d lightweight buildings, %d crates"), ActorCount(Self.GetWorld()), LightweightCount(Self.GetWorld()), S->CratesBefore.Num()));
+			Self.Check(SetToolArea(Self, *S), TEXT("tool area set: the whole map"));
+			ListenResults(Self, S);
+			return EStep::Next;
+		});
+		R.Steps.Add(WaitFrames(30));
+		// What the save's own frames are like, before any action
+		R.Steps.Add([](FRun& Self)
+		{
+			Self.MaxFrameMs = 0.0;
+			Self.bMeasureFrames = true;
+			return EStep::Next;
+		});
+		R.Steps.Add(WaitSeconds(10.0));
+		R.Steps.Add([](FRun& Self)
+		{
+			Self.bMeasureFrames = false;
+			Self.Step(FString::Printf(TEXT("longest frame in 10 s before any action: %.1f ms"), Self.MaxFrameMs));
+			return EStep::Next;
+		});
+	}
+
+	// AA-080 (7): ClearInventories into crates, then MassDismantle with the refund in crates, over every building of a big save: each
+	// ends with its result and keeps W5
+	void AddBigSave(FRun& R)
+	{
+		struct FState { double Pressed = 0.0, Seconds = 0.0; };
+		FSceneRef S = MakeShared<FScene>();
+		TSharedRef<FState> State = MakeShared<FState>();
+		AddWholeMap(R, S);
+		const auto AddAction = [&R, S, State](const TCHAR* Action, const TCHAR* Button, const TCHAR* Want)
+		{
+			AddOpenAction(R, Action);
+			AddOnWindow(R, TEXT("Widget_MessageYesNo"), [State, Action, Button](FRun& Self, UUserWidget* Window)
+			{
+				const UWidget* Found = Window->GetWidgetFromName(Button);
+				const FTextProperty* Text = Found ? FindFProperty<FTextProperty>(Found->GetClass(), TEXT("mText")) : nullptr;
+				const FString Label = Text ? Text->GetPropertyValue_InContainer(Found).ToString() : FString(Button);
+				Self.MaxFrameMs = 0.0;
+				Self.bMeasureFrames = true;
+				Self.StepTimeoutSec = 3600.0;
+				State->Pressed = Self.Now();
+				Self.Check(PressButton(Window, Button), FString::Printf(TEXT("%s: '%s' pressed"), Action, *Label));
+			});
+			AddResultWindow(R, S, [State](FRun& Self)
+			{
+				Self.bMeasureFrames = false;
+				State->Seconds = Self.Now() - State->Pressed;
+			});
+			R.Steps.Add([S, State, Action, Want](FRun& Self)
+			{
+				Self.StepTimeoutSec = 120.0;
+				Self.Step(FString::Printf(TEXT("%s over the whole save: job time %.1f s from the answer to the result, now %d building actors, %d lightweight buildings, %d new crates"), Action,
+					State->Seconds, ActorCount(Self.GetWorld()), LightweightCount(Self.GetWorld()), NewCrates(Self, *S).Num()));
+				Self.Check(S->Message.Contains(Want), FString::Printf(TEXT("%s result '%s' has '%s'"), Action, *S->Message, Want));
+				Self.Check(Self.MaxFrameMs <= 200.0, FString::Printf(TEXT("%s: longest frame during the job %.1f ms (W5: 200)"), Action, Self.MaxFrameMs));
+				return EStep::Next;
+			});
+		};
+		// The second answer: the items go to crates
+		AddAction(TEXT("ClearInventories"), TEXT("NoButton"), TEXT("Cleared"));
+		R.Steps.Add(WaitSeconds(10.0));
+		// The first answer: "Refund to crate", or OK when the save has No Build Cost (the contents still go to crates)
+		AddAction(TEXT("MassDismantle"), TEXT("YesButton"), TEXT("Dismantled"));
+	}
+
+	// Not a gate scenario, a measurement: Copy opened over a whole big save collects every building in one frame of the player's game
+	void AddBigSaveCopyOpen(FRun& R)
+	{
+		FSceneRef S = MakeShared<FScene>();
+		TSharedRef<double> Clicked = MakeShared<double>(0.0);
+		AddWholeMap(R, S);
+		R.Steps.Add([](FRun& Self)
+		{
+			Self.MaxFrameMs = 0.0;
+			Self.bMeasureFrames = true;
+			Self.StepTimeoutSec = 1800.0;
+			return EStep::Next;
+		});
+		AddOpenAction(R, TEXT("Copy"));
+		R.Steps.Add([Clicked](FRun& Self)
+		{
+			*Clicked = *Clicked > 0.0 ? *Clicked : Self.Now();
+			UUserWidget* Window = TopWindow(Self);
+			if (!Window || !IsShown(Window))
+			{
+				return EStep::Wait;
+			}
+			Self.bMeasureFrames = false;
+			Self.Check(true, FString::Printf(TEXT("Copy over the whole save: window %s after %.1f s, longest frame %.1f ms"), *Window->GetClass()->GetName(), Self.Now() - *Clicked, Self.MaxFrameMs));
+			return EStep::Next;
+		});
+	}
+
 	bool BuildScenario(FRun& R)
 	{
+		if (R.Scenario == TEXT("ChoiceNotShown"))
+		{
+			AddChoiceNotShown(R);
+			return true;
+		}
+		if (R.Scenario == TEXT("ChoiceBehindGamePopup"))
+		{
+			AddChoiceBehindGamePopup(R);
+			return true;
+		}
+		if (R.Scenario == TEXT("ChoiceOnQuit"))
+		{
+			R.StepTimeoutSec = 60.0;
+			AddChoiceOnQuit(R);
+			return true;
+		}
+		if (R.Scenario == TEXT("CopyHub"))
+		{
+			AddCopyHub(R);
+			return true;
+		}
+		if (R.Scenario == TEXT("FillOnlyIgnored"))
+		{
+			AddFillOnlyIgnored(R);
+			return true;
+		}
+		if (R.Scenario == TEXT("FillLargeCost"))
+		{
+			AddFillLargeCost(R);
+			return true;
+		}
+		if (R.Name == TEXT("ThreeLoads"))
+		{
+			AddThreeLoads(R);
+			return true;
+		}
+		if (R.Name == TEXT("BigSave"))
+		{
+			AddBigSave(R);
+			return true;
+		}
+		if (R.Name == TEXT("BigSaveCopyOpen"))
+		{
+			AddBigSaveCopyOpen(R);
+			return true;
+		}
 		if (R.Name == TEXT("MP_Smoke"))
 		{
 			// The client takes the tool and opens its menu; R10: what the host's game makes of it is counted by Watch
@@ -7272,9 +8020,9 @@ namespace
 			AddDisconnectPreview(R);
 			return true;
 		}
-		if (R.Scenario == TEXT("DisconnectCopy") || R.Scenario == TEXT("DisconnectCopyRefund"))
+		if (R.Scenario == TEXT("DisconnectCopy") || R.Scenario == TEXT("DisconnectCopyRefund") || R.Scenario == TEXT("DisconnectCopyOwn"))
 		{
-			AddDisconnectCopy(R, R.Scenario == TEXT("DisconnectCopyRefund"));
+			AddDisconnectCopy(R, R.Scenario == TEXT("DisconnectCopyRefund"), R.Scenario == TEXT("DisconnectCopyOwn"));
 			return true;
 		}
 		if (R.Scenario == TEXT("ServerSave"))
@@ -7622,9 +8370,9 @@ namespace
 		}
 		if (R.bAwaitWorld)
 		{
-			if (R.Now() - R.AwaitStarted > 180.0)
+			if (R.Now() - R.AwaitStarted > R.AwaitTimeoutSec)
 			{
-				R.Check(false, FString::Printf(TEXT("no game world 180 s after leaving for the menu (load %s issued %d)"), *R.LoadSave, R.bLoadIssued));
+				R.Check(false, FString::Printf(TEXT("no game world %.0f s after leaving for the menu (load %s issued %d)"), R.AwaitTimeoutSec, *R.LoadSave, R.bLoadIssued));
 				Finish(R);
 				return false;
 			}
@@ -7635,6 +8383,10 @@ namespace
 				const bool bMenu = Menu && Menu->IsGameWorld() && (Menu->GetMapName().Contains(TEXT("Menu")) || Menu->URL.HasOption(TEXT("closed")));
 				if (!R.bLoadIssued && bMenu && Menu->HasBegunPlay() && R.Now() - R.AwaitStarted > 5.0)
 				{
+					if (R.OnMenu && !R.OnMenu(R, Menu))
+					{
+						break;
+					}
 					R.bLoadIssued = true;
 					R.Step(FString::Printf(TEXT("in %s: loading %s"), *Menu->GetMapName(), *R.LoadSave));
 					UGameplayStatics::OpenLevel(Menu, FName(TEXT("/Game/FactoryGame/Map/GameLevel01/Persistent_Level")), true, FString::Printf(TEXT("skipOnboarding?listen?loadgame=%s"), *R.LoadSave));
