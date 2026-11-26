@@ -141,7 +141,8 @@ class AREAACTIONS_API UAreaActionsChoiceContent : public UFGPopupWidgetContent
 	GENERATED_BODY()
 
 public:
-	struct FAnswer { FText Label; FName Name; TFunction<void()> Run; };
+	// bCancel: the answer Escape (or the popup closed by the game) runs
+	struct FAnswer { FText Label; FName Name; TFunction<void()> Run; bool bCancel = false; };
 	void Setup(const FText& InMessage, TArray<FAnswer>&& InAnswers);
 
 	// The popup closed (an answer, Cancel or Escape)

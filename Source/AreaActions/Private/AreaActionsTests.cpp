@@ -45,6 +45,8 @@
 #include "FGCrate.h"
 #include "AkComponent.h"
 #include "UI/FGInteractWidget.h"
+#include "FGHUD.h"
+#include "UI/FGGameUI.h"
 #include "FGItemPickup_Spawnable.h"
 #include "FGRecipe.h"
 #include "FGRecipeManager.h"
@@ -6618,6 +6620,37 @@ namespace
 			AddControlMachines(Self, Scene, Asset::IronPlate, 4, 2);
 		});
 		Shot(TEXT("status"));
+		// The game's own windows of a Constructor and a Storage Container of the scene, for the comparison
+		auto GameWindow = [&R, S, &Shot](int32 Index, const TCHAR* Name)
+		{
+			R.Steps.Add([S, Index](FRun& Self)
+			{
+				AFGBuildable* Building = S->Inside.IsValidIndex(Index) ? S->Inside[Index].Get() : nullptr;
+				AFGHUD* HUD = Self.GetPlayer() ? Cast<AFGHUD>(Self.GetPlayer()->GetHUD()) : nullptr;
+				// mInteractWidgetSoftClass is protected: read through reflection, as UIProbe does
+				const FSoftClassProperty* Soft = Building ? FindFProperty<FSoftClassProperty>(Building->GetClass(), TEXT("mInteractWidgetSoftClass")) : nullptr;
+				const TSubclassOf<UFGInteractWidget> Class = Soft ? Cast<UClass>(Soft->GetPropertyValue_InContainer(Building).LoadSynchronous()) : nullptr;
+				Self.Check(HUD && Class, FString::Printf(TEXT("game window of %s: %s"), *GetNameSafe(Building), *GetNameSafe(Class)));
+				if (HUD && Class)
+				{
+					HUD->OpenInteractUI(Class, Building);
+				}
+				return EStep::Next;
+			});
+			Shot(Name);
+			R.Steps.Add([](FRun& Self)
+			{
+				AFGHUD* HUD = Self.GetPlayer() ? Cast<AFGHUD>(Self.GetPlayer()->GetHUD()) : nullptr;
+				if (HUD && HUD->GetGameUI())
+				{
+					HUD->GetGameUI()->PopAllWidgets();
+				}
+				return EStep::Next;
+			});
+			R.Steps.Add(WaitFrames(10));
+		};
+		GameWindow(0, TEXT("game_constructor"));
+		GameWindow(3, TEXT("game_storage"));
 		// The first menu shows the help by itself; Done hides it (the test's own settings file)
 		AddOpenMenu(R);
 		Shot(TEXT("menu_help"));

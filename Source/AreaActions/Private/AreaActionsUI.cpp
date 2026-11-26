@@ -425,7 +425,10 @@ void UAreaActionsMessageShim::NativeConstruct()
 		return Property ? Property->GetPropertyValue_InContainer(this) : FString();
 	};
 	FPopupClosed Closed;
-	UFGBlueprintFunctionLibrary::AddPopupWithCloseDelegate(GetOwningPlayer(), FText::FromString(ReadString(TEXT("Title"))), FText::FromString(ReadString(TEXT("Message"))), Closed, PID_OK);
+	if (GetOwningPlayer())
+	{
+		UFGBlueprintFunctionLibrary::AddPopupWithCloseDelegate(GetOwningPlayer(), FText::FromString(ReadString(TEXT("Title"))), FText::FromString(ReadString(TEXT("Message"))), Closed, PID_OK);
+	}
 	// Off the tool's stack in the next tick, after AddWidget has finished with it
 	if (UWorld* World = GetWorld())
 	{
@@ -533,6 +536,8 @@ TSharedRef<SWidget> UAreaActionsChoiceContent::RebuildWidget()
 			UUserWidget* Button = AreaActionsUI::MakeButton(WidgetTree, Answers[Index].Name, Answers[Index].Label, nullptr, NAME_None, Index == 0);
 			if (!Button)
 			{
+				// Keeps Buttons index-aligned with Answers
+				Buttons.Add(nullptr);
 				continue;
 			}
 			AreaActionsUI::Bind(Button, TEXT("OnClickedIncludeSelf"), this, GET_FUNCTION_NAME_CHECKED(UAreaActionsChoiceContent, AnswerClicked));
@@ -591,8 +596,9 @@ void UAreaActionsChoiceContent::PopupClosed(bool bConfirmed)
 		return;
 	}
 	bDone = true;
-	// Escape (or the popup closed by the game) is the cancel answer, the last one
-	const int32 Index = Answers.IsValidIndex(Picked) ? Picked : Answers.Num() - 1;
+	// Escape (or the popup closed by the game) runs the cancel answer
+	const int32 Cancel = Answers.IndexOfByPredicate([](const FAnswer& Answer) { return Answer.bCancel; });
+	const int32 Index = Answers.IsValidIndex(Picked) ? Picked : Cancel;
 	UE_LOG(LogAreaActionsCpp, Display, TEXT("Choice '%s': %s"), *Message.Left(60), Answers.IsValidIndex(Index) ? *Answers[Index].Name.ToString() : TEXT("none"));
 	if (Answers.IsValidIndex(Index) && Answers[Index].Run)
 	{
@@ -604,10 +610,16 @@ void UAreaActionsChoiceContent::Close()
 {
 	// No answer runs: the action that asked is gone
 	const bool bShown = !bDone && mPopupWidget && mPopupWidget->IsInViewport();
+	const bool bQueued = !bDone && !bShown;
 	bDone = true;
 	if (bShown)
 	{
 		UFGBlueprintFunctionLibrary::ClosePopup(GetOwningPlayer());
+	}
+	else if (bQueued && GetOwningPlayer())
+	{
+		// Still waiting behind another popup: take it out of the queue, or it would show later with dead buttons
+		UFGBlueprintFunctionLibrary::ClearPopupQueueOfContentClass(GetOwningPlayer(), GetClass());
 	}
 }
 

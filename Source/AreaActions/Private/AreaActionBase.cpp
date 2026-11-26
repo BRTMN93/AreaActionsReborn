@@ -237,7 +237,7 @@ bool AAreaActionBase::OpenChoice(const FText& Title, const FText& Message, const
 			{
 				Shell->ChoiceClosed();
 			}
-		} });
+		}, Answer.Function == TEXT("Cancel") });
 	}
 	if (!bHasCancel)
 	{
@@ -248,7 +248,7 @@ bool AAreaActionBase::OpenChoice(const FText& Title, const FText& Message, const
 			{
 				Live->ChoiceClosed();
 			}
-		} });
+		}, true });
 	}
 	UE_LOG(LogAreaActionsCpp, Display, TEXT("Action %s asks '%s' (%d answers)"), *GetClass()->GetName(), *Title.ToString(), Buttons.Num());
 	RequestCountAtChoice = RequestCount;
