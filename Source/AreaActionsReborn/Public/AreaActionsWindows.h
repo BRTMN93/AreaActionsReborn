@@ -58,6 +58,23 @@ private:
 // What Copy's and Fill's windows share (were Widget_Copy, Widget_Fill): number fields in the game's input boxes, "Use build cost" as the
 // game's toggle, the container distance as a slider with its field, the game's buttons; Hide and the pick buttons hide the window while
 // the player clicks into the world.
+// One number field of the Copy and Fill windows
+USTRUCT()
+struct FAreaActionsField
+{
+	GENERATED_BODY()
+
+	UPROPERTY(Transient)
+	TObjectPtr<UUserWidget> Box;
+	bool bFloat = true;
+	double Default = 0.0;
+	double Min = -1.0e9;
+	double Max = 1.0e9;
+	bool bAllowZero = true;
+	// The value last set, put back when the window is constructed
+	double Shown = 0.0;
+};
+
 UCLASS(Abstract)
 class AREAACTIONSREBORN_API UAreaActionsPlaceWindow : public UAreaActionsWindow
 {
@@ -85,17 +102,7 @@ public:
 	void HideClicked();
 
 protected:
-	struct FField
-	{
-		TObjectPtr<UUserWidget> Box;
-		bool bFloat = true;
-		double Default = 0.0;
-		double Min = -1.0e9;
-		double Max = 1.0e9;
-		bool bAllowZero = true;
-		// The value last set, put back when the window is constructed
-		double Shown = 0.0;
-	};
+	using FField = FAreaActionsField;
 
 	virtual void Canceled() override { WidgetCanceled.Broadcast(); }
 	virtual void NativeConstruct() override;
@@ -109,7 +116,8 @@ protected:
 	void Normalize(FName Field);
 	AActor* GetSettings() const;
 
-	TMap<FName, FField> Fields;
+	UPROPERTY(Transient)
+	TMap<FName, FAreaActionsField> Fields;
 	UPROPERTY(Transient)
 	TObjectPtr<UUserWidget> CostToggle;
 	UPROPERTY(Transient)

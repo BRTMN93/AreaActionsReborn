@@ -253,6 +253,21 @@ bool AAreaActionBase::OpenChoice(const FText& Title, const FText& Message, const
 	UE_LOG(LogAreaActionsCpp, Display, TEXT("Action %s asks '%s' (%d answers)"), *GetClass()->GetName(), *Title.ToString(), Buttons.Num());
 	RequestCountAtChoice = RequestCount;
 	Choice = UAreaActionsChoiceContent::Open(OwnerPC, Title, Message, MoveTemp(Buttons));
+	if (Choice)
+	{
+		// AA-104: an action must not wait for a question that never reached the screen or the game's popup queue
+		FTimerHandle Handle;
+		GetWorldTimerManager().SetTimer(Handle, FTimerDelegate::CreateWeakLambda(this, [this, Asked = Choice.Get(), Name = Title.ToString()]()
+		{
+			if (Choice && Choice == Asked && !Choice->IsShownOrQueued())
+			{
+				UE_LOG(LogAreaActionsCpp, Error, TEXT("%s: the question '%s' did not show, the action ends"), *GetClass()->GetName(), *Name);
+				Choice->Close();
+				Choice = nullptr;
+				Finish();
+			}
+		}), 2.0f, false);
+	}
 	return Choice != nullptr;
 }
 

@@ -7908,6 +7908,11 @@ namespace
 
 void FAreaActionsTests::JoinFromCommandLine()
 {
+	// Like everything of the test mode, these arguments work only next to -AATest=<Scenario>
+	if (FString Scenario; !FParse::Value(FCommandLine::Get(), TEXT("AATest="), Scenario))
+	{
+		return;
+	}
 	// -AATestLoad=<save>: a dedicated server starts in its lobby map, or in the session its settings name; the test loads its own save
 	// once (a hard travel, as the server's API does), and the scenario starts only in that world
 	FString LoadSave;

@@ -52,14 +52,14 @@ UAreaActionsRCO* UAreaActionsRCO::Of(APlayerController* Controller)
 
 void UAreaActionsRCO::ServerPing_Implementation(int32 Token)
 {
-	UE_LOG(LogAreaActionsCpp, Display, TEXT("ServerPing %d"), Token);
+	UE_LOG(LogAreaActionsCpp, Verbose, TEXT("ServerPing %d"), Token);
 	ClientPong(Token);
 	OnPing.Broadcast(this, Token);
 }
 
 void UAreaActionsRCO::ClientPong_Implementation(int32 Token)
 {
-	UE_LOG(LogAreaActionsCpp, Display, TEXT("ClientPong %d"), Token);
+	UE_LOG(LogAreaActionsCpp, Verbose, TEXT("ClientPong %d"), Token);
 	OnPong.Broadcast(Token);
 }
 
@@ -203,7 +203,9 @@ void UAreaActionsRCO::ServerPlaceCopies_Implementation(int32 RequestId, const FA
 	}
 	const bool bNumbers = IsBounded(Placement.Delta, 2.0 * MaxCoordinate) && IsBounded(Placement.RotationCenter, 2.0 * MaxCoordinate) && FMath::IsFinite(Placement.Yaw)
 		&& IsBounded(Placement.Border, MaxGap) && IsBounded(FVector(Placement.Ramp, 0.0), MaxGap)
-		&& FMath::Abs(Placement.Amount.X) <= MaxAmount && FMath::Abs(Placement.Amount.Y) <= MaxAmount && FMath::Abs(Placement.Amount.Z) <= MaxAmount;
+		&& FMath::Abs(Placement.Amount.X) <= MaxAmount && FMath::Abs(Placement.Amount.Y) <= MaxAmount && FMath::Abs(Placement.Amount.Z) <= MaxAmount
+		// The Fill window never sends a count of 0; a request with one would plan nothing through loops as large as its other counts
+		&& (!Placement.bFill || (Placement.Amount.X != 0 && Placement.Amount.Y != 0 && Placement.Amount.Z != 0));
 	if (!bNumbers)
 	{
 		Reject(RequestId, Action, EAreaActionsResultCode::Rejected, FString::Printf(TEXT("placement out of range: delta %s, centre %s, yaw %f, gap %s, amount %s, ramp %s"),

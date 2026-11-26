@@ -17,7 +17,9 @@
 #include "Engine/Font.h"
 #include "Engine/Texture2D.h"
 #include "FGBlueprintFunctionLibrary.h"
+#include "FGHUDBase.h"
 #include "GameFramework/PlayerController.h"
+#include "UI/FGBaseUI.h"
 #include "UI/FGPopupWidget.h"
 
 #define LOCTEXT_NAMESPACE "AreaActions"
@@ -26,7 +28,6 @@ namespace AreaActionsUI
 {
 	const TCHAR* const FramePath = TEXT("/Game/FactoryGame/Interface/UI/Widget_Window_DarkMode.Widget_Window_DarkMode_C");
 	const TCHAR* const ContentBackgroundPath = TEXT("/Game/FactoryGame/Interface/UI/InGame/Widget_Window_ContentBackground_DarkMode.Widget_Window_ContentBackground_DarkMode_C");
-	const TCHAR* const AlternateBackgroundPath = TEXT("/Game/FactoryGame/Interface/UI/InGame/Widget_Window_AlternateContentBackground_DarkMode.Widget_Window_AlternateContentBackground_DarkMode_C");
 	const TCHAR* const StandardButtonPath = TEXT("/Game/FactoryGame/Interface/UI/InGame/-Shared/Widget_StandardButton.Widget_StandardButton_C");
 	const TCHAR* const ListButtonPath = TEXT("/Game/FactoryGame/Interface/UI/InGame/-Shared/Widget_ListButton.Widget_ListButton_C");
 	const TCHAR* const ScrollboxPath = TEXT("/Game/FactoryGame/Interface/UI/InGame/-Shared/Widget_Scrollbox.Widget_Scrollbox_C");
@@ -116,18 +117,6 @@ namespace AreaActionsUI
 		FScriptDelegate Delegate;
 		Delegate.BindUFunction(Target, Function);
 		Property->AddDelegate(MoveTemp(Delegate), Widget);
-		return true;
-	}
-
-	bool Call(UObject* Object, FName Function)
-	{
-		UFunction* Found = Object ? Object->FindFunction(Function) : nullptr;
-		if (!Found || Found->ParmsSize != 0)
-		{
-			UE_LOG(LogAreaActionsCpp, Error, TEXT("%s has no %s()"), *GetNameSafe(Object), *Function.ToString());
-			return false;
-		}
-		Object->ProcessEvent(Found, nullptr);
 		return true;
 	}
 
@@ -585,8 +574,48 @@ UAreaActionsChoiceContent* UAreaActionsChoiceContent::Open(APlayerController* Pl
 	Content->Setup(InMessage, MoveTemp(InAnswers));
 	FPopupClosed Closed;
 	Closed.BindUFunction(Content, GET_FUNCTION_NAME_CHECKED(UAreaActionsChoiceContent, PopupClosed));
-	UFGBlueprintFunctionLibrary::AddPopupWithContent(Player, Title, FText::GetEmpty(), Closed, Content, EKeys::Invalid, PID_NONE);
+	if (!bDropForTest)
+	{
+		UFGBlueprintFunctionLibrary::AddPopupWithContent(Player, Title, FText::GetEmpty(), Closed, Content, EKeys::Invalid, PID_NONE);
+	}
 	return Content;
+}
+
+bool UAreaActionsChoiceContent::bDropForTest = false;
+
+bool UAreaActionsChoiceContent::IsShownOrQueued() const
+{
+	if (bDone || mPopupWidget)
+	{
+		return true;
+	}
+	const APlayerController* Player = GetOwningPlayer();
+	AFGHUDBase* Hud = Player ? Cast<AFGHUDBase>(Player->GetHUD()) : nullptr;
+	UFGBaseUI* BaseUI = Hud ? Hud->GetBaseUI() : nullptr;
+	if (!BaseUI)
+	{
+		return false;
+	}
+	if (const UFGPopupWidget* Active = BaseUI->GetPopup(); Active && Active->mContent == this)
+	{
+		return true;
+	}
+	// The queue is the game UI's own (a protected UPROPERTY)
+	const FArrayProperty* Queue = FindFProperty<FArrayProperty>(UFGBaseUI::StaticClass(), TEXT("mPopupDataQueue"));
+	const FStructProperty* Entry = Queue ? CastField<FStructProperty>(Queue->Inner) : nullptr;
+	if (!Entry || Entry->Struct != FPopupData::StaticStruct())
+	{
+		return false;
+	}
+	FScriptArrayHelper Waiting(Queue, Queue->ContainerPtrToValuePtr<void>(BaseUI));
+	for (int32 Index = 0; Index < Waiting.Num(); ++Index)
+	{
+		if (reinterpret_cast<const FPopupData*>(Waiting.GetRawPtr(Index))->PopupContent == this)
+		{
+			return true;
+		}
+	}
+	return false;
 }
 
 void UAreaActionsChoiceContent::PopupClosed(bool bConfirmed)

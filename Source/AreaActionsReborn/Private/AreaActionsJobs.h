@@ -8,11 +8,11 @@ class UFGRecipe;
 // The server jobs of the simple actions. The RCO has checked the request before it makes one.
 namespace AreaActionsJobs
 {
-	// Manufacturers whose class the recipe lists get it; their solid items go to one crate at the player (D8), fluids are lost (D14),
+	// Manufacturers whose class the recipe lists get it; their solid items go to return crates at the player (D8), fluids are lost (D14),
 	// machines that already use the recipe are left alone (D12)
 	TUniquePtr<FAreaActionsJob> MakeSetRecipe(TSubclassOf<UFGRecipe> Recipe);
 	// Every inventory of the buildings and crates in the area, except the power shard and somersloop slots (D11); with bToCrate the solid
-	// items go to one crate at the player, fluids are lost
+	// items go to return crates at the player, fluids are lost
 	TUniquePtr<FAreaActionsJob> MakeClearInventories(bool bToCrate);
 	// Truck stations (docking stations) and freight platforms
 	TUniquePtr<FAreaActionsJob> MakeSetStationMode(bool bLoad);
@@ -25,7 +25,7 @@ namespace AreaActionsJobs
 	TUniquePtr<FAreaActionsJob> MakeDismantle(EAreaActionsDismantleRefund Refund);
 	// The test mode: 1 = return crates find no room next to the player, 2 = no crate can be placed at all (the messages, AA-085); 0 = off
 	void SetCratesFailForTest(int32 Mode);
-	// The test mode: every Nth copy of a Copy or Fill counts as refused by the game (its cost goes back); 0 = off
+	// The test mode: every Nth copy of a Copy or Fill counts as refused by the game (a refused copy costs nothing); 0 = off
 	void SetRefuseCopiesForTest(int32 EveryNth);
 	// Most copies one request may build (AreaActions.MaxSpawnPerRequest)
 	int32 GetMaxSpawn();

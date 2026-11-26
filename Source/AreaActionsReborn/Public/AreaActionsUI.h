@@ -21,7 +21,6 @@ namespace AreaActionsUI
 	UClass* GameClass(const TCHAR* Path);
 	extern const TCHAR* const FramePath;
 	extern const TCHAR* const ContentBackgroundPath;
-	extern const TCHAR* const AlternateBackgroundPath;
 	extern const TCHAR* const StandardButtonPath;
 	extern const TCHAR* const ListButtonPath;
 	extern const TCHAR* const ScrollboxPath;
@@ -45,8 +44,7 @@ namespace AreaActionsUI
 	// A Blueprint event dispatcher of a widget, bound to a UFUNCTION of Target by name (no signature check: the handlers take the
 	// dispatcher's parameters)
 	bool Bind(UObject* Widget, FName Dispatcher, UObject* Target, FName Function);
-	// Calls a Blueprint function without parameters, or with one bool or object parameter
-	bool Call(UObject* Object, FName Function);
+	// Calls a Blueprint function with one bool or object parameter
 	bool CallBool(UObject* Object, FName Function, bool bValue);
 
 	UUserWidget* MakeGame(UWidgetTree* Tree, const TCHAR* Path, FName Name = NAME_None);
@@ -156,6 +154,11 @@ public:
 	static UAreaActionsChoiceContent* Open(APlayerController* Player, const FText& Title, const FText& Message, TArray<FAnswer>&& Answers);
 	// Closes the popup that shows this content, when it is the one on screen
 	void Close();
+	// The game took the question: it is on screen, waits in the popup queue, or was answered. The game adds a popup without saying
+	// whether it will ever show (AA-104)
+	bool IsShownOrQueued() const;
+	// The test mode: the next questions never reach the game's popup queue
+	static bool bDropForTest;
 
 	UPROPERTY(Transient, BlueprintReadOnly, Category = "Area Actions")
 	FString Message;
@@ -165,6 +168,7 @@ protected:
 
 private:
 	TArray<FAnswer> Answers;
+	UPROPERTY(Transient)
 	TArray<TObjectPtr<UUserWidget>> Buttons;
 	// The answer that runs once the popup has closed
 	int32 Picked = INDEX_NONE;

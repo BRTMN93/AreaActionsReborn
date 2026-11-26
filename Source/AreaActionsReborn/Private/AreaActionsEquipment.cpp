@@ -205,7 +205,8 @@ void AAreaActionsEquipment::ProcessEvent(UFunction* Function, void* Parameters)
 	bool bLocal = Name == WasEquippedName ? IsLocalInstigator() : bEquippedLocally;
 #if AA_WITH_TESTS
 	// The test mode's stand-in for a WasEquipped that comes before the character is the local one
-	bLocal &= Name != WasEquippedName || !FParse::Param(FCommandLine::Get(), TEXT("AATestLateEquip"));
+	static const bool bLateEquip = FParse::Param(FCommandLine::Get(), TEXT("AATestLateEquip")) && FCString::Stristr(FCommandLine::Get(), TEXT("-AATest=")) != nullptr;
+	bLocal &= Name != WasEquippedName || !bLateEquip;
 #endif
 	// On taking the tool away the instigator may be gone already, so the answer of WasEquipped is kept
 	bEquippedLocally = Name == WasEquippedName && bLocal;

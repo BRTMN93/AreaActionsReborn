@@ -59,8 +59,6 @@ namespace AreaActionsBuildings
 	bool IsLightweightClass(const UClass* Class);
 	// The building's box in its own space: its clearance box or, without one, the bounds of its meshes; false when there is none
 	bool GetLocalBox(const FSnapshot& Building, FBox& Out);
-	// The same for a lightweight found by a hit (class and index in the subsystem)
-	bool GetLightweight(UWorld* World, UClass* Class, int32 Index, FSnapshot& Out);
 	// The building a trace hit: an actor, or a lightweight through its instance handle; false for anything else
 	bool FromHit(UWorld* World, const FHitResult& Hit, FSnapshot& Out);
 	// The 8 corners of the building's box in the world, the top face first and going round (as the tool's GetActorCorners); empty without a box

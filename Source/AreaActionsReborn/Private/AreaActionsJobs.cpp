@@ -531,12 +531,21 @@ namespace
 			Depot = AFGCentralStorageSubsystem::Get(World);
 		}
 
-		int32 Count(TSubclassOf<UFGItemDescriptor> Item) const
+		// Stops counting at Enough: a copy's cost is asked for every copy, and the player's own inventory usually covers it
+		int32 Count(TSubclassOf<UFGItemDescriptor> Item, int64 Enough = MAX_int64) const
 		{
-			int64 Total = Depot.IsValid() ? Depot->GetNumItemsFromCentralStorage(Item) : 0;
+			int64 Total = 0;
 			for (const TWeakObjectPtr<UFGInventoryComponent>& Inventory : Inventories)
 			{
+				if (Total >= Enough)
+				{
+					break;
+				}
 				Total += Inventory.IsValid() ? Inventory->GetNumItems(Item) : 0;
+			}
+			if (Total < Enough && Depot.IsValid())
+			{
+				Total += Depot->GetNumItemsFromCentralStorage(Item);
 			}
 			return static_cast<int32>(FMath::Min<int64>(Total, MAX_int32));
 		}
@@ -545,7 +554,7 @@ namespace
 		{
 			for (const TPair<TSubclassOf<UFGItemDescriptor>, int32>& Entry : Cost)
 			{
-				if (Count(Entry.Key) < Entry.Value)
+				if (Count(Entry.Key, Entry.Value) < Entry.Value)
 				{
 					return false;
 				}
@@ -559,6 +568,10 @@ namespace
 			const int32 Want = Amount;
 			for (const TWeakObjectPtr<UFGInventoryComponent>& Inventory : Inventories)
 			{
+				if (Amount == 0)
+				{
+					break;
+				}
 				const int32 Here = Inventory.IsValid() ? FMath::Min(Amount, Inventory->GetNumItems(Item)) : 0;
 				if (Here > 0)
 				{

@@ -32,7 +32,7 @@ public:
 };
 
 // Parent of the Blueprint BaseAction. The tool spawns an action's Blueprint on the player's machine (Equip_AreaActions.InitAction); with
-// NativeAction set, this class runs it in C++ and the Blueprint only holds data. Without it (MassDismantle until it moves to C++) the
+// NativeAction set, this class runs it in C++ and the Blueprint only holds data. Without it the
 // Blueprint's own graph runs as before. Names here differ from the Blueprint's members (Title, Description, Player, AreaActionsEquip, Init,
 // Run, Done, Finished), which stay in the Blueprint, except OnLeftClick and OnRightClick, which replace BaseAction's own events.
 UCLASS(Abstract)

@@ -506,6 +506,9 @@ UWidget* UAreaActionsFillWindow::BuildContent()
 	Count.bFloat = false;
 	Count.Default = 1.0;
 	Count.bAllowZero = false;
+	// As the server allows (MaxAmount); the preview plans with these numbers on the player's own machine
+	Count.Min = -1.0e6;
+	Count.Max = 1.0e6;
 	UVerticalBox* Amount = Column(LOCTEXT("FillAmount", "Copies (minus: back)"), false);
 	Add(Amount, TEXT("XAmount"), TEXT("X"), Red, Count);
 	Add(Amount, TEXT("YAmount"), TEXT("Y"), Green, Count);

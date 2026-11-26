@@ -97,7 +97,9 @@ void AAreaActionsServerSubsystem::Tick(float DeltaSeconds)
 			++Index;
 			continue;
 		}
+		// The job's end (the return crates packed again) counts as part of its last slice
 		Job.Finish(GetWorld());
+		Job.MaxSliceMs = FMath::Max(Job.MaxSliceMs, (FPlatformTime::Seconds() - SliceStart) * 1000.0);
 		UE_LOG(LogAreaActionsCpp, Display, TEXT("AAJOB %s items=%d frames=%d maxslice=%.2f code=%d buildings=%d"),
 			Job.GetName(), Job.GetItems(), Job.Frames, Job.MaxSliceMs, static_cast<int32>(Job.Result.Code), Job.Result.Buildings);
 		++FinishedJobs;

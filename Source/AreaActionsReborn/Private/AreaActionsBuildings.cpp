@@ -13,6 +13,8 @@
 #include "Buildables/FGBuildableRailroadSwitchControl.h"
 #include "Buildables/FGBuildableRailroadTrack.h"
 #include "Buildables/FGBuildableResourceExtractor.h"
+#include "Buildables/FGBuildableSpaceElevator.h"
+#include "Buildables/FGBuildableTradingPost.h"
 #include "Buildables/FGBuildableWire.h"
 #include "Buildables/FGPipeHyperStart.h"
 #include "Components/InstancedStaticMeshComponent.h"
@@ -93,7 +95,9 @@ namespace AreaActionsBuildings
 		static const UClass* const Skipped[] = { AFGBuildableConveyorBase::StaticClass(), AFGBuildableWire::StaticClass(), AFGBuildableRailroadTrack::StaticClass(),
 			AFGBuildableRailroadSwitchControl::StaticClass(), AFGBuildablePole::StaticClass(), AFGBuildablePipeBase::StaticClass(), AFGBuildablePipeHyper::StaticClass(),
 			AFGBuildablePoleStackable::StaticClass(), AFGPipeHyperStart::StaticClass(), AFGBuildableResourceExtractor::StaticClass(),
-			AFGBuildablePipeHyperAttachment::StaticClass() };
+			AFGBuildablePipeHyperAttachment::StaticClass(),
+			// The game allows one of each; its Build Gun refuses a second, a spawned copy would not be refused
+			AFGBuildableTradingPost::StaticClass(), AFGBuildableSpaceElevator::StaticClass() };
 		for (const UClass* Each : Skipped)
 		{
 			if (Class && Class->IsChildOf(Each))
@@ -152,18 +156,6 @@ namespace AreaActionsBuildings
 			}
 		}
 		return Out.IsValid != 0;
-	}
-
-	bool GetLightweight(UWorld* World, UClass* Class, int32 Index, FSnapshot& Out)
-	{
-		AFGLightweightBuildableSubsystem* Lightweights = AFGLightweightBuildableSubsystem::Get(World);
-		const FRuntimeBuildableInstanceData* Data = Lightweights ? Lightweights->GetRuntimeDataForBuildableClassAndIndex(Class, Index) : nullptr;
-		if (!Data || !Data->IsValid())
-		{
-			return false;
-		}
-		FromLightweight(Class, Index, *Data, Out);
-		return true;
 	}
 
 	bool FromHit(UWorld* World, const FHitResult& Hit, FSnapshot& Out)
@@ -406,6 +398,11 @@ namespace AreaActionsBuildings
 		FillSteps(Placement.Amount.X, StepsX);
 		FillSteps(Placement.Amount.Y, StepsY);
 		FillSteps(Placement.Amount.Z, StepsZ);
+		// A count of 0 asks for nothing; without this the two other loops would still run in full around an empty one
+		if (StepsX.IsEmpty() || StepsY.IsEmpty() || StepsZ.IsEmpty())
+		{
+			return;
+		}
 		const FVector Pitch = Frame.PatternSize + Placement.Border;
 		for (const int32 X : StepsX)
 		{
