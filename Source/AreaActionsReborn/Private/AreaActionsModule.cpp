@@ -3,4 +3,4 @@
 
 DEFINE_LOG_CATEGORY(LogAreaActionsCpp);
 
-IMPLEMENT_MODULE(FDefaultModuleImpl, AreaActions);
+IMPLEMENT_MODULE(FDefaultModuleImpl, AreaActionsReborn);

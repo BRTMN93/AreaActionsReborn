@@ -11,7 +11,7 @@ class UTextBlock;
 // and the actions as the game's list buttons, the help steps under them. The Blueprint keeps its dispatchers (BuildStatusSelected,
 // ActionSelected), which the tool binds, and the help's texts (HelpMessages, NextText, DoneText, the *MessagesIdx lists).
 UCLASS(Abstract)
-class AREAACTIONS_API UAreaActionsPopupBase : public UAreaActionsWindow
+class AREAACTIONSREBORN_API UAreaActionsPopupBase : public UAreaActionsWindow
 {
 	GENERATED_BODY()
 

@@ -235,7 +235,7 @@ UHorizontalBox* UAreaActionsPlaceWindow::MakeButtonRow()
 
 AActor* UAreaActionsPlaceWindow::GetSettings() const
 {
-	UClass* Class = LoadClass<AActor>(nullptr, TEXT("/AreaActions/Actions/ActionsSettings.ActionsSettings_C"));
+	UClass* Class = LoadClass<AActor>(nullptr, TEXT("/AreaActionsReborn/Actions/ActionsSettings.ActionsSettings_C"));
 	return Class ? UGameplayStatics::GetActorOfClass(GetOwningPlayer(), Class) : nullptr;
 }
 

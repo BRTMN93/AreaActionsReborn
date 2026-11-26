@@ -9,7 +9,7 @@
 // game's API and are not ported (AA-060). Whether the player saw the help to its end is kept in the player's settings file
 // (AreaActionsSettings, decision D21), so a client keeps it too; the flags here only stay for saves made before.
 UCLASS(Abstract)
-class AREAACTIONS_API AAreaActionsTutorialSubsystem : public AActor, public IFGSaveInterface
+class AREAACTIONSREBORN_API AAreaActionsTutorialSubsystem : public AActor, public IFGSaveInterface
 {
 	GENERATED_BODY()
 

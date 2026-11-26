@@ -5,7 +5,7 @@
 
 // The selected area: a polygon in XY and a height range. Comes from the client, so the server checks it before any use.
 USTRUCT(BlueprintType)
-struct AREAACTIONS_API FAreaActionsArea
+struct AREAACTIONSREBORN_API FAreaActionsArea
 {
 	GENERATED_BODY()
 
@@ -55,7 +55,7 @@ enum class EAreaActionsDismantleRefund : uint8
 };
 
 USTRUCT(BlueprintType)
-struct AREAACTIONS_API FAreaActionsClassCount
+struct AREAACTIONSREBORN_API FAreaActionsClassCount
 {
 	GENERATED_BODY()
 
@@ -68,7 +68,7 @@ struct AREAACTIONS_API FAreaActionsClassCount
 
 // The server's answer. Kept small: an RPC carries at most 64 KB, so the counts per class stop at MaxCounts.
 USTRUCT(BlueprintType)
-struct AREAACTIONS_API FAreaActionsResult
+struct AREAACTIONSREBORN_API FAreaActionsResult
 {
 	GENERATED_BODY()
 
@@ -118,7 +118,7 @@ struct AREAACTIONS_API FAreaActionsResult
 // Where Copy and Fill put the copies: the player's numbers, not transforms. Both sides turn them into transforms with the same code
 // (AreaActionsBuildings), from the buildings each side finds in the area; the server checks every number before use.
 USTRUCT(BlueprintType)
-struct AREAACTIONS_API FAreaActionsPlacement
+struct AREAACTIONSREBORN_API FAreaActionsPlacement
 {
 	GENERATED_BODY()
 

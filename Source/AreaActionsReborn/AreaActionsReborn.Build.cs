@@ -1,8 +1,8 @@
 using UnrealBuildTool;
 
-public class AreaActions : ModuleRules
+public class AreaActionsReborn : ModuleRules
 {
-	public AreaActions(ReadOnlyTargetRules Target) : base(Target)
+	public AreaActionsReborn(ReadOnlyTargetRules Target) : base(Target)
 	{
 		PCHUsage = PCHUsageMode.UseExplicitOrSharedPCHs;
 		CppStandard = CppStandardVersion.Cpp20;

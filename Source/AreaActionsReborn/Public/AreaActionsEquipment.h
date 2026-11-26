@@ -13,7 +13,7 @@ namespace AreaActionsBuildings { struct FSnapshot; }
 // Parent of the tool Blueprint Equip_AreaActions. Functions here keep the name and the pins of the Blueprint functions they replace, so
 // the Blueprint's call nodes bind to them once the Blueprint's own version is removed.
 UCLASS(Abstract)
-class AREAACTIONS_API AAreaActionsEquipment : public AFGEquipment
+class AREAACTIONSREBORN_API AAreaActionsEquipment : public AFGEquipment
 {
 	GENERATED_BODY()
 

@@ -70,7 +70,7 @@ namespace AreaActionsUI
 // A window of the tool in the game's look: the game's window frame (title, close button), its content background and the content
 // BuildContent makes. Opened through the tool's window stack (Equip_AreaActions.AddWidget), closed through it (RemoveWidget).
 UCLASS(Abstract)
-class AREAACTIONS_API UAreaActionsWindow : public UFGInteractWidget
+class AREAACTIONSREBORN_API UAreaActionsWindow : public UFGInteractWidget
 {
 	GENERATED_BODY()
 
@@ -109,7 +109,7 @@ protected:
 // The tool's message window Equip_AreaActions makes (Widget_MessageOk: "At least 3 corners needed"): it shows the game's popup with its
 // Title and Message (Blueprint strings) and leaves the tool's stack at once.
 UCLASS(Abstract)
-class AREAACTIONS_API UAreaActionsMessageShim : public UFGInteractWidget
+class AREAACTIONSREBORN_API UAreaActionsMessageShim : public UFGInteractWidget
 {
 	GENERATED_BODY()
 
@@ -119,7 +119,7 @@ protected:
 
 // The selection state under the crosshair (Widget_AreaBuildingStatus), in the look of the game's key hints
 UCLASS(Abstract)
-class AREAACTIONS_API UAreaActionsStatusWidget : public UUserWidget
+class AREAACTIONSREBORN_API UAreaActionsStatusWidget : public UUserWidget
 {
 	GENERATED_BODY()
 
@@ -136,7 +136,7 @@ private:
 // A question in the game's popup: its message and one game button per answer, plus Cancel unless an answer cancels. The popup's own
 // close (Escape) counts as Cancel.
 UCLASS()
-class AREAACTIONS_API UAreaActionsChoiceContent : public UFGPopupWidgetContent
+class AREAACTIONSREBORN_API UAreaActionsChoiceContent : public UFGPopupWidgetContent
 {
 	GENERATED_BODY()
 

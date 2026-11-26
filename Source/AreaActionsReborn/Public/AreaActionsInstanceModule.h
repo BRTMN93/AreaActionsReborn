@@ -7,7 +7,7 @@
 // The mod's game instance root. Pure C++: bRootModule is set here and there is no Blueprint child (a flagged child as well would be a
 // second root, which SML stops with a Fatal error).
 UCLASS()
-class AREAACTIONS_API UAreaActionsInstanceModule : public UGameInstanceModule
+class AREAACTIONSREBORN_API UAreaActionsInstanceModule : public UGameInstanceModule
 {
 	GENERATED_BODY()
 

@@ -52,7 +52,7 @@ namespace
 	// Defaults_C.StateToTitle / StateToDescription: the selection modes' texts
 	FText StateText(const TCHAR* Map, uint8 State)
 	{
-		const UClass* Defaults = LoadClass<UObject>(nullptr, TEXT("/AreaActions/Equipment/AreaActions/Defaults.Defaults_C"));
+		const UClass* Defaults = LoadClass<UObject>(nullptr, TEXT("/AreaActionsReborn/Equipment/AreaActions/Defaults.Defaults_C"));
 		const UObject* Object = Defaults ? Defaults->GetDefaultObject() : nullptr;
 		const FMapProperty* Property = Object ? FindFProperty<FMapProperty>(Object->GetClass(), Map) : nullptr;
 		if (!Property || !CastField<FTextProperty>(Property->ValueProp))
@@ -76,7 +76,7 @@ FText UAreaActionsPopupBase::GetTitle() const
 	FString Version;
 	const UGameInstance* Instance = GetGameInstance();
 	FModInfo Info;
-	if (UModLoadingLibrary* Mods = Instance ? Instance->GetSubsystem<UModLoadingLibrary>() : nullptr; Mods && Mods->GetLoadedModInfo(TEXT("AreaActions"), Info))
+	if (UModLoadingLibrary* Mods = Instance ? Instance->GetSubsystem<UModLoadingLibrary>() : nullptr; Mods && Mods->GetLoadedModInfo(TEXT("AreaActionsReborn"), Info))
 	{
 		Version = Info.Version.ToString();
 	}

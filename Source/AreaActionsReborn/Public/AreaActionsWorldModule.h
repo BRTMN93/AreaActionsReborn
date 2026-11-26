@@ -8,7 +8,7 @@ class AAreaActionBase;
 
 // Parent of the Blueprint root AreaActions_GameWorldModule, which keeps bRootModule (never set here: two roots are a Fatal error)
 UCLASS()
-class AREAACTIONS_API UAreaActionsWorldModule : public UGameWorldModule
+class AREAACTIONSREBORN_API UAreaActionsWorldModule : public UGameWorldModule
 {
 	GENERATED_BODY()
 

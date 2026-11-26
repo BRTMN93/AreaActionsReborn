@@ -9,7 +9,7 @@ class UUserWidget;
 
 // The recipe list (Widget_SetRecipe), then the request; the result names the machines changed per class
 UCLASS()
-class AREAACTIONS_API UAreaActionSetRecipe : public UAreaAction
+class AREAACTIONSREBORN_API UAreaActionSetRecipe : public UAreaAction
 {
 	GENERATED_BODY()
 
@@ -30,7 +30,7 @@ private:
 
 // "Delete items" or "Move to crate", then the request; closing the window cancels
 UCLASS()
-class AREAACTIONS_API UAreaActionClearInventories : public UAreaAction
+class AREAACTIONSREBORN_API UAreaActionClearInventories : public UAreaAction
 {
 	GENERATED_BODY()
 
@@ -51,7 +51,7 @@ private:
 // "Refund to crate", "No refund" or "Cost only" (with "No Build Cost": OK or Cancel, AA-092), then the request; closing the window cancels. The result names the buildings, the refund, the crates
 // and what the game did not let anyone dismantle
 UCLASS()
-class AREAACTIONS_API UAreaActionMassDismantle : public UAreaAction
+class AREAACTIONSREBORN_API UAreaActionMassDismantle : public UAreaAction
 {
 	GENERATED_BODY()
 
@@ -75,7 +75,7 @@ private:
 
 // "Load" or "Unload", then the request; closing the window cancels
 UCLASS()
-class AREAACTIONS_API UAreaActionSetStationMode : public UAreaAction
+class AREAACTIONSREBORN_API UAreaActionSetStationMode : public UAreaAction
 {
 	GENERATED_BODY()
 

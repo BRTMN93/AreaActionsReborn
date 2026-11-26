@@ -17,7 +17,7 @@ UAreaActionsWorldModule* UAreaActionsWorldModule::Get(const UObject* WorldContex
 {
 	const UWorld* World = WorldContext ? WorldContext->GetWorld() : nullptr;
 	const UWorldModuleManager* Manager = World ? World->GetSubsystem<UWorldModuleManager>() : nullptr;
-	return Manager ? Cast<UAreaActionsWorldModule>(Manager->FindModule(TEXT("AreaActions"))) : nullptr;
+	return Manager ? Cast<UAreaActionsWorldModule>(Manager->FindModule(TEXT("AreaActionsReborn"))) : nullptr;
 }
 
 void UAreaActionsWorldModule::AddAction(TSubclassOf<AAreaActionBase> Action)

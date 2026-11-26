@@ -15,7 +15,7 @@ class UStaticMesh;
 // length) or has children, are instanced meshes in the game's valid placement material. Nothing of it is
 // saved or replicated.
 UCLASS(NotPlaceable, Transient)
-class AREAACTIONS_API AAreaActionsPreview : public AActor
+class AREAACTIONSREBORN_API AAreaActionsPreview : public AActor
 {
 	GENERATED_BODY()
 
@@ -46,7 +46,7 @@ private:
 // Copy and Fill on the player's machine: the window's numbers become a placement; the preview and the server turn it into the same places
 // from the buildings each finds in the area (AreaActionsBuildings)
 UCLASS(Abstract)
-class AREAACTIONS_API UAreaActionPlaceCopies : public UAreaAction
+class AREAACTIONSREBORN_API UAreaActionPlaceCopies : public UAreaAction
 {
 	GENERATED_BODY()
 
@@ -92,7 +92,7 @@ protected:
 };
 
 UCLASS()
-class AREAACTIONS_API UAreaActionCopy : public UAreaActionPlaceCopies
+class AREAACTIONSREBORN_API UAreaActionCopy : public UAreaActionPlaceCopies
 {
 	GENERATED_BODY()
 
@@ -122,7 +122,7 @@ private:
 };
 
 UCLASS()
-class AREAACTIONS_API UAreaActionFill : public UAreaActionPlaceCopies
+class AREAACTIONSREBORN_API UAreaActionFill : public UAreaActionPlaceCopies
 {
 	GENERATED_BODY()
 

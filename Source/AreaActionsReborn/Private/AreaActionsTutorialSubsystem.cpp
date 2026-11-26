@@ -23,7 +23,7 @@ namespace AreaActionsSettings
 			Name = FParse::Value(FCommandLine::Get(), TEXT("AATestRole="), Role) ? FString::Printf(TEXT("Settings_Test_%s"), *Role) : TEXT("Settings_Test");
 		}
 #endif
-		return FPaths::Combine(FPaths::ProjectSavedDir(), TEXT("AreaActions"), Name + TEXT(".ini"));
+		return FPaths::Combine(FPaths::ProjectSavedDir(), TEXT("AreaActionsReborn"), Name + TEXT(".ini"));
 	}
 
 	static FConfigFile& File()

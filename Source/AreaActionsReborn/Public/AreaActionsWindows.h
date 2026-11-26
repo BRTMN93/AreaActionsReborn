@@ -21,7 +21,7 @@ DECLARE_DYNAMIC_MULTICAST_DELEGATE_ThreeParams(FAreaActionsFillPreview, FVector,
 // SetRecipe's window (was Widget_SetRecipe): the game's search box over the recipes the factory machines make, as the game's list
 // buttons with the product's icon. The dispatchers keep the old window's names, so the action binds them as before.
 UCLASS()
-class AREAACTIONS_API UAreaActionsRecipeWindow : public UAreaActionsWindow
+class AREAACTIONSREBORN_API UAreaActionsRecipeWindow : public UAreaActionsWindow
 {
 	GENERATED_BODY()
 
@@ -59,7 +59,7 @@ private:
 // game's toggle, the container distance as a slider with its field, the game's buttons; Hide and the pick buttons hide the window while
 // the player clicks into the world.
 UCLASS(Abstract)
-class AREAACTIONS_API UAreaActionsPlaceWindow : public UAreaActionsWindow
+class AREAACTIONSREBORN_API UAreaActionsPlaceWindow : public UAreaActionsWindow
 {
 	GENERATED_BODY()
 
@@ -120,7 +120,7 @@ protected:
 
 // Copy's settings: offset in metres, rotation in degrees, paste to a clicked place, rotation centre, preview, OK
 UCLASS()
-class AREAACTIONS_API UAreaActionsCopyWindow : public UAreaActionsPlaceWindow
+class AREAACTIONSREBORN_API UAreaActionsCopyWindow : public UAreaActionsPlaceWindow
 {
 	GENERATED_BODY()
 
@@ -159,7 +159,7 @@ protected:
 
 // Fill's settings: copies along each axis (with direction), the gap between them, the ramp, fill to a clicked place, preview, OK
 UCLASS()
-class AREAACTIONS_API UAreaActionsFillWindow : public UAreaActionsPlaceWindow
+class AREAACTIONSREBORN_API UAreaActionsFillWindow : public UAreaActionsPlaceWindow
 {
 	GENERATED_BODY()
 

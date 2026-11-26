@@ -426,7 +426,7 @@ bool UAreaActionPlaceCopies::CallWindow(FName Name, TFunctionRef<bool(UFunction*
 
 AActor* UAreaActionPlaceCopies::GetSettings() const
 {
-	static const TCHAR* Path = TEXT("/AreaActions/Actions/ActionsSettings.ActionsSettings_C");
+	static const TCHAR* Path = TEXT("/AreaActionsReborn/Actions/ActionsSettings.ActionsSettings_C");
 	UClass* Class = LoadClass<AActor>(nullptr, Path);
 	return Class ? UGameplayStatics::GetActorOfClass(GetShell(), Class) : nullptr;
 }
@@ -543,7 +543,7 @@ void UAreaActionCopy::OnClick(bool bRight)
 				FActorSpawnParameters Parameters;
 				Parameters.Owner = Shell;
 				Parameters.SpawnCollisionHandlingOverride = ESpawnActorCollisionHandlingMethod::AlwaysSpawn;
-				UClass* MarkerClass = LoadClass<AActor>(nullptr, TEXT("/AreaActions/Actions/Copy/CopyRotationCenter.CopyRotationCenter_C"));
+				UClass* MarkerClass = LoadClass<AActor>(nullptr, TEXT("/AreaActionsReborn/Actions/Copy/CopyRotationCenter.CopyRotationCenter_C"));
 				RotationMarker = MarkerClass ? World->SpawnActor<AActor>(MarkerClass, FTransform(Points[0]), Parameters) : nullptr;
 				if (bPreviewing)
 				{

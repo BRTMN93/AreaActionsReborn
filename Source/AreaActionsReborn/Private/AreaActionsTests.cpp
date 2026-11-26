@@ -354,8 +354,8 @@ namespace
 
 	// --- The tool (AA-005): the Blueprint's own variables and events, read and called by name ---
 
-	const TCHAR* ToolItem = TEXT("/AreaActions/Equipment/AreaActions/Desc_AreaActions.Desc_AreaActions_C");
-	const TCHAR* StateEnum = TEXT("/AreaActions/Equipment/AreaActions/AreaBuildingStateEnum.AreaBuildingStateEnum");
+	const TCHAR* ToolItem = TEXT("/AreaActionsReborn/Equipment/AreaActions/Desc_AreaActions.Desc_AreaActions_C");
+	const TCHAR* StateEnum = TEXT("/AreaActionsReborn/Equipment/AreaActions/AreaBuildingStateEnum.AreaBuildingStateEnum");
 
 	AFGCharacterPlayer* GetCharacter(const FRun& R)
 	{
@@ -813,7 +813,7 @@ namespace
 				return EStep::Next;
 			}
 			FString Version;
-			if (const FPluginDescriptor* Descriptor = IPluginManager::Get().FindPlugin(TEXT("AreaActions")) ? &IPluginManager::Get().FindPlugin(TEXT("AreaActions"))->GetDescriptor() : nullptr)
+			if (const FPluginDescriptor* Descriptor = IPluginManager::Get().FindPlugin(TEXT("AreaActionsReborn")) ? &IPluginManager::Get().FindPlugin(TEXT("AreaActionsReborn"))->GetDescriptor() : nullptr)
 			{
 				Version = Descriptor->VersionName;
 			}
@@ -3152,7 +3152,7 @@ namespace
 		R.Steps.Add(WaitFrames(3));
 		R.Steps.Add([C](FRun& Self)
 		{
-			UClass* MarkerClass = LoadClass<AActor>(nullptr, TEXT("/AreaActions/Actions/Copy/CopyRotationCenter.CopyRotationCenter_C"));
+			UClass* MarkerClass = LoadClass<AActor>(nullptr, TEXT("/AreaActionsReborn/Actions/Copy/CopyRotationCenter.CopyRotationCenter_C"));
 			AActor* Marker = MarkerClass ? UGameplayStatics::GetActorOfClass(Self.GetWorld(), MarkerClass) : nullptr;
 			if (Self.Check(Marker != nullptr, FString::Printf(TEXT("rotation centre marker %s"), Marker ? *Marker->GetActorLocation().ToCompactString() : TEXT("none"))))
 			{
@@ -6206,8 +6206,8 @@ namespace
 	{
 		AddChecks(R, [When](FRun& Self)
 		{
-			UClass* Schematic = LoadClass<UFGSchematic>(nullptr, TEXT("/AreaActions/Schematic_AreaActions.Schematic_AreaActions_C"));
-			TSubclassOf<UFGRecipe> ToolRecipe = LoadClass<UFGRecipe>(nullptr, TEXT("/AreaActions/Equipment/AreaActions/Recipe_AreaActions.Recipe_AreaActions_C"));
+			UClass* Schematic = LoadClass<UFGSchematic>(nullptr, TEXT("/AreaActionsReborn/Schematic_AreaActions.Schematic_AreaActions_C"));
+			TSubclassOf<UFGRecipe> ToolRecipe = LoadClass<UFGRecipe>(nullptr, TEXT("/AreaActionsReborn/Equipment/AreaActions/Recipe_AreaActions.Recipe_AreaActions_C"));
 			AFGSchematicManager* Schematics = AFGSchematicManager::Get(Self.GetWorld());
 			AFGRecipeManager* Recipes = AFGRecipeManager::Get(Self.GetWorld());
 			Self.Check(Schematic && Schematics && Schematics->IsSchematicPurchased(Schematic), FString::Printf(TEXT("%s: schematic %s given"), When, *GetNameSafe(Schematic)));
@@ -7550,8 +7550,8 @@ namespace
 	// AA-040 point 2: what this game holds of the mod's windows, the tool's indicators and action actors right now
 	void Watch(FRun& R)
 	{
-		static const TCHAR* Indicators[] = { TEXT("/AreaActions/Equipment/AreaActions/Indicators/AreaActionsCorner.AreaActionsCorner_C"),
-			TEXT("/AreaActions/Equipment/AreaActions/Indicators/AreaActionsWall.AreaActionsWall_C"), TEXT("/AreaActions/Equipment/AreaActions/Indicators/AreaActionsZ.AreaActionsZ_C") };
+		static const TCHAR* Indicators[] = { TEXT("/AreaActionsReborn/Equipment/AreaActions/Indicators/AreaActionsCorner.AreaActionsCorner_C"),
+			TEXT("/AreaActionsReborn/Equipment/AreaActions/Indicators/AreaActionsWall.AreaActionsWall_C"), TEXT("/AreaActionsReborn/Equipment/AreaActions/Indicators/AreaActionsZ.AreaActionsZ_C") };
 		static TMap<const UClass*, bool> Ours;
 		const UWorld* World = R.GetWorld();
 		const auto CountOf = [World](const UClass* Class)
@@ -7573,7 +7573,7 @@ namespace
 			bool* bOurs = Ours.Find(Widget->GetClass());
 			if (!bOurs)
 			{
-				bOurs = &Ours.Add(Widget->GetClass(), Widget->GetClass()->GetPathName().StartsWith(TEXT("/AreaActions/")));
+				bOurs = &Ours.Add(Widget->GetClass(), Widget->GetClass()->GetPathName().StartsWith(TEXT("/AreaActionsReborn/")));
 			}
 			// A widget made for a player has that player's world; the templates inside a widget class have none
 			Windows += *bOurs && IsValid(Widget) && Widget->GetWorld() == World ? 1 : 0;

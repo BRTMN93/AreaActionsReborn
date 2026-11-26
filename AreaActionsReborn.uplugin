@@ -1,0 +1,35 @@
+{
+	"FileVersion": 3,
+	"Version": 2,
+	"VersionName": "2.0.0",
+	"SemVersion": "2.0.0",
+	"FriendlyName": "Area Actions Reborn",
+	"Description": "Select an area and run an action on everything in it: set recipes, clear inventories, set station modes, fill, copy, mass dismantle. A port of Area Actions to Satisfactory 1.x with multiplayer.",
+	"Category": "Modding",
+	"CreatedBy": "BRTMN, Mircea Roata",
+	"GameVersion": ">=520140",
+	"RequiredOnRemote": true,
+	"RemoteVersionRange": ">=2.0.0",
+	"CreatedByURL": "",
+	"DocsURL": "",
+	"MarketplaceURL": "",
+	"SupportURL": "",
+	"CanContainContent": true,
+	"IsBetaVersion": false,
+	"IsExperimentalVersion": false,
+	"Installed": false,
+	"Modules": [
+		{
+			"Name": "AreaActionsReborn",
+			"Type": "Runtime",
+			"LoadingPhase": "Default"
+		}
+	],
+	"Plugins": [
+		{
+			"Name": "SML",
+			"SemVersion": "^3.12.1",
+			"Enabled": true
+		}
+	]
+}

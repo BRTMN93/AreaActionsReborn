@@ -10,7 +10,7 @@ class UAreaActionsRCO;
 
 // One action request on the server, run in slices: first it collects the buildings in the area, then it changes them one by one.
 // A job keeps weak pointers only and checks every building right before it uses it.
-class AREAACTIONS_API FAreaActionsJob
+class AREAACTIONSREBORN_API FAreaActionsJob
 {
 public:
 	virtual ~FAreaActionsJob() = default;
@@ -50,7 +50,7 @@ public:
 
 // The server's side of the actions: the job queue, run in Tick within AreaActions.ServerBudgetMs per frame for all players together
 UCLASS()
-class AREAACTIONS_API AAreaActionsServerSubsystem : public AModSubsystem
+class AREAACTIONSREBORN_API AAreaActionsServerSubsystem : public AModSubsystem
 {
 	GENERATED_BODY()
 

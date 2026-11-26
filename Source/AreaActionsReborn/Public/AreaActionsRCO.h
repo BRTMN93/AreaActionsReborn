@@ -11,7 +11,7 @@ class FAreaActionsJob;
 // One for every player. Every change of the world goes through it, also in a game for one player; the server checks all it gets.
 // Server calls carry the area and the action's parameters only; the server answers each with ClientResult and the same RequestId.
 UCLASS()
-class AREAACTIONS_API UAreaActionsRCO : public UFGRemoteCallObject
+class AREAACTIONSREBORN_API UAreaActionsRCO : public UFGRemoteCallObject
 {
 	GENERATED_BODY()
 

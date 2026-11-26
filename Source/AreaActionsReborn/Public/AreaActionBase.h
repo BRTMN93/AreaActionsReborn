@@ -12,7 +12,7 @@ class UUserWidget;
 
 // The C++ side of one action on the player's machine: its windows, its request to the server and the answer.
 UCLASS(Abstract)
-class AREAACTIONS_API UAreaAction : public UObject
+class AREAACTIONSREBORN_API UAreaAction : public UObject
 {
 	GENERATED_BODY()
 
@@ -36,7 +36,7 @@ public:
 // Blueprint's own graph runs as before. Names here differ from the Blueprint's members (Title, Description, Player, AreaActionsEquip, Init,
 // Run, Done, Finished), which stay in the Blueprint, except OnLeftClick and OnRightClick, which replace BaseAction's own events.
 UCLASS(Abstract)
-class AREAACTIONS_API AAreaActionBase : public AActor
+class AREAACTIONSREBORN_API AAreaActionBase : public AActor
 {
 	GENERATED_BODY()
 

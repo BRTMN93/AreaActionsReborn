@@ -355,7 +355,7 @@ TSharedRef<SWidget> UAreaActionsWindow::RebuildWidget()
 					}
 					else if (FObjectPropertyBase* TabIcon = CastField<FObjectPropertyBase>(*It))
 					{
-						TabIcon->SetObjectPropertyValue(Value, LoadObject<UTexture2D>(nullptr, TEXT("/AreaActions/Equipment/AreaActions/UI/AreaActionsIcon64.AreaActionsIcon64")));
+						TabIcon->SetObjectPropertyValue(Value, LoadObject<UTexture2D>(nullptr, TEXT("/AreaActionsReborn/Equipment/AreaActions/UI/AreaActionsIcon64.AreaActionsIcon64")));
 					}
 				}
 			}

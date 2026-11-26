@@ -6,7 +6,7 @@
 
 // Editor steps the Python scripts of the editor cannot do themselves (method M1 without the editor window); nothing in the game
 UCLASS()
-class AREAACTIONS_API UAreaActionsEditorTools : public UBlueprintFunctionLibrary
+class AREAACTIONSREBORN_API UAreaActionsEditorTools : public UBlueprintFunctionLibrary
 {
 	GENERATED_BODY()
 
