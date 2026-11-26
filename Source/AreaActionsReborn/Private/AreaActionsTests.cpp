@@ -5982,22 +5982,23 @@ namespace
 		return Property ? Property->GetPropertyValue_InContainer(Object) : INDEX_NONE;
 	}
 
-	// A Blueprint function of the object without parameters that returns a text (the menu's bound texts)
-	FString CallText(UObject* Object, const TCHAR* Function)
+	// The text one of the window's game buttons shows: the first text block inside it with a text, else what the button keeps in mText
+	FString ButtonLabel(const UUserWidget* Window, const TCHAR* Name)
 	{
-		UFunction* Fn = Object ? Object->FindFunction(Function) : nullptr;
-		FTextProperty* Return = Fn ? CastField<FTextProperty>(Fn->GetReturnProperty()) : nullptr;
-		if (!Return)
+		const UWidget* Found = Window ? Window->GetWidgetFromName(Name) : nullptr;
+		FString Label;
+		if (const UUserWidget* Button = Cast<UUserWidget>(Found); Button && Button->WidgetTree)
 		{
-			return TEXT("<none>");
+			Button->WidgetTree->ForEachWidget([&Label](UWidget* Each)
+			{
+				if (const UTextBlock* Block = Cast<UTextBlock>(Each); Block && Label.IsEmpty())
+				{
+					Label = Block->GetText().ToString();
+				}
+			});
 		}
-		uint8* Params = static_cast<uint8*>(FMemory_Alloca(Fn->ParmsSize));
-		FMemory::Memzero(Params, Fn->ParmsSize);
-		Return->InitializeValue_InContainer(Params);
-		Object->ProcessEvent(Fn, Params);
-		const FString Text = Return->GetPropertyValue_InContainer(Params).ToString();
-		Return->DestroyValue_InContainer(Params);
-		return Text;
+		const FTextProperty* Text = Found && Label.IsEmpty() ? FindFProperty<FTextProperty>(Found->GetClass(), TEXT("mText")) : nullptr;
+		return !Label.IsEmpty() ? Label : Text ? Text->GetPropertyValue_InContainer(Found).ToString() : FString(TEXT("<none>"));
 	}
 
 	void CallNoParams(UObject* Object, const TCHAR* Function)
@@ -6088,7 +6089,7 @@ namespace
 		R.Steps.Add([](FRun& Self)
 		{
 			UAreaActionsPopupBase* Popup = GetPopup(Self);
-			Self.Check(CallText(Popup, TEXT("GetFlyText")) == TEXT("Enable flying"), FString::Printf(TEXT("fly button reads '%s'"), *CallText(Popup, TEXT("GetFlyText"))));
+			Self.Check(ButtonLabel(Popup, TEXT("FlyButton")) == TEXT("Enable flying"), FString::Printf(TEXT("fly button reads '%s'"), *ButtonLabel(Popup, TEXT("FlyButton"))));
 			Self.Check(PressButton(Popup, TEXT("FlyButton")), TEXT("FlyButton pressed"));
 			return EStep::Next;
 		});
@@ -6146,7 +6147,7 @@ namespace
 		R.Steps.Add([](FRun& Self)
 		{
 			UAreaActionsPopupBase* Popup = GetPopup(Self);
-			Self.Check(CallText(Popup, TEXT("GetFlyText")) == TEXT("Disable flying"), FString::Printf(TEXT("fly button reads '%s'"), *CallText(Popup, TEXT("GetFlyText"))));
+			Self.Check(ButtonLabel(Popup, TEXT("FlyButton")) == TEXT("Disable flying"), FString::Printf(TEXT("fly button reads '%s'"), *ButtonLabel(Popup, TEXT("FlyButton"))));
 			Self.Check(PressButton(Popup, TEXT("FlyButton")), TEXT("FlyButton pressed again"));
 			return EStep::Next;
 		});
