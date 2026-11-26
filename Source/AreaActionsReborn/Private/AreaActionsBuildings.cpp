@@ -3,7 +3,9 @@
 #include "AreaActionsEquipment.h"
 #include "AreaActionsLog.h"
 #include "Buildables/FGBuildable.h"
+#include "Buildables/FGBuildableCalendar.h"
 #include "Buildables/FGBuildableConveyorBase.h"
+#include "Buildables/FGBuildableGenerator.h"
 #include "Buildables/FGBuildableHubTerminal.h"
 #include "Buildables/FGBuildableManufacturer.h"
 #include "Buildables/FGBuildablePipeBase.h"
@@ -19,6 +21,7 @@
 #include "Buildables/FGBuildableWire.h"
 #include "Buildables/FGPipeHyperStart.h"
 #include "Components/InstancedStaticMeshComponent.h"
+#include "EngineUtils.h"
 #include "FGBuildableBeam.h"
 #include "FGBuildableSubsystem.h"
 #include "FGLightweightBuildableSubsystem.h"
@@ -55,7 +58,23 @@ namespace AreaActionsBuildings
 			return Lightweights ? Lightweights->GetBuiltWithRecipeForBuildableClass(Building.Class) : nullptr;
 		}
 
-		void FromActor(AFGBuildable* Actor, FSnapshot& Out)
+		// The buildings a HUB keeps as parts of its own (terminal, bench, storage, burners, locker ...), from the members the game saves
+		// and replicates: a part's parent pointer is neither, only game code sets it
+		TSet<const AActor*> HubParts(UWorld* World)
+		{
+			TSet<const AActor*> Out;
+			for (TActorIterator<AFGBuildableTradingPost> It(World); It; ++It)
+			{
+				Out.Append({ It->mStorage.Get(), It->mHubTerminal.Get(), It->mWorkBench.Get(), It->mLocker.Get(), It->mPioneerPotty.Get(), It->mCalendar.Get(), It->mMiniGame.Get() });
+				for (const AFGBuildableGenerator* Each : It->mGenerators)
+				{
+					Out.Add(Each);
+				}
+			}
+			return Out;
+		}
+
+		void FromActor(AFGBuildable* Actor, FSnapshot& Out, const TSet<const AActor*>& PartsOfHub)
 		{
 			Out.Class = Actor->GetClass();
 			Out.Transform = Actor->GetActorTransform();
@@ -64,7 +83,7 @@ namespace AreaActionsBuildings
 			Out.Actor = Actor;
 			// A part of an ignored building is ignored with it (the HUB's bench, storage and burners are buildings of their own)
 			const AActor* Parent = Actor->GetParentBuildableActor();
-			Out.bIgnored = ShouldIgnore(Out.Class) || (Parent && ShouldIgnore(Parent->GetClass()));
+			Out.bIgnored = ShouldIgnore(Out.Class) || (Parent && ShouldIgnore(Parent->GetClass())) || PartsOfHub.Contains(Actor);
 			if (const AFGBuildableManufacturer* Machine = Cast<AFGBuildableManufacturer>(Actor))
 			{
 				Out.MachineRecipe = Machine->GetCurrentRecipe();
@@ -165,7 +184,7 @@ namespace AreaActionsBuildings
 	{
 		if (AFGBuildable* Actor = Cast<AFGBuildable>(Hit.GetActor()))
 		{
-			FromActor(Actor, Out);
+			FromActor(Actor, Out, HubParts(World));
 			return true;
 		}
 		AAbstractInstanceManager* Manager = AAbstractInstanceManager::GetInstanceManager(World);
@@ -176,7 +195,7 @@ namespace AreaActionsBuildings
 		}
 		if (AFGBuildable* Owner = Cast<AFGBuildable>(AAbstractInstanceManager::GetOwnerByHandle(Handle)))
 		{
-			FromActor(Owner, Out);
+			FromActor(Owner, Out, HubParts(World));
 			return true;
 		}
 		FLightweightBuildableInstanceRef Ref;
@@ -228,12 +247,14 @@ namespace AreaActionsBuildings
 			// shortcut: a cursor over the live list (as the simple actions); a building removed meanwhile can hide one entry
 			static const TArray<AFGBuildable*> None;
 			const TArray<AFGBuildable*>& All = Buildables ? Buildables->GetAllBuildablesRef() : None;
+			// Read again in every slice: nothing of it is kept over frames
+			const TSet<const AActor*> PartsOfHub = HubParts(World);
 			while (ActorCursor < All.Num())
 			{
 				AFGBuildable* Actor = All[ActorCursor++];
 				if (IsValid(Actor) && !Actor->GetIsLightweightTemporary() && Area.Contains(Actor->GetActorLocation()))
 				{
-					FromActor(Actor, Out.AddDefaulted_GetRef());
+					FromActor(Actor, Out.AddDefaulted_GetRef(), PartsOfHub);
 				}
 				if (TimeUp())
 				{
@@ -379,21 +400,32 @@ namespace AreaActionsBuildings
 				Out.Add({ Source, Transform });
 			}
 		};
+		// The buildings to copy, found once: Fill's loops below must not walk the ignored ones (belts, pipes) again for every cell, and
+		// with nothing to copy no copy would ever reach the limit that ends them
+		TArray<int32> Sources;
+		for (int32 Index = 0; Index < Buildings.Num(); ++Index)
+		{
+			if (!Buildings[Index].bIgnored)
+			{
+				Sources.Add(Index);
+			}
+		}
+		if (Sources.IsEmpty())
+		{
+			return;
+		}
 		if (!Placement.bFill)
 		{
 			const FVector Pivot = Frame.Position + Placement.RotationCenter;
 			const FVector Move = Axes.RotateVector(Placement.Delta);
 			const FQuat Turn(FRotator(0.0, Placement.Yaw, 0.0));
-			for (int32 Index = 0; Index < Buildings.Num(); ++Index)
+			for (const int32 Index : Sources)
 			{
 				const FSnapshot& Building = Buildings[Index];
-				if (!Building.bIgnored)
-				{
-					FTransform Copy = Building.Transform;
-					Copy.SetLocation(Pivot + Move + Turn.RotateVector(Building.Transform.GetLocation() - Pivot));
-					Copy.SetRotation(Turn * Building.Transform.GetRotation());
-					Add(Index, Copy);
-				}
+				FTransform Copy = Building.Transform;
+				Copy.SetLocation(Pivot + Move + Turn.RotateVector(Building.Transform.GetLocation() - Pivot));
+				Copy.SetRotation(Turn * Building.Transform.GetRotation());
+				Add(Index, Copy);
 			}
 			return;
 		}
@@ -402,8 +434,7 @@ namespace AreaActionsBuildings
 		FillSteps(Placement.Amount.Y, StepsY);
 		FillSteps(Placement.Amount.Z, StepsZ);
 		// A count of 0 asks for nothing; without this the two other loops would still run in full around an empty one
-		// The same for an area with nothing to copy (belts or poles alone): no copy would ever reach the limit that ends the loops
-		if (StepsX.IsEmpty() || StepsY.IsEmpty() || StepsZ.IsEmpty() || !Buildings.ContainsByPredicate([](const FSnapshot& Each) { return !Each.bIgnored; }))
+		if (StepsX.IsEmpty() || StepsY.IsEmpty() || StepsZ.IsEmpty())
 		{
 			return;
 		}
@@ -421,14 +452,11 @@ namespace AreaActionsBuildings
 					FVector Offset = Pitch * FVector(X, Y, Z);
 					Offset.Z += FMath::Abs(X) * Placement.Ramp.X + FMath::Abs(Y) * Placement.Ramp.Y;
 					const FVector Move = Axes.RotateVector(Offset);
-					for (int32 Index = 0; Index < Buildings.Num(); ++Index)
+					for (const int32 Index : Sources)
 					{
-						if (!Buildings[Index].bIgnored)
-						{
-							FTransform Copy = Buildings[Index].Transform;
-							Copy.AddToTranslation(Move);
-							Add(Index, Copy);
-						}
+						FTransform Copy = Buildings[Index].Transform;
+						Copy.AddToTranslation(Move);
+						Add(Index, Copy);
 					}
 					if (Out.Num() > Limit)
 					{

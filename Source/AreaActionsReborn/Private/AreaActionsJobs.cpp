@@ -23,6 +23,11 @@
 static TAutoConsoleVariable<int32> CVarMaxSpawnPerRequest(TEXT("AreaActions.MaxSpawnPerRequest"), 10000,
 	TEXT("Most buildings one Copy or Fill may build; a larger request is refused before anything changes"));
 
+// The game starts a dismantle effect for each building actor one frame later, at about 2 ms each: outside the time budget, which sees
+// the dismantling alone (measured: 80 to 100 a frame made frames of 150 to 200 ms)
+static TAutoConsoleVariable<int32> CVarDismantleActorsPerFrame(TEXT("AreaActions.DismantleActorsPerFrame"), 25,
+	TEXT("Most building actors MassDismantle takes down in one frame (lightweight buildings do not count); 0 = the time budget alone"));
+
 namespace
 {
 	struct FTaken
@@ -820,6 +825,7 @@ namespace
 				}
 				bCollected = true;
 			}
+			SliceActors = 0;
 			const int32 Total = FoundCrates.Num() + Buildings.Num();
 			while (Next < Total)
 			{
@@ -836,7 +842,7 @@ namespace
 				{
 					DismantleActor(World, Building.Actor.Get());
 				}
-				if (FPlatformTime::Seconds() > EndTime)
+				if (SliceEnds(EndTime))
 				{
 					return false;
 				}
@@ -929,7 +935,7 @@ namespace
 					{
 						DismantleActor(World, Building.Actor.Get());
 					}
-					if (FPlatformTime::Seconds() > EndTime)
+					if (SliceEnds(EndTime))
 					{
 						return false;
 					}
@@ -1043,8 +1049,16 @@ namespace
 			}
 		}
 
+		// The time budget, or enough building actors for one frame (CVarDismantleActorsPerFrame)
+		bool SliceEnds(double EndTime) const
+		{
+			const int32 Most = CVarDismantleActorsPerFrame.GetValueOnGameThread();
+			return FPlatformTime::Seconds() > EndTime || (Most > 0 && SliceActors >= Most);
+		}
+
 		void DismantleOne(UWorld* World, AActor* Actor)
 		{
+			++SliceActors;
 			Done.Add(Actor);
 			if (bToCrate)
 			{
@@ -1125,6 +1139,8 @@ namespace
 		int32 SweepNext = 0;
 		int32 SweepBefore = 0;
 		int32 Sweeps = 0;
+		// Building actors dismantled in the slice that is running
+		int32 SliceActors = 0;
 		double SweepFrom = 0.0;
 		bool bSweeping = false;
 		bool bSwept = false;

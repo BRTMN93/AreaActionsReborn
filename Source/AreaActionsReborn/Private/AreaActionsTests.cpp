@@ -11,6 +11,9 @@
 #include "Equipment/FGChainsaw.h"
 #include "AreaActionsJobs.h"
 #include "Algo/AnyOf.h"
+#include "Async/Async.h"
+#include "HAL/PlatformStackWalk.h"
+#include <atomic>
 #include "Blueprint/WidgetTree.h"
 #include "Blueprint/WidgetBlueprintGeneratedClass.h"
 #include "Components/NamedSlotInterface.h"
@@ -20,6 +23,10 @@
 #include "FGPowerConnectionComponent.h"
 #include "HAL/IConsoleManager.h"
 #include "Buildables/FGBuildableBlueprintDesigner.h"
+#include "Buildables/FGBuildableCalendar.h"
+#include "Buildables/FGBuildableGenerator.h"
+#include "Buildables/FGBuildableHubTerminal.h"
+#include "Buildables/FGBuildableTradingPost.h"
 #include "Components/CheckBox.h"
 #include "Components/EditableTextBox.h"
 #include "FGCentralStorageSubsystem.h"
@@ -7514,6 +7521,11 @@ namespace
 			State->Actors = ActorCount(Self.GetWorld());
 			State->Lightweights = LightweightCount(Self.GetWorld());
 			Self.Check(S->Inside.Num() == 2 && InArea > 2, FString::Printf(TEXT("the HUB stands with its own parts: %d building actors in the area, %d of them parts of another"), InArea, Parts));
+			// What this game's own collection makes of them (a client plans its preview from it): nothing to copy
+			TArray<AreaActionsBuildings::FSnapshot> Found;
+			AreaActionsBuildings::CollectAll(Self.GetWorld(), S->Area, Found);
+			const int32 Copyable = Algo::CountIf(Found, [](const AreaActionsBuildings::FSnapshot& Each) { return !Each.bIgnored; });
+			Self.Check(Found.Num() >= InArea && Copyable == 0, FString::Printf(TEXT("collected in this game: %d buildings in the area, %d of them to copy (want 0)"), Found.Num(), Copyable));
 			return EStep::Next;
 		});
 		AddOpenAction(R, TEXT("Copy"));
@@ -7711,6 +7723,43 @@ namespace
 			return EStep::Next;
 		});
 		R.Steps.Add(WaitFrames(30));
+		// A HUB of a real save (built with the Build Gun, with its upgrades): Copy and Fill leave every part of it alone
+		R.Steps.Add([](FRun& Self)
+		{
+			for (TActorIterator<AFGBuildableTradingPost> It(Self.GetWorld()); It; ++It)
+			{
+				TArray<const AFGBuildable*> Parts = { It->mStorage.Get(), It->mHubTerminal.Get(), It->mWorkBench.Get(), It->mLocker.Get(), It->mPioneerPotty.Get(), It->mCalendar.Get(),
+					It->mMiniGame.Get() };
+				for (const AFGBuildableGenerator* Each : It->mGenerators)
+				{
+					Parts.Add(Each);
+				}
+				const FVector At = It->GetActorLocation();
+				FAreaActionsArea Around;
+				Around.Polygon = { FVector2D(At.X - 5000, At.Y - 5000), FVector2D(At.X + 5000, At.Y - 5000), FVector2D(At.X + 5000, At.Y + 5000), FVector2D(At.X - 5000, At.Y + 5000) };
+				Around.MinZ = At.Z - 5000.0;
+				Around.MaxZ = At.Z + 5000.0;
+				TArray<AreaActionsBuildings::FSnapshot> Found;
+				AreaActionsBuildings::CollectAll(Self.GetWorld(), Around, Found);
+				int32 Present = 0, Parented = 0, Copyable = 0;
+				for (const AFGBuildable* Part : Parts)
+				{
+					if (!IsValid(Part))
+					{
+						continue;
+					}
+					const AreaActionsBuildings::FSnapshot* Snapshot = Found.FindByPredicate([Part](const AreaActionsBuildings::FSnapshot& Each) { return Each.Actor.Get() == Part; });
+					++Present;
+					Parented += Part->GetParentBuildableActor() ? 1 : 0;
+					Copyable += !Snapshot || !Snapshot->bIgnored ? 1 : 0;
+					Self.Step(FString::Printf(TEXT("HUB part %s: parent building %s, %s"), *Part->GetClass()->GetName(), *GetNameSafe(Part->GetParentBuildableActor()),
+						!Snapshot ? TEXT("not collected") : Snapshot->bIgnored ? TEXT("ignored") : TEXT("to copy")));
+				}
+				Self.Check(Present > 0 && Copyable == 0, FString::Printf(TEXT("the HUB at %s: %d parts, %d with a parent building, %d not ignored by Copy and Fill (want 0); %d buildings within 50 m"),
+					*At.ToCompactString(), Present, Parented, Copyable, Found.Num()));
+			}
+			return EStep::Next;
+		});
 		// What the save's own frames are like, before any action
 		R.Steps.Add([](FRun& Self)
 		{
@@ -7799,8 +7848,33 @@ namespace
 		});
 	}
 
+	// Not a gate scenario, a measurement: the world's own long frames while no action runs (with -AATestHitchStacks the log says where
+	// the game thread is in them)
+	void AddIdleFrames(FRun& R)
+	{
+		AddWholeMap(R, MakeShared<FScene>());
+		R.Steps.Add([](FRun& Self)
+		{
+			Self.MaxFrameMs = 0.0;
+			Self.bMeasureFrames = true;
+			return EStep::Next;
+		});
+		R.Steps.Add(WaitSeconds(60.0));
+		R.Steps.Add([](FRun& Self)
+		{
+			Self.bMeasureFrames = false;
+			Self.Check(true, FString::Printf(TEXT("longest frame in 60 s with no action: %.1f ms"), Self.MaxFrameMs));
+			return EStep::Next;
+		});
+	}
+
 	bool BuildScenario(FRun& R)
 	{
+		if (R.Name == TEXT("IdleFrames"))
+		{
+			AddIdleFrames(R);
+			return true;
+		}
 		if (R.Scenario == TEXT("ChoiceNotShown"))
 		{
 			AddChoiceNotShown(R);
@@ -8484,7 +8558,48 @@ static void WatchFramePhases()
 			Probe->RegisterTickFunction(World->PersistentLevel);
 		}
 	}
-	FCoreDelegates::OnBeginFrame.AddLambda([] { Phases = FPhases(); Phases.Begin = FPlatformTime::Seconds(); });
+	// -AATestHitchStacks: a second thread samples the game thread's stack while a measured frame runs over 100 ms (three samples a frame)
+	static std::atomic<double> MeasuredFrameBegin{ 0.0 };
+	if (FParse::Param(FCommandLine::Get(), TEXT("AATestHitchStacks")))
+	{
+		Async(EAsyncExecution::Thread, []
+		{
+			double Frame = 0.0;
+			int32 Samples = 0;
+			while (!IsEngineExitRequested())
+			{
+				FPlatformProcess::Sleep(0.005f);
+				const double FrameBegin = MeasuredFrameBegin.load();
+				if (FrameBegin != Frame)
+				{
+					Frame = FrameBegin;
+					Samples = 0;
+				}
+				const double Over = FPlatformTime::Seconds() - FrameBegin;
+				if (FrameBegin <= 0.0 || Samples >= 3 || Over < 0.1 + 0.05 * Samples)
+				{
+					continue;
+				}
+				uint64 Stack[48];
+				const uint32 Depth = FPlatformStackWalk::CaptureThreadStackBackTrace(GGameThreadId, Stack, UE_ARRAY_COUNT(Stack));
+				FString Lines;
+				for (uint32 Index = 0; Index < Depth; ++Index)
+				{
+					ANSICHAR Line[1024] = {};
+					FPlatformStackWalk::ProgramCounterToHumanReadableString(Index, Stack[Index], Line, sizeof(Line));
+					Lines += TEXT("\n    ");
+					Lines += ANSI_TO_TCHAR(Line);
+				}
+				UE_LOG(LogAreaActionsCpp, Display, TEXT("AATEST hitch stack %d, %.0f ms into the frame:%s"), ++Samples, Over * 1000.0, *Lines);
+			}
+		});
+	}
+	FCoreDelegates::OnBeginFrame.AddLambda([]
+	{
+		Phases = FPhases();
+		Phases.Begin = FPlatformTime::Seconds();
+		MeasuredFrameBegin = Run && Run->bMeasureFrames ? Phases.Begin : 0.0;
+	});
 	FWorldDelegates::OnWorldTickStart.AddLambda([](UWorld*, ELevelTick, float) { if (Phases.WorldStart == 0.0) { Phases.WorldStart = FPlatformTime::Seconds(); } });
 	FWorldDelegates::OnWorldPreActorTick.AddLambda([](UWorld*, ELevelTick, float) { if (Phases.PreActors == 0.0) { Phases.PreActors = FPlatformTime::Seconds(); } });
 	FWorldDelegates::OnWorldPostActorTick.AddLambda([](UWorld*, ELevelTick, float) { Phases.PostActors = FPlatformTime::Seconds(); });
