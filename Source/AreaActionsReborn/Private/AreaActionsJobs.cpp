@@ -26,7 +26,7 @@ static TAutoConsoleVariable<int32> CVarMaxSpawnPerRequest(TEXT("AreaActions.MaxS
 // The game starts a dismantle effect for each building actor one frame later, at about 2 ms each: outside the time budget, which sees
 // the dismantling alone (measured: 80 to 100 a frame made frames of 150 to 200 ms)
 static TAutoConsoleVariable<int32> CVarDismantleActorsPerFrame(TEXT("AreaActions.DismantleActorsPerFrame"), 25,
-	TEXT("Most building actors MassDismantle takes down in one frame (lightweight buildings do not count); 0 = the time budget alone"));
+	TEXT("Most building actors one MassDismantle takes down in a frame (lightweight buildings do not count); 0 = the time budget alone"));
 
 namespace
 {
